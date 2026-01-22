@@ -313,7 +313,7 @@ def main():
     args = parse_args()
 
     # Validate arguments
-    domains = ['Art', 'Clipart', 'Product', 'Real_World']
+    domains = ['Art', 'Clipart', 'Product', 'Real World']
     num_domains = len(domains)
 
     if args.clients % num_domains != 0:
