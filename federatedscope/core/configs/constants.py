@@ -21,7 +21,8 @@ AGGREGATOR_TYPE = {
     "gcflplus": "clients_avg",
     "fedgc": "clients_avg",
     "fedopt": "fedopt",
-    "fedsak": "fedsak"
+    "fedsak": "fedsak",
+    "ggeur": "clients_avg"  # GGEUR_Clip (custom aggregation in GGEURServer)
 }
 
 CLIENTS_TYPE = {
