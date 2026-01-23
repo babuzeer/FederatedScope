@@ -21,6 +21,7 @@ distribute:
   role: 'client'
   data_idx: 2
   client_id: 3
+  heartbeat_timeout: 600  # 10 minutes for feature extraction
 
 distributed_data:
   enabled: True
@@ -77,4 +78,12 @@ ggeur:
   clip_pretrained: openai
   clip_model_path: /root/open_clip_vitb16.bin
   feature_extractor: clip
+  embedding_dim: 512
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+  num_generated_per_sample: 50
+  num_generated_per_prototype: 50
+  target_size_per_class: 50
+  use_cross_client_prototypes: True
+  statistics_round: 0
   use_lds: False
