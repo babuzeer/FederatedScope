@@ -10,7 +10,7 @@ federate:
   mode: 'distributed'
   make_global_eval: False
   online_aggr: False
-  total_round_num: 50
+  total_round_num: 100  # Increased from 50 to match standalone
 
 distribute:
   use: True
@@ -40,7 +40,7 @@ data:
                              'std': [0.229, 0.224, 0.225]}]]
 
 dataloader:
-  batch_size: 32
+  batch_size: 16  # Reduced from 32 to match standalone
   num_workers: 4
 
 model:
@@ -48,16 +48,12 @@ model:
   out_channels: 65
 
 train:
-  local_update_steps: 5
+  local_update_steps: 10  # Changed from 5 to 10 epochs to match standalone
   batch_or_epoch: epoch
   optimizer:
-    type: SGD
-    lr: 0.01
-    momentum: 0.9
-    weight_decay: 0.0005
+    type: Adam  # Changed from SGD to Adam
+    lr: 0.001   # Changed from 0.01 to 0.001
 
-grad:
-  grad_clip: 5.0
 
 criterion:
   type: CrossEntropyLoss
