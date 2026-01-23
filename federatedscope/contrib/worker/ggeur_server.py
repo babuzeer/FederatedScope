@@ -148,7 +148,8 @@ class GGEURServer(Server):
         """
         if self.state == 0:
             # Round 0: Send a signal to clients to start collecting statistics
-            # Send empty dict instead of None (Message system doesn't support None)
+            # Send a non-empty dict with a signal (Message system doesn't
+            # support None or empty dict)
             logger.info(
                 "Server: Round 0 - sending signal to collect statistics")
             for client_id in range(1, self._client_num + 1):
@@ -157,7 +158,7 @@ class GGEURServer(Server):
                             sender=self.ID,
                             receiver=[client_id],
                             state=self.state,
-                            content={}))  # Empty dict instead of None
+                            content={'signal': 'collect_statistics'}))
         else:
             # For subsequent rounds, use the custom training round method
             self._start_training_round()
