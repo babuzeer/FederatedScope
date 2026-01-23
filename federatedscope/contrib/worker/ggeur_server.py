@@ -135,6 +135,33 @@ class GGEURServer(Server):
         self.register_handlers('augmentation_ready',
                                self.callback_for_augmentation_ready)
 
+    def broadcast_model_para(self,
+                             msg_type='model_para',
+                             sample_client_num=-1,
+                             filter_unseen_clients=True):
+        """
+        Override broadcast_model_para to handle GGEUR's special startup flow.
+
+        In GGEUR, the server doesn't broadcast initial model parameters at
+        Round 0. Instead, clients first collect local statistics, and the
+        server creates the global MLP only after receiving all statistics.
+        """
+        if self.state == 0:
+            # Round 0: Send a signal to clients to start collecting statistics
+            # instead of broadcasting model parameters
+            logger.info(
+                "Server: Round 0 - sending signal to collect statistics")
+            for client_id in range(1, self._client_num + 1):
+                self.comm_manager.send(
+                    Message(msg_type='model_para',
+                            sender=self.ID,
+                            receiver=[client_id],
+                            state=self.state,
+                            content=None))
+        else:
+            # For subsequent rounds, use the custom training round method
+            self._start_training_round()
+
     def _build_global_mlp(self, num_classes):
         """Build global MLP classifier"""
         input_dim = self.ggeur_cfg.embedding_dim
