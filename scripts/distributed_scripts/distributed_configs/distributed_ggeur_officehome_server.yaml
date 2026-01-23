@@ -71,5 +71,6 @@ ggeur:
   feature_cache_dir: ''
   clip_model: ViT-B/32
   clip_pretrained: openai
+  clip_model_path: /root/open_clip_vitb16.bin
   feature_extractor: clip
   use_lds: False
