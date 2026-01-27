@@ -25,6 +25,10 @@ from federatedscope.register import register_worker
 
 logger = logging.getLogger(__name__)
 
+# Shared (process-wide) BERT cache to avoid loading a huge model per client in
+# standalone simulation.
+_SHARED_BERT_EXTRACTORS = {}  # key -> (tokenizer, model)
+
 
 class AugmentedFeatureDataset(Dataset):
     """Dataset for augmented CLIP features"""
@@ -133,6 +137,7 @@ class GGEURClient(Client):
         # ===== Feature Extractor Mode =====
         # 'clip': Use CLIP (ViT-based, original method)
         # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, etc.)
+        # 'bert': Use pretrained BERT for text feature extraction
         self.feature_extractor_type = getattr(self.ggeur_cfg, 'feature_extractor', 'clip')
 
         # CLIP model (for 'clip' mode)
@@ -141,6 +146,10 @@ class GGEURClient(Client):
 
         # CNN feature extractor (for 'cnn' mode)
         self.cnn_extractor = None
+
+        # BERT feature extractor (for 'bert' mode)
+        self.bert_model = None
+        self.bert_tokenizer = None
 
         # Local features and labels
         self.local_features = {}  # {class_idx: features array}
@@ -195,7 +204,9 @@ class GGEURClient(Client):
 
     def _load_feature_extractor(self):
         """Load feature extractor (CLIP or CNN based on config)"""
-        if self.feature_extractor_type == 'cnn':
+        if self.feature_extractor_type == 'bert':
+            self._load_bert_model()
+        elif self.feature_extractor_type == 'cnn':
             self._load_cnn_extractor()
         else:
             self._load_clip_model()
@@ -225,6 +236,56 @@ class GGEURClient(Client):
         except Exception as e:
             logger.error(f"Client {self.ID}: Failed to load CNN extractor: {e}")
             raise
+
+    def _load_bert_model(self):
+        """Load pretrained BERT model/tokenizer for text feature extraction"""
+        if self.bert_model is not None and self.bert_tokenizer is not None:
+            return
+
+        try:
+            from transformers import AutoConfig, AutoModel, AutoTokenizer
+        except ImportError as e:
+            logger.error("transformers not installed. Please install: pip install transformers")
+            raise e
+
+        model_path = getattr(self.ggeur_cfg, 'bert_model_path', '') or ''
+        tokenizer_path = getattr(self.ggeur_cfg, 'bert_tokenizer_path', '') or model_path
+        local_only = getattr(self.ggeur_cfg, 'bert_local_files_only', True)
+        use_pretrained = getattr(self.ggeur_cfg, 'bert_use_pretrained_weights', True)
+
+        if not model_path:
+            raise ValueError("When ggeur.feature_extractor='bert', please set ggeur.bert_model_path to a local model dir")
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"BERT model path not found: {model_path}")
+        if not os.path.exists(tokenizer_path):
+            raise FileNotFoundError(f"BERT tokenizer path not found: {tokenizer_path}")
+
+        # Reuse a shared extractor to avoid loading a large model per client
+        cache_key = (
+            os.path.abspath(model_path),
+            os.path.abspath(tokenizer_path),
+            str(self.device),
+            bool(local_only),
+            bool(use_pretrained),
+        )
+        if cache_key in _SHARED_BERT_EXTRACTORS:
+            self.bert_tokenizer, self.bert_model = _SHARED_BERT_EXTRACTORS[cache_key]
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=local_only)
+            if use_pretrained:
+                model = AutoModel.from_pretrained(model_path, local_files_only=local_only)
+            else:
+                cfg = AutoConfig.from_pretrained(model_path, local_files_only=local_only)
+                model = AutoModel.from_config(cfg)
+            model = model.to(self.device)
+            model.eval()
+            _SHARED_BERT_EXTRACTORS[cache_key] = (tokenizer, model)
+            self.bert_tokenizer, self.bert_model = tokenizer, model
+
+        hidden_size = getattr(getattr(self.bert_model, 'config', None), 'hidden_size', None)
+        mode_str = "pretrained" if use_pretrained else "random_init"
+        logger.info(f"Client {self.ID}: Loaded BERT extractor ({mode_str}) from {model_path} (hidden_size={hidden_size})")
 
     def _load_clip_model(self):
         """Load CLIP model for feature extraction"""
@@ -273,14 +334,30 @@ class GGEURClient(Client):
         # Get cache directory from config or use default
         cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
         if not cache_dir:
-            cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'clip_feature_cache')
+            if self.feature_extractor_type == 'bert':
+                cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'text_feature_cache')
+            else:
+                cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'clip_feature_cache')
 
         os.makedirs(cache_dir, exist_ok=True)
 
         # Build cache filename based on dataset, domain, and model
         dataset_name = self._cfg.data.type.lower()
 
-        if self.feature_extractor_type == 'cnn':
+        if self.feature_extractor_type == 'bert':
+            model_path = getattr(self.ggeur_cfg, 'bert_model_path', 'bert')
+            model_name = os.path.basename(str(model_path).rstrip('/\\')) or 'bert'
+            max_len = getattr(self.ggeur_cfg, 'bert_max_length', 128)
+            pooling = getattr(self.ggeur_cfg, 'bert_pooling', 'cls')
+            use_pretrained = getattr(self.ggeur_cfg, 'bert_use_pretrained_weights', True)
+            mode_str = "pre" if use_pretrained else "rand"
+            if use_pretrained:
+                model_str = f"{model_name}_maxlen{max_len}_{pooling}_{mode_str}"
+            else:
+                seed = getattr(self._cfg, 'seed', 0)
+                model_str = f"{model_name}_maxlen{max_len}_{pooling}_{mode_str}_seed{seed}"
+            prefix = 'bert'
+        elif self.feature_extractor_type == 'cnn':
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             model_str = model_name.replace('/', '_').replace('-', '_')
             prefix = 'cnn'
@@ -329,12 +406,135 @@ class GGEURClient(Client):
         except Exception as e:
             logger.warning(f"Client {self.ID}: Failed to save cache: {e}")
 
+    def _extract_bert_features(self, base_dataset, subset_indices, cache_path):
+        """
+        Extract sentence-level BERT embeddings from a text dataset.
+
+        Args:
+            base_dataset: underlying Dataset (may be CPSDTextDataset)
+            subset_indices: optional list of indices (for Subset)
+            cache_path: npz cache path for {id -> embedding}
+        """
+        self._load_bert_model()
+
+        # Load existing cache (id -> embedding)
+        feature_cache = self._load_feature_cache(cache_path)
+        cache_updated = False
+
+        # Resolve indices
+        if subset_indices is None:
+            indices = list(range(len(base_dataset)))
+        else:
+            indices = list(subset_indices)
+
+        # Collect missing ids for batch extraction
+        base_indices_to_extract = []
+        ids_to_extract = []
+
+        self.local_features = {}
+        self.local_labels = {}
+
+        for base_idx in indices:
+            # Stable sample id for cache lookup
+            if hasattr(base_dataset, 'get_id'):
+                sample_id = str(base_dataset.get_id(base_idx))
+            else:
+                sample_id = f"{getattr(base_dataset, 'domain', 'text')}:{base_idx}"
+
+            # Label (prefer `.targets`)
+            if hasattr(base_dataset, 'targets'):
+                label = int(base_dataset.targets[base_idx])
+                text = None
+            else:
+                text, label = base_dataset[base_idx]
+                label = int(label)
+
+            if sample_id in feature_cache:
+                feat = feature_cache[sample_id]
+                if label not in self.local_features:
+                    self.local_features[label] = []
+                    self.local_labels[label] = []
+                self.local_features[label].append(feat)
+                self.local_labels[label].append(label)
+            else:
+                base_indices_to_extract.append(base_idx)
+                ids_to_extract.append(sample_id)
+
+        # Batch extract missing samples
+        max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+        pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+        batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+        if batch_size <= 0:
+            batch_size = 32
+
+        import numpy as np
+        import torch
+
+        with torch.no_grad():
+            for i in range(0, len(base_indices_to_extract), batch_size):
+                batch_base_idx = base_indices_to_extract[i:i + batch_size]
+                batch_ids = ids_to_extract[i:i + batch_size]
+
+                texts = []
+                labels = []
+                for base_idx in batch_base_idx:
+                    text, label = base_dataset[base_idx]
+                    texts.append(str(text))
+                    labels.append(int(label))
+
+                encoded = self.bert_tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_len,
+                    return_tensors='pt'
+                )
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+                outputs = self.bert_model(**encoded)
+                hidden = outputs.last_hidden_state  # (B, T, H)
+
+                if pooling == 'mean':
+                    attn = encoded.get('attention_mask', None)
+                    if attn is None:
+                        emb = hidden.mean(dim=1)
+                    else:
+                        mask = attn.unsqueeze(-1).float()
+                        emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+                else:
+                    # default: [CLS]
+                    emb = hidden[:, 0, :]
+
+                emb_np = emb.detach().cpu().numpy().astype(np.float32)
+
+                for vec, label, sample_id in zip(emb_np, labels, batch_ids):
+                    feature_cache[sample_id] = vec
+                    cache_updated = True
+                    if label not in self.local_features:
+                        self.local_features[label] = []
+                        self.local_labels[label] = []
+                    self.local_features[label].append(vec)
+                    self.local_labels[label].append(label)
+
+        # Save updated cache
+        if cache_updated:
+            self._save_feature_cache(cache_path, feature_cache)
+
+        # Convert lists to numpy arrays
+        for label in list(self.local_features.keys()):
+            self.local_features[label] = np.array(self.local_features[label])
+
     def _extract_features(self):
         """
         Extract features from local data using either CLIP or CNN.
         Supports caching for both modes.
         """
-        extractor_name = 'CNN' if self.feature_extractor_type == 'cnn' else 'CLIP'
+        if self.feature_extractor_type == 'bert':
+            extractor_name = 'BERT'
+        elif self.feature_extractor_type == 'cnn':
+            extractor_name = 'CNN'
+        else:
+            extractor_name = 'CLIP'
         logger.info(f"Client {self.ID}: Extracting {extractor_name} features...")
 
         # Get train data
@@ -362,6 +562,13 @@ class GGEURClient(Client):
             domain = getattr(dataset, 'domain', None)
 
         cache_path = self._get_feature_cache_path(domain)
+
+        # Text (BERT) feature extraction path
+        if self.feature_extractor_type == 'bert':
+            self._extract_bert_features(base_dataset, subset_indices, cache_path)
+            total_samples = sum(len(v) for v in self.local_features.values())
+            logger.info(f"Client {self.ID}: Extracted {total_samples} BERT features from {len(self.local_features)} classes")
+            return
 
         # Load existing cache
         feature_cache = self._load_feature_cache(cache_path)
@@ -782,11 +989,36 @@ class GGEURClient(Client):
         self.augmentation_done = True
 
     def _build_mlp_classifier(self):
-        """Build MLP classifier for augmented features"""
+        """Build classifier for augmented features (MLP for vision, RNN/LSTM for text)"""
         # IMPORTANT: Always use config's num_classes, not the unique labels in augmented data
         # In LDS mode, each client may only have a subset of classes, but the model
         # must support all classes for proper FedAvg aggregation
         num_classes = self._cfg.model.num_classes
+        model_type = str(getattr(self._cfg.model, 'type', 'ggeur_mlp')).lower()
+
+        # Text mode: train RNN/LSTM on frozen-feature embeddings
+        if model_type in {'ggeur_rnn', 'ggeur_lstm'}:
+            from federatedscope.contrib.model.ggeur_text_rnn import GGEURTextRNNClassifier
+
+            input_dim = int(getattr(self.ggeur_cfg, 'embedding_dim', 768))
+            hidden_dim = int(getattr(self._cfg.model, 'hidden', 256))
+            num_layers = int(getattr(self._cfg.model, 'layer', 1))
+            dropout = float(getattr(self._cfg.model, 'dropout', 0.0))
+            rnn_type = 'rnn' if model_type == 'ggeur_rnn' else 'lstm'
+
+            self.mlp_classifier = GGEURTextRNNClassifier(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                num_layers=num_layers,
+                dropout=dropout,
+                rnn_type=rnn_type,
+            )
+            self.mlp_classifier = self.mlp_classifier.to(self.device)
+            logger.info(f"Client {self.ID}: Built {model_type} classifier with {num_classes} classes")
+            return
+
+        # Vision mode: train MLP on embeddings
         input_dim = self.ggeur_cfg.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 

@@ -7,7 +7,7 @@ Based on the paper's algorithm:
 2. Compute local statistics (mean, covariance) per class
 3. Server aggregates covariance matrices using parallel axis theorem
 4. Clients perform Gaussian feature augmentation using global covariance
-5. Train MLP classifier on augmented features via FedAvg
+5. Train a lightweight classifier on augmented features via FedAvg
 """
 
 from federatedscope.core.configs.config import CN
@@ -25,7 +25,8 @@ def extend_ggeur_cfg(cfg):
 
     # ========== Feature Extractor Mode ==========
     # 'clip': Use CLIP (ViT-based, original method)
-    # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, EfficientNet, etc.)
+    # 'cnn' : Use pretrained CNN (ConvNeXt, ResNet, EfficientNet, etc.)
+    # 'bert': Use pretrained BERT for text feature extraction
     cfg.ggeur.feature_extractor = 'clip'
 
     # ========== CNN Feature Extractor Settings ==========
@@ -49,6 +50,21 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.feature_cache_dir = ''
     # Whether to use cached features if available
     cfg.ggeur.use_feature_cache = True
+
+    # ========== BERT Feature Extractor Settings (Text) ==========
+    # Local path to pretrained BERT model/tokenizer (feature extractor ONLY)
+    # e.g., 'models/nlptown_bert_base_multilingual_uncased_senti'
+    cfg.ggeur.bert_model_path = ''
+    cfg.ggeur.bert_tokenizer_path = ''  # empty -> same as bert_model_path
+    cfg.ggeur.bert_max_length = 128
+    # Pooling type for sentence embedding: 'cls' or 'mean'
+    cfg.ggeur.bert_pooling = 'cls'
+    cfg.ggeur.bert_batch_size = 32
+    # Whether to force local loading only (avoid downloading from internet)
+    cfg.ggeur.bert_local_files_only = True
+    # Whether to use pretrained weights for BERT feature extraction
+    # If False, the BERT encoder will be randomly initialized (no pretrained knowledge).
+    cfg.ggeur.bert_use_pretrained_weights = True
 
     # ========== Feature Augmentation ==========
     # Number of samples to generate per original sample

@@ -1,0 +1,90 @@
+# GGEUR on CPSD (Sentiment140 / Yelp / IMDb) with a trainable LSTM classifier
+#
+# - Feature extractor (frozen): pretrained BERT
+# - Trainable model: LSTM (NOT pretrained)
+# - Cross-domain FL: 3 domains, clients split within each domain by Dirichlet
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 30          # must be divisible by 3 (domains)
+  total_round_num: 50
+  sample_client_num: 30
+
+# ========== Data Settings ==========
+data:
+  type: 'cpsd'
+  root: 'data/CPSD'
+  splits: [0.9, 0.1, 0.0]  # train/val from official train split; test uses official test split
+  dirichlet_alpha: 0.1    # within-domain client heterogeneity (label skew)
+  args:
+    - max_train_samples_per_domain: 20000
+      max_test_samples_per_domain: 5000
+      seed: 42
+      use_cache: True
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_rnn'      # switch to 'ggeur_rnn' to use vanilla RNN
+  num_classes: 2
+  in_channels: 768        # BERT hidden size (embedding_dim)
+  hidden: 256
+  layer: 1                # number of RNN/LSTM layers
+  dropout: 0.1
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 0.001
+
+# ========== GGEUR Settings ==========
+ggeur:
+  use: True
+
+  # Feature extractor mode
+  feature_extractor: 'bert'
+
+  # BERT feature extraction (local path, feature extractor ONLY)
+  bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
+  bert_tokenizer_path: ''
+  bert_max_length: 128
+  bert_pooling: 'cls'
+  bert_batch_size: 32
+  bert_local_files_only: True
+  bert_use_pretrained_weights: True
+
+  # Embedding dimension (must match BERT hidden size)
+  embedding_dim: 768
+
+  # Feature caching
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # Feature augmentation
+  num_generated_per_sample: 50
+  num_generated_per_prototype: 50
+  target_size_per_class: 50
+
+  # (Unused in RNN/LSTM mode; kept for compatibility)
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  use_cross_client_prototypes: True
+  statistics_round: 0
+
+# ========== Output Settings ==========
+outdir: 'exp/ggeur_rnn_sentiment'
+expname: 'ggeur_cpsd_lstm'

@@ -24,6 +24,10 @@ from federatedscope.core.workers import Server
 
 logger = logging.getLogger(__name__)
 
+# Shared (process-wide) BERT cache to avoid loading a huge model multiple times
+# in standalone simulation.
+_SHARED_BERT_EXTRACTORS = {}  # key -> (tokenizer, model)
+
 
 class GGEURServer(Server):
     """
@@ -77,6 +81,10 @@ class GGEURServer(Server):
         self.clip_model = None
         self.clip_preprocess = None
 
+        # BERT model/tokenizer for text feature extraction
+        self.bert_model = None
+        self.bert_tokenizer = None
+
         # Tracking best model
         self.best_avg_accuracy = 0.0
         self.best_model_state = None
@@ -96,6 +104,7 @@ class GGEURServer(Server):
         # ===== Feature Extractor Mode =====
         # 'clip': Use CLIP (ViT-based, original method)
         # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, etc.)
+        # 'bert': Use pretrained BERT for text feature extraction
         self.feature_extractor_type = getattr(self.ggeur_cfg, 'feature_extractor', 'clip')
         self.cnn_extractor = None  # CNN feature extractor for evaluation
 
@@ -120,8 +129,57 @@ class GGEURServer(Server):
         self.register_handlers('augmentation_ready',
                                self.callback_for_augmentation_ready)
 
+    def trigger_for_start(self):
+        """
+        Start the FL course after all clients join in.
+
+        Note:
+        - The base `Server.trigger_for_start()` broadcasts the initial
+          `model_para` to `sample_client_num` clients.
+        - For GGEUR, the statistics collection round (`ggeur.statistics_round`,
+          default 0) requires ALL clients to upload local statistics, otherwise
+          the server will wait for missing clients forever.
+        """
+        if not self.check_client_join_in():
+            return
+
+        original_sample_client_num = getattr(self, "sample_client_num", None)
+        try:
+            stats_round = int(getattr(self.ggeur_cfg, "statistics_round", 0))
+            if self.state == stats_round and not getattr(self, "statistics_collected", False):
+                self.sample_client_num = self.client_num
+            super().trigger_for_start()
+        finally:
+            if original_sample_client_num is not None:
+                self.sample_client_num = original_sample_client_num
+
     def _build_global_mlp(self, num_classes):
-        """Build global MLP classifier"""
+        """Build global classifier (MLP for vision, RNN/LSTM for text)"""
+        model_type = str(getattr(self._cfg.model, 'type', 'ggeur_mlp')).lower()
+
+        # Text mode: train RNN/LSTM on frozen-feature embeddings
+        if model_type in {'ggeur_rnn', 'ggeur_lstm'}:
+            from federatedscope.contrib.model.ggeur_text_rnn import GGEURTextRNNClassifier
+
+            input_dim = int(getattr(self.ggeur_cfg, 'embedding_dim', 768))
+            hidden_dim = int(getattr(self._cfg.model, 'hidden', 256))
+            num_layers = int(getattr(self._cfg.model, 'layer', 1))
+            dropout = float(getattr(self._cfg.model, 'dropout', 0.0))
+            rnn_type = 'rnn' if model_type == 'ggeur_rnn' else 'lstm'
+
+            self.global_mlp = GGEURTextRNNClassifier(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                num_layers=num_layers,
+                dropout=dropout,
+                rnn_type=rnn_type,
+            )
+            self.global_mlp = self.global_mlp.to(self.device)
+            logger.info(f"Server: Built global {model_type} classifier with {num_classes} classes")
+            return
+
+        # Vision mode: train MLP on embeddings
         input_dim = self.ggeur_cfg.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
@@ -220,9 +278,61 @@ class GGEURServer(Server):
             logger.error(f"Server: Failed to load CNN extractor: {e}")
             raise
 
+    def _load_bert_model(self):
+        """Load pretrained BERT model/tokenizer for text feature extraction"""
+        if self.bert_model is not None and self.bert_tokenizer is not None:
+            return
+
+        try:
+            from transformers import AutoConfig, AutoModel, AutoTokenizer
+        except ImportError as e:
+            logger.error("transformers not installed. Please install: pip install transformers")
+            raise e
+
+        model_path = getattr(self.ggeur_cfg, 'bert_model_path', '') or ''
+        tokenizer_path = getattr(self.ggeur_cfg, 'bert_tokenizer_path', '') or model_path
+        local_only = getattr(self.ggeur_cfg, 'bert_local_files_only', True)
+        use_pretrained = getattr(self.ggeur_cfg, 'bert_use_pretrained_weights', True)
+
+        if not model_path:
+            raise ValueError("When ggeur.feature_extractor='bert', please set ggeur.bert_model_path to a local model dir")
+
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"BERT model path not found: {model_path}")
+        if not os.path.exists(tokenizer_path):
+            raise FileNotFoundError(f"BERT tokenizer path not found: {tokenizer_path}")
+
+        # Reuse a shared extractor to avoid loading a large model multiple times
+        cache_key = (
+            os.path.abspath(model_path),
+            os.path.abspath(tokenizer_path),
+            str(self.device),
+            bool(local_only),
+            bool(use_pretrained),
+        )
+        if cache_key in _SHARED_BERT_EXTRACTORS:
+            self.bert_tokenizer, self.bert_model = _SHARED_BERT_EXTRACTORS[cache_key]
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=local_only)
+            if use_pretrained:
+                model = AutoModel.from_pretrained(model_path, local_files_only=local_only)
+            else:
+                cfg = AutoConfig.from_pretrained(model_path, local_files_only=local_only)
+                model = AutoModel.from_config(cfg)
+            model = model.to(self.device)
+            model.eval()
+            _SHARED_BERT_EXTRACTORS[cache_key] = (tokenizer, model)
+            self.bert_tokenizer, self.bert_model = tokenizer, model
+
+        hidden_size = getattr(getattr(self.bert_model, 'config', None), 'hidden_size', None)
+        mode_str = "pretrained" if use_pretrained else "random_init"
+        logger.info(f"Server: Loaded BERT extractor ({mode_str}) from {model_path} (hidden_size={hidden_size})")
+
     def _load_feature_extractor(self):
         """Load the appropriate feature extractor (CLIP or CNN)"""
-        if self.feature_extractor_type == 'cnn':
+        if self.feature_extractor_type == 'bert':
+            self._load_bert_model()
+        elif self.feature_extractor_type == 'cnn':
             self._load_cnn_extractor()
         else:
             self._load_clip_model()
@@ -231,7 +341,10 @@ class GGEURServer(Server):
         """Get cache path for test features"""
         cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
         if not cache_dir:
-            cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'clip_feature_cache')
+            if self.feature_extractor_type == 'bert':
+                cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'text_feature_cache')
+            else:
+                cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'clip_feature_cache')
 
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -249,7 +362,20 @@ class GGEURServer(Server):
         dataset_name = data_type
 
         # Build model string based on feature extractor type
-        if self.feature_extractor_type == 'cnn':
+        if self.feature_extractor_type == 'bert':
+            model_path = getattr(self.ggeur_cfg, 'bert_model_path', 'bert')
+            model_name = os.path.basename(str(model_path).rstrip('/\\')) or 'bert'
+            max_len = getattr(self.ggeur_cfg, 'bert_max_length', 128)
+            pooling = getattr(self.ggeur_cfg, 'bert_pooling', 'cls')
+            use_pretrained = getattr(self.ggeur_cfg, 'bert_use_pretrained_weights', True)
+            mode_str = "pre" if use_pretrained else "rand"
+            if use_pretrained:
+                model_str = f"{model_name}_maxlen{max_len}_{pooling}_{mode_str}"
+            else:
+                seed = getattr(self._cfg, 'seed', 0)
+                model_str = f"{model_name}_maxlen{max_len}_{pooling}_{mode_str}_seed{seed}"
+            prefix = 'bert'
+        elif self.feature_extractor_type == 'cnn':
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             model_str = model_name.replace('/', '_').replace('-', '_')
             prefix = 'cnn'
@@ -263,6 +389,35 @@ class GGEURServer(Server):
         split_str = f"split{int(splits[0]*100)}_{int(splits[1]*100)}_{int(100-splits[0]*100-splits[1]*100)}_seed{seed}"
         cache_filename = f"{dataset_name}_{domain}_test_{prefix}_{model_str}_{split_str}.npz"
 
+        return os.path.join(cache_dir, cache_filename)
+
+    def _get_cpsd_test_cache_path(self, domain, cpsd_args):
+        """
+        CPSD uses sampled subsets for test data, so cache keys must include the
+        sampling parameters (max samples + seed), otherwise old small caches may
+        be reused and inflate early metrics.
+        """
+        cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+        if not cache_dir:
+            cache_dir = os.path.join(os.path.dirname(self._cfg.data.root), 'text_feature_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+
+        model_path = getattr(self.ggeur_cfg, 'bert_model_path', 'bert')
+        model_name = os.path.basename(str(model_path).rstrip('/\\')) or 'bert'
+        max_len = getattr(self.ggeur_cfg, 'bert_max_length', 128)
+        pooling = getattr(self.ggeur_cfg, 'bert_pooling', 'cls')
+        use_pretrained = getattr(self.ggeur_cfg, 'bert_use_pretrained_weights', True)
+        mode_str = "pre" if use_pretrained else "rand"
+        cfg_seed = getattr(self._cfg, 'seed', 0)
+
+        max_test = int(getattr(cpsd_args, 'max_test_samples_per_domain', 0))
+        seed = int(getattr(cpsd_args, 'seed', getattr(self._cfg, 'seed', 42)))
+
+        domain_str = str(domain).replace(' ', '_').replace('/', '_').replace('\\', '_')
+        if use_pretrained:
+            cache_filename = f"cpsd_{domain_str}_test_bert_{model_name}_maxlen{max_len}_{pooling}_{mode_str}_max{max_test}_seed{seed}.npz"
+        else:
+            cache_filename = f"cpsd_{domain_str}_test_bert_{model_name}_maxlen{max_len}_{pooling}_{mode_str}_cfgseed{cfg_seed}_max{max_test}_seed{seed}.npz"
         return os.path.join(cache_dir, cache_filename)
 
     def _load_test_data_and_features(self):
@@ -289,6 +444,86 @@ class GGEURServer(Server):
         seed = self._cfg.seed if hasattr(self._cfg, 'seed') else 123
 
         logger.info(f"Server: Using splits={splits}, seed={seed} (same as client data)")
+
+        # CPSD: cross-domain sentiment (text) - use BERT features
+        if data_type == 'cpsd':
+            if self.feature_extractor_type != 'bert':
+                raise ValueError("CPSD requires ggeur.feature_extractor='bert' for test feature extraction")
+
+            from federatedscope.contrib.data.cpsd_data import _get_cpsd_args, _load_domain_split
+
+            args = _get_cpsd_args(self._cfg)
+            domains = ['Sentiment140', 'Yelp', 'IMDb']
+
+            for domain in domains:
+                cache_path = self._get_cpsd_test_cache_path(domain, args)
+
+                if os.path.exists(cache_path):
+                    try:
+                        data = np.load(cache_path)
+                        self.test_features[domain] = data['features']
+                        self.test_labels[domain] = data['labels']
+                        logger.info(f"Server: Loaded {len(self.test_labels[domain])} cached CPSD test features for {domain}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Server: Failed to load cache for {domain}: {e}")
+
+                test_dataset = _load_domain_split(
+                    data_root=data_root,
+                    args=args,
+                    domain=domain,
+                    split='test',
+                    max_samples=args.max_test_samples_per_domain,
+                )
+                if len(test_dataset) == 0:
+                    logger.warning(f"Server: No test data for domain {domain}")
+                    continue
+
+                self._load_bert_model()
+                pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+                max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+                batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+                if batch_size <= 0:
+                    batch_size = 32
+
+                features_list = []
+                labels_list = []
+
+                dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+                with torch.no_grad():
+                    for texts, labels in dataloader:
+                        encoded = self.bert_tokenizer(
+                            list(texts),
+                            padding=True,
+                            truncation=True,
+                            max_length=max_len,
+                            return_tensors='pt'
+                        )
+                        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                        outputs = self.bert_model(**encoded)
+                        hidden = outputs.last_hidden_state
+                        if pooling == 'mean':
+                            attn = encoded.get('attention_mask', None)
+                            if attn is None:
+                                emb = hidden.mean(dim=1)
+                            else:
+                                mask = attn.unsqueeze(-1).float()
+                                emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+                        else:
+                            emb = hidden[:, 0, :]
+
+                        features_list.append(emb.detach().cpu().numpy())
+                        labels_list.append(labels.detach().cpu().numpy())
+
+                self.test_features[domain] = np.vstack(features_list).astype(np.float32)
+                self.test_labels[domain] = np.concatenate(labels_list).astype(np.int64)
+
+                np.savez(cache_path, features=self.test_features[domain], labels=self.test_labels[domain])
+                logger.info(f"Server: Extracted and cached {len(self.test_labels[domain])} CPSD test features for {domain}")
+
+            self.test_data_loaded = True
+            logger.info(f"Server: Loaded CPSD test data for {len(self.test_features)} domains")
+            return
 
         # Determine domains based on dataset type
         if 'pacs' in data_type:

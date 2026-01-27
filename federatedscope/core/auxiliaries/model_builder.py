@@ -73,15 +73,41 @@ def get_shape_from_data(data, model_config, backend='torch'):
         import torch
         if issubclass(type(data_representative), torch.utils.data.DataLoader):
             x, _ = next(iter(data_representative))
-            if isinstance(x, list):
-                return x[0].shape
-            return x.shape
+            # NLP/feature cases: x can be dict/list/tuple (e.g., tokenized inputs or raw strings)
+            if isinstance(x, dict):
+                first_v = next(iter(x.values()))
+                return first_v.shape if hasattr(first_v, 'shape') else None
+            if isinstance(x, (list, tuple)):
+                if len(x) == 0:
+                    return None
+                x0 = x[0]
+                if isinstance(x0, dict):
+                    first_v = next(iter(x0.values()))
+                    return first_v.shape if hasattr(first_v, 'shape') else None
+                if hasattr(x0, 'shape'):
+                    return x0.shape
+                # Fall back to a config-provided channel size when input is non-tensor (e.g., raw text)
+                in_channels = getattr(model_config, 'in_channels', 0)
+                return (1, in_channels) if in_channels else None
+            return x.shape if hasattr(x, 'shape') else None
         else:
             try:
                 x, _ = data_representative
-                if isinstance(x, list):
-                    return x[0].shape
-                return x.shape
+                if isinstance(x, dict):
+                    first_v = next(iter(x.values()))
+                    return first_v.shape if hasattr(first_v, 'shape') else None
+                if isinstance(x, (list, tuple)):
+                    if len(x) == 0:
+                        return None
+                    x0 = x[0]
+                    if isinstance(x0, dict):
+                        first_v = next(iter(x0.values()))
+                        return first_v.shape if hasattr(first_v, 'shape') else None
+                    if hasattr(x0, 'shape'):
+                        return x0.shape
+                    in_channels = getattr(model_config, 'in_channels', 0)
+                    return (1, in_channels) if in_channels else None
+                return x.shape if hasattr(x, 'shape') else None
             except:
                 raise TypeError('Unsupported data type.')
     elif backend == 'tensorflow':

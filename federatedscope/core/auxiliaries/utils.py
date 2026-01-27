@@ -139,7 +139,11 @@ def setup_seed(seed):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
     if tf is not None:
-        tf.set_random_seed(seed)
+        # TensorFlow 1.x: tf.set_random_seed; TensorFlow 2.x: tf.random.set_seed
+        if hasattr(tf, "random") and hasattr(tf.random, "set_seed"):
+            tf.random.set_seed(seed)
+        elif hasattr(tf, "set_random_seed"):
+            tf.set_random_seed(seed)
 
 
 def get_resource_info(filename):
