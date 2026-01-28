@@ -43,8 +43,6 @@ def load_ggeur_data(config, client_cfgs=None):
     elif data_type in ['office-home', 'officehome', 'office_home']:
         return _load_officehome_ggeur_data(config, client_cfgs)
     else:
-        logger.warning(f"Data type {data_type} not specifically supported for GGEUR_Clip, "
-                       f"falling back to standard loading")
         return None
 
 

@@ -360,6 +360,21 @@ class GGEURServer(Server):
         seed = self._cfg.seed if hasattr(self._cfg, 'seed') else 123
 
         dataset_name = data_type
+        # Text dataset variants: include key args in cache name to avoid stale caches.
+        if data_type == 'mdsent':
+            raw_args = self._cfg.data.args[0] if getattr(self._cfg.data, 'args', None) else {}
+            if raw_args is None:
+                raw_args = {}
+            include_u = raw_args.get('include_unlabeled', True)
+            if isinstance(include_u, str):
+                include_u = include_u.strip().lower() in {"1", "true", "yes", "y"}
+            max_n = raw_args.get('max_samples_per_domain', 0)
+            try:
+                max_n = int(max_n)
+            except Exception:
+                max_n = 0
+            max_str = "all" if max_n <= 0 else str(max_n)
+            dataset_name = f"{data_type}_includeu{int(bool(include_u))}_max{max_str}"
 
         # Build model string based on feature extractor type
         if self.feature_extractor_type == 'bert':
@@ -523,6 +538,92 @@ class GGEURServer(Server):
 
             self.test_data_loaded = True
             logger.info(f"Server: Loaded CPSD test data for {len(self.test_features)} domains")
+            return
+
+        # MDSent: multi-domain sentiment ratings (text) - use BERT features
+        if data_type == 'mdsent':
+            if self.feature_extractor_type != 'bert':
+                raise ValueError("MDSent requires ggeur.feature_extractor='bert' for test feature extraction")
+
+            from federatedscope.contrib.data.mdsent_data import (
+                _domain_seed,
+                _get_mdsent_args,
+                _load_domain_all,
+                _maybe_cap_domain_samples,
+                _split_train_val_test,
+            )
+
+            args = _get_mdsent_args(self._cfg)
+
+            default_domains = ['books', 'dvd', 'electronics', 'kitchen']
+            domains = [d for d in default_domains if os.path.isdir(os.path.join(data_root, d))]
+
+            for domain in domains:
+                cache_path = self._get_test_cache_path(domain)
+
+                if os.path.exists(cache_path):
+                    try:
+                        data = np.load(cache_path)
+                        self.test_features[domain] = data['features']
+                        self.test_labels[domain] = data['labels']
+                        logger.info(f"Server: Loaded {len(self.test_labels[domain])} cached MDSent test features for {domain}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Server: Failed to load cache for {domain}: {e}")
+
+                full_dataset = _load_domain_all(data_root=data_root, args=args, domain=domain)
+                full_dataset = _maybe_cap_domain_samples(full_dataset, args=args, domain=domain)
+                _, _, test_dataset = _split_train_val_test(
+                    full_dataset, splits=splits, seed=_domain_seed(args, domain)
+                )
+                if len(test_dataset) == 0:
+                    logger.warning(f"Server: No test data for domain {domain}")
+                    continue
+
+                self._load_bert_model()
+                pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+                max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+                batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+                if batch_size <= 0:
+                    batch_size = 32
+
+                features_list = []
+                labels_list = []
+
+                dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+                with torch.no_grad():
+                    for texts, labels in dataloader:
+                        encoded = self.bert_tokenizer(
+                            list(texts),
+                            padding=True,
+                            truncation=True,
+                            max_length=max_len,
+                            return_tensors='pt'
+                        )
+                        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                        outputs = self.bert_model(**encoded)
+                        hidden = outputs.last_hidden_state
+                        if pooling == 'mean':
+                            attn = encoded.get('attention_mask', None)
+                            if attn is None:
+                                emb = hidden.mean(dim=1)
+                            else:
+                                mask = attn.unsqueeze(-1).float()
+                                emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+                        else:
+                            emb = hidden[:, 0, :]
+
+                        features_list.append(emb.detach().cpu().numpy())
+                        labels_list.append(labels.detach().cpu().numpy())
+
+                self.test_features[domain] = np.vstack(features_list).astype(np.float32)
+                self.test_labels[domain] = np.concatenate(labels_list).astype(np.int64)
+
+                np.savez(cache_path, features=self.test_features[domain], labels=self.test_labels[domain])
+                logger.info(f"Server: Extracted and cached {len(self.test_labels[domain])} MDSent test features for {domain}")
+
+            self.test_data_loaded = True
+            logger.info(f"Server: Loaded MDSent test data for {len(self.test_features)} domains")
             return
 
         # Determine domains based on dataset type
