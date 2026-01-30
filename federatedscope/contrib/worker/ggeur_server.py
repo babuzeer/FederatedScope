@@ -514,16 +514,57 @@ class GGEURServer(Server):
         logger.info(
             f"Server: Received local statistics from client {client_id}")
 
-        # Store statistics
+        # Expected embedding dimension from config
+        expected_dim = self.ggeur_cfg.embedding_dim
+
+        means = content['means']
+        covs = content['covs']
+        counts = content['counts']
+
+        # Convert lists back to numpy arrays
+        # Client sends: list -> Server converts: numpy array
+        validated_means = {}
+        validated_covs = {}
+
+        for class_idx in means.keys():
+            class_idx = int(class_idx)  # Ensure int type
+
+            # Convert mean list -> numpy array
+            mean_list = means[class_idx]
+            mean = np.array(mean_list, dtype=np.float32)
+
+            # Convert cov nested list -> numpy array
+            cov_list = covs[class_idx]
+            cov = np.array(cov_list, dtype=np.float32)
+
+            # Validate shapes
+            if mean.shape != (expected_dim,):
+                raise ValueError(
+                    f"Client {client_id}, Class {class_idx}: mean shape mismatch - expected ({expected_dim},), got {mean.shape}"
+                )
+
+            if cov.shape != (expected_dim, expected_dim):
+                raise ValueError(
+                    f"Client {client_id}, Class {class_idx}: cov shape mismatch - expected ({expected_dim}, {expected_dim}), got {cov.shape}"
+                )
+
+            validated_means[class_idx] = mean
+            validated_covs[class_idx] = cov
+
+        # Store statistics with validated numpy arrays
         self.local_statistics_buffer[client_id] = {
-            'means': content['means'],
-            'covs': content['covs'],
-            'counts': content['counts'],
+            'means': validated_means,
+            'covs': validated_covs,
+            'counts': counts,
             'prototypes': content['prototypes']
         }
 
         # Store prototypes for cross-client sharing
         self.all_prototypes[client_id] = content['prototypes']
+
+        logger.info(
+            f"Server: Validated statistics from client {client_id} ({len(validated_means)} classes)"
+        )
 
         # Check if all clients have uploaded statistics
         if len(self.local_statistics_buffer) >= self._client_num:
@@ -541,9 +582,8 @@ class GGEURServer(Server):
             other_prototypes = self._prepare_other_prototypes()
 
             # Build global MLP
-            # IMPORTANT: Use config's num_classes, not the number of classes in covariance matrices
-            # In LDS mode, some classes may have no data across all clients
-            num_classes = self._cfg.model.num_classes
+            # Use out_channels as the number of classes
+            num_classes = self._cfg.model.out_channels
             if num_classes > 0:
                 self._build_global_mlp(num_classes)
 
@@ -670,7 +710,7 @@ class GGEURServer(Server):
         """Build CNN backbone for separated training (Phase 2)"""
         from federatedscope.contrib.model.ggeur_cnn import GGEUR_CNN_Backbone
 
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         cnn_model_name = getattr(self.ggeur_cfg, 'cnn_model', 'resnet18')
 
         # Always train from scratch in separated training mode
@@ -686,7 +726,7 @@ class GGEURServer(Server):
 
     def _build_classifier_from_state_dict(self, state_dict):
         """Build classifier model from saved state dict for evaluation"""
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         input_dim = self.ggeur_cfg.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 

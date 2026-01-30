@@ -543,8 +543,23 @@ class GGEURClient(Client):
                         self.local_labels[label].append(label)
 
         # Convert lists to numpy arrays
+        expected_dim = self.ggeur_cfg.embedding_dim
         for label in self.local_features:
             self.local_features[label] = np.array(self.local_features[label])
+
+            # Validate feature shape after conversion
+            feature_shape = self.local_features[label].shape
+
+            # Ensure 2D shape (n_samples, embedding_dim)
+            if len(feature_shape) != 2:
+                raise ValueError(
+                    f"Features for class {label} should be 2D, got shape {feature_shape}"
+                )
+
+            if feature_shape[1] != expected_dim:
+                raise ValueError(
+                    f"Features dimension mismatch: expected {expected_dim}, got {feature_shape[1]}"
+                )
 
         total_samples = sum(len(v) for v in self.local_features.values())
         logger.info(
@@ -563,16 +578,41 @@ class GGEURClient(Client):
         self.local_covs = {}
         self.local_counts = {}
 
+        # Get expected embedding dimension from config
+        expected_dim = self.ggeur_cfg.embedding_dim
+
         for class_idx, features in self.local_features.items():
             if features.shape[0] == 0:
                 continue
 
             n = features.shape[0]
+
+            # Validate features shape
+            if len(features.shape) != 2:
+                raise ValueError(
+                    f"Features for class {class_idx} should be 2D array (n_samples, embedding_dim), got shape {features.shape}"
+                )
+
+            if features.shape[1] != expected_dim:
+                raise ValueError(
+                    f"Features for class {class_idx} dimension mismatch: expected {expected_dim}, got {features.shape[1]}"
+                )
+
             mean = np.mean(features, axis=0)
+
+            # Validate mean shape
+            assert mean.shape == (
+                expected_dim,
+            ), f"Mean shape mismatch: {mean.shape} vs ({expected_dim},)"
 
             # Compute covariance
             centered = features - mean
             cov = (1.0 / n) * np.dot(centered.T, centered)
+
+            # Validate cov shape
+            assert cov.shape == (
+                expected_dim, expected_dim
+            ), f"Cov shape mismatch: {cov.shape} vs ({expected_dim}, {expected_dim})"
 
             self.local_means[class_idx] = mean
             self.local_covs[class_idx] = cov
@@ -587,18 +627,43 @@ class GGEURClient(Client):
         logger.info(
             f"Client {self.ID}: Uploading local statistics to server...")
 
-        # Also send prototypes for cross-client augmentation
-        prototypes = {}
-        for class_idx, mean in self.local_means.items():
-            prototypes[class_idx] = mean
+        # Convert numpy arrays to lists for safe gRPC transmission
+        # This ensures consistent serialization across all clients
+        means_serialized = {}
+        covs_serialized = {}
+        prototypes_serialized = {}
+
+        for class_idx in self.local_means.keys():
+            # Ensure class_idx is int
+            class_idx = int(class_idx)
+
+            # Serialize mean (512,) -> list
+            mean = self.local_means[class_idx]
+            assert isinstance(mean, np.ndarray), f"mean should be ndarray, got {type(mean)}"
+            assert mean.shape == (self.ggeur_cfg.embedding_dim,), \
+                f"mean shape should be ({self.ggeur_cfg.embedding_dim},), got {mean.shape}"
+            means_serialized[class_idx] = mean.tolist()
+
+            # Serialize cov (512, 512) -> nested list
+            cov = self.local_covs[class_idx]
+            assert isinstance(cov, np.ndarray), f"cov should be ndarray, got {type(cov)}"
+            assert cov.shape == (self.ggeur_cfg.embedding_dim, self.ggeur_cfg.embedding_dim), \
+                f"cov shape should be ({self.ggeur_cfg.embedding_dim}, {self.ggeur_cfg.embedding_dim}), got {cov.shape}"
+            covs_serialized[class_idx] = cov.tolist()
+
+            # Serialize prototype (same as mean)
+            prototypes_serialized[class_idx] = mean.tolist()
 
         content = {
             'client_id': self.ID,
-            'means': self.local_means,
-            'covs': self.local_covs,
-            'counts': self.local_counts,
-            'prototypes': prototypes
+            'means': means_serialized,
+            'covs': covs_serialized,
+            'counts': self.local_counts,  # counts are already ints
+            'prototypes': prototypes_serialized
         }
+
+        logger.info(
+            f"Client {self.ID}: Serialized statistics for {len(means_serialized)} classes")
 
         self.comm_manager.send(
             Message(msg_type='local_statistics',
@@ -859,7 +924,7 @@ class GGEURClient(Client):
         # IMPORTANT: Always use config's num_classes, not the unique labels in augmented data
         # In LDS mode, each client may only have a subset of classes, but the model
         # must support all classes for proper FedAvg aggregation
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         input_dim = self.ggeur_cfg.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
@@ -1126,7 +1191,7 @@ class GGEURClient(Client):
             return  # Already setup
 
         # Build classifier with same architecture as MLP
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         input_dim = self.ggeur_cfg.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
@@ -1160,7 +1225,7 @@ class GGEURClient(Client):
         """Build CNN backbone for separated training Phase 2"""
         from federatedscope.contrib.model.ggeur_cnn import GGEUR_CNN_Backbone
 
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         cnn_model_name = getattr(self.ggeur_cfg, 'cnn_model', 'resnet18')
 
         self.cnn_backbone = GGEUR_CNN_Backbone(
@@ -1423,7 +1488,7 @@ class GGEURClient(Client):
         """Build CNN model for knowledge distillation"""
         from federatedscope.contrib.model.ggeur_cnn import GGEUR_CNN_FeatureAlign
 
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         cnn_model_name = getattr(self.ggeur_cfg, 'cnn_model', 'resnet18')
         cnn_pretrained = getattr(self.ggeur_cfg, 'cnn_pretrained', True)
         clip_dim = getattr(self.ggeur_cfg, 'embedding_dim', 512)
@@ -1443,7 +1508,7 @@ class GGEURClient(Client):
         """Build CNN model for feature alignment (from scratch training)"""
         from federatedscope.contrib.model.ggeur_cnn import GGEUR_CNN_FeatureAlign
 
-        num_classes = self._cfg.model.num_classes
+        num_classes = self._cfg.model.out_channels
         cnn_model_name = getattr(self.ggeur_cfg, 'cnn_model', 'resnet18')
         clip_dim = getattr(self.ggeur_cfg, 'embedding_dim', 512)
 
@@ -1738,7 +1803,7 @@ class GGEURClient(Client):
         # Convert global prototypes to tensor
         prototype_tensor = None
         if use_prototype_align and self.global_prototypes:
-            num_classes = self._cfg.model.num_classes
+            num_classes = self._cfg.model.out_channels
             clip_dim = getattr(self.ggeur_cfg, 'embedding_dim', 512)
             prototype_tensor = torch.zeros(num_classes,
                                            clip_dim).to(self.device)
