@@ -1120,94 +1120,101 @@ class GGEURServer(Server):
         logger.info(f"Server: Performing FedAvg aggregation for round {round_idx}")
 
         # Collect all model parameters
-        all_params = self.msg_buffer['train'][round_idx]
+        all_params = self.msg_buffer['train'].get(round_idx, [])
 
-        # Filter out empty updates
-        valid_params = [(s, p) for s, p, _ in all_params if s > 0 and p is not None]
+        try:
+            # Filter out empty updates
+            valid_params = [(s, p) for s, p, _ in all_params if s > 0 and p is not None]
 
-        if not valid_params:
-            logger.warning("Server: No valid model parameters received")
+            if not valid_params:
+                logger.warning("Server: No valid model parameters received")
+                self.state = round_idx + 1
+                if self.state < self._total_round_num:
+                    self._start_training_round()
+                else:
+                    self._finish()
+                return
+
+            # Compute sample weights
+            sample_sizes = [s for s, p in valid_params]
+            total_samples = sum(sample_sizes)
+
+            # Handle separated training mode
+            if self.use_separated_training:
+                self._perform_separated_fedavg(valid_params, total_samples, round_idx)
+            else:
+                # Check if we're in CNN distillation mode
+                first_params = valid_params[0][1]
+                is_combined_params = isinstance(first_params, dict) and 'mlp' in first_params
+
+                if is_combined_params:
+                    # Aggregate MLP and CNN separately
+                    mlp_aggregated = self._aggregate_model_params(
+                        [(s, p['mlp']) for s, p in valid_params if p.get('mlp') is not None],
+                        total_samples
+                    )
+                    cnn_aggregated = self._aggregate_model_params(
+                        [(s, p['cnn']) for s, p in valid_params if p.get('cnn') is not None],
+                        total_samples
+                    )
+
+                    # Update global MLP
+                    if mlp_aggregated and self.global_mlp is not None:
+                        try:
+                            self.global_mlp.load_state_dict(mlp_aggregated)
+                        except Exception as e:
+                            logger.debug(f"Server: Could not load MLP params: {e}")
+
+                    # Update global CNN
+                    if cnn_aggregated and self.global_cnn is not None:
+                        try:
+                            self.global_cnn.load_state_dict(cnn_aggregated)
+                        except Exception as e:
+                            logger.debug(f"Server: Could not load CNN params: {e}")
+                else:
+                    # Standard mode: only MLP
+                    mlp_aggregated = self._aggregate_model_params(valid_params, total_samples)
+
+                    if mlp_aggregated and self.global_mlp is not None:
+                        try:
+                            self.global_mlp.load_state_dict(mlp_aggregated)
+                        except Exception as e:
+                            logger.debug(f"Server: Could not load MLP params: {e}")
+
+            # Evaluate MLP on test sets (using CLIP features)
+            test_results = self._evaluate_on_test_sets()
+            if test_results:
+                acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
+                logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+
+            # Evaluate CNN on test sets (using original images) if enabled
+            # Include separated training Phase 2
+            should_eval_cnn = (
+                (self.use_cnn_distillation or self.use_feature_alignment) or
+                (self.use_separated_training and self.training_phase == 'cnn_backbone')
+            )
+            if should_eval_cnn and self.global_cnn is not None:
+                cnn_test_results = self._evaluate_cnn_on_test_sets()
+                if cnn_test_results:
+                    acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in cnn_test_results.items()])
+                    logger.info(f"Server: Round {round_idx} CNN Test Accuracy - {acc_str}")
+
+            # Log progress
+            logger.info(f"Server: Round {round_idx} aggregation complete, total samples: {total_samples}")
+
+            # Move to next round
             self.state = round_idx + 1
+
             if self.state < self._total_round_num:
                 self._start_training_round()
             else:
                 self._finish()
-            return
-
-        # Compute sample weights
-        sample_sizes = [s for s, p in valid_params]
-        total_samples = sum(sample_sizes)
-
-        # Handle separated training mode
-        if self.use_separated_training:
-            self._perform_separated_fedavg(valid_params, total_samples, round_idx)
-        else:
-            # Check if we're in CNN distillation mode
-            first_params = valid_params[0][1]
-            is_combined_params = isinstance(first_params, dict) and 'mlp' in first_params
-
-            if is_combined_params:
-                # Aggregate MLP and CNN separately
-                mlp_aggregated = self._aggregate_model_params(
-                    [(s, p['mlp']) for s, p in valid_params if p.get('mlp') is not None],
-                    total_samples
-                )
-                cnn_aggregated = self._aggregate_model_params(
-                    [(s, p['cnn']) for s, p in valid_params if p.get('cnn') is not None],
-                    total_samples
-                )
-
-                # Update global MLP
-                if mlp_aggregated and self.global_mlp is not None:
-                    try:
-                        self.global_mlp.load_state_dict(mlp_aggregated)
-                    except Exception as e:
-                        logger.debug(f"Server: Could not load MLP params: {e}")
-
-                # Update global CNN
-                if cnn_aggregated and self.global_cnn is not None:
-                    try:
-                        self.global_cnn.load_state_dict(cnn_aggregated)
-                    except Exception as e:
-                        logger.debug(f"Server: Could not load CNN params: {e}")
-            else:
-                # Standard mode: only MLP
-                mlp_aggregated = self._aggregate_model_params(valid_params, total_samples)
-
-                if mlp_aggregated and self.global_mlp is not None:
-                    try:
-                        self.global_mlp.load_state_dict(mlp_aggregated)
-                    except Exception as e:
-                        logger.debug(f"Server: Could not load MLP params: {e}")
-
-        # Evaluate MLP on test sets (using CLIP features)
-        test_results = self._evaluate_on_test_sets()
-        if test_results:
-            acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
-            logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
-
-        # Evaluate CNN on test sets (using original images) if enabled
-        # Include separated training Phase 2
-        should_eval_cnn = (
-            (self.use_cnn_distillation or self.use_feature_alignment) or
-            (self.use_separated_training and self.training_phase == 'cnn_backbone')
-        )
-        if should_eval_cnn and self.global_cnn is not None:
-            cnn_test_results = self._evaluate_cnn_on_test_sets()
-            if cnn_test_results:
-                acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in cnn_test_results.items()])
-                logger.info(f"Server: Round {round_idx} CNN Test Accuracy - {acc_str}")
-
-        # Log progress
-        logger.info(f"Server: Round {round_idx} aggregation complete, total samples: {total_samples}")
-
-        # Move to next round
-        self.state = round_idx + 1
-
-        if self.state < self._total_round_num:
-            self._start_training_round()
-        else:
-            self._finish()
+        finally:
+            try:
+                if isinstance(self.msg_buffer, dict) and 'train' in self.msg_buffer:
+                    self.msg_buffer['train'].pop(round_idx, None)
+            except Exception as e:
+                logger.debug(f"Server: Failed to cleanup msg_buffer for round {round_idx}: {e}")
 
     def _perform_separated_fedavg(self, valid_params, total_samples, round_idx):
         """Perform FedAvg for separated training mode"""

@@ -6,7 +6,7 @@
 
 # ========== Basic Settings ==========
 use_gpu: True
-device: 0
+device: 1
 seed: 42
 verbose: 1
 
@@ -14,16 +14,16 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 40
-  total_round_num: 50
-  sample_client_num: 40
+  client_num: 120
+  total_round_num: 200
+  sample_client_num: 120
 
 # ========== Data Settings ==========
 data:
   type: 'mdsent'
   root: 'data/sentiment'
-  splits: [0.8, 0.1, 0.1]
-  dirichlet_alpha: 0.1
+  splits: [0.8, 0, 0.2]
+  dirichlet_alpha: 0.01
   args:
     - include_unlabeled: True
       seed: 42
@@ -47,7 +47,7 @@ train:
   local_update_steps: 1
   optimizer:
     type: 'Adam'
-    lr: 0.001
+    lr: 0.1
 
 # ========== GGEUR Settings (No Augmentation) ==========
 ggeur:
