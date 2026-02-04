@@ -26,6 +26,7 @@ data:
   dirichlet_alpha: 0.01
   args:
     - include_unlabeled: True
+      balance_test: True
       seed: 42
       use_cache: True
 
@@ -80,4 +81,3 @@ ggeur:
 # ========== Output Settings ==========
 outdir: 'exp/fedavg_rnn_sentiment'
 expname: 'fedavg_mdsent_rating4_lstm_no_augmentation'
-

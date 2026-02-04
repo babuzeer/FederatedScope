@@ -17,6 +17,8 @@ Federated construction:
 
 Optional args (cfg.data.args[0]):
   - include_unlabeled: bool (default True)  # `unlabeled.review` still has ratings
+  - balance_test: bool (default False)      # make test set class-balanced (by undersampling)
+  - test_samples_per_class: int (default 0) # >0: force N per class; 0: auto=min class count
   - seed: int (default cfg.seed or 42)
   - use_cache: bool (default True)
   - cache_dir: str (default <data.root>/mdsent_cache)
@@ -46,6 +48,8 @@ _RATING_TO_CLASS = {"1.0": 0, "2.0": 1, "4.0": 2, "5.0": 3}
 class _MDSentArgs:
     include_unlabeled: bool = True
     max_samples_per_domain: int = 0  # <=0 means use all
+    balance_test: bool = False
+    test_samples_per_class: int = 0  # <=0 means auto (min class count)
     seed: int = 42
     cache_dir: str = ""  # empty -> <data.root>/mdsent_cache
     use_cache: bool = True
@@ -102,6 +106,8 @@ def _get_mdsent_args(cfg) -> _MDSentArgs:
     return _MDSentArgs(
         include_unlabeled=_get_bool("include_unlabeled", True),
         max_samples_per_domain=_get_int("max_samples_per_domain", 0),
+        balance_test=_get_bool("balance_test", False),
+        test_samples_per_class=_get_int("test_samples_per_class", 0),
         seed=_get_int("seed", int(getattr(cfg, "seed", 42))),
         cache_dir=_get_str("cache_dir", ""),
         use_cache=_get_bool("use_cache", True),
@@ -304,6 +310,64 @@ def _split_train_val_test(dataset: MDSentTextDataset, splits: Tuple[float, float
     return train_set, val_set, test_set
 
 
+def _balance_dataset_by_class(dataset: MDSentTextDataset,
+                              num_classes: int,
+                              seed: int,
+                              per_class: int = 0) -> MDSentTextDataset:
+    """
+    Create a class-balanced subset of `dataset` by undersampling each class.
+
+    Notes:
+      - This is intended for evaluation splits (e.g., test) where we want
+        equal samples per class.
+      - If any class is missing, we keep the original dataset unchanged.
+      - If `per_class<=0`, we use the minimum class count as the per-class size.
+    """
+    if dataset is None or len(dataset) == 0:
+        return dataset
+
+    num_classes = int(num_classes) if int(num_classes) > 0 else 0
+    if num_classes <= 0:
+        return dataset
+
+    label_to_indices: Dict[int, List[int]] = {c: [] for c in range(num_classes)}
+    for idx, y in enumerate(dataset.targets):
+        y = int(y)
+        if y in label_to_indices:
+            label_to_indices[y].append(idx)
+
+    counts = {c: len(v) for c, v in label_to_indices.items()}
+    if any(counts[c] <= 0 for c in range(num_classes)):
+        logger.warning(
+            f"MDSent: Cannot balance split for domain={getattr(dataset, 'domain', '')}, "
+            f"missing classes in split counts={counts}. Keeping original split."
+        )
+        return dataset
+
+    min_cnt = min(counts.values())
+    if int(per_class) > 0:
+        k = min(int(per_class), int(min_cnt))
+    else:
+        k = int(min_cnt)
+
+    if k <= 0:
+        return dataset
+
+    rng = random.Random(int(seed))
+    selected_indices: List[int] = []
+    for c in range(num_classes):
+        idxs = list(label_to_indices[c])
+        rng.shuffle(idxs)
+        selected_indices.extend(idxs[:k])
+
+    rng.shuffle(selected_indices)
+
+    texts = [dataset.texts[i] for i in selected_indices]
+    labels = [int(dataset.targets[i]) for i in selected_indices]
+    ids = [dataset.ids[i] for i in selected_indices]
+    return MDSentTextDataset(texts=texts, labels=labels, ids=ids, domain=dataset.domain)
+
+
 def _maybe_cap_domain_samples(dataset: MDSentTextDataset, args: _MDSentArgs, domain: str) -> MDSentTextDataset:
     max_n = int(getattr(args, "max_samples_per_domain", 0) or 0)
     if max_n <= 0 or len(dataset) <= max_n:
@@ -373,6 +437,14 @@ def load_mdsent_data(config, client_cfgs=None):
         train_dataset, val_dataset, test_dataset = _split_train_val_test(
             full_dataset, splits=splits, seed=_domain_seed(args, domain)
         )
+
+        if getattr(args, "balance_test", False) or int(getattr(args, "test_samples_per_class", 0) or 0) > 0:
+            test_dataset = _balance_dataset_by_class(
+                test_dataset,
+                num_classes=num_classes,
+                seed=_domain_seed(args, domain) + 97,
+                per_class=int(getattr(args, "test_samples_per_class", 0) or 0),
+            )
 
         # Split train dataset into clients within this domain
         if clients_per_domain <= 1:

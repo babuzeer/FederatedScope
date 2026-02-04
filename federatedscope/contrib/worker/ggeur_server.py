@@ -374,7 +374,22 @@ class GGEURServer(Server):
             except Exception:
                 max_n = 0
             max_str = "all" if max_n <= 0 else str(max_n)
+
+            balance_test = raw_args.get('balance_test', False)
+            if isinstance(balance_test, str):
+                balance_test = balance_test.strip().lower() in {"1", "true", "yes", "y"}
+            test_spc = raw_args.get('test_samples_per_class', 0)
+            try:
+                test_spc = int(test_spc)
+            except Exception:
+                test_spc = 0
+            if test_spc > 0:
+                balance_test = True
+
             dataset_name = f"{data_type}_includeu{int(bool(include_u))}_max{max_str}"
+            if balance_test:
+                # Ensure cache invalidation when evaluation set changes.
+                dataset_name = f"{dataset_name}_tbal1_tspc{int(test_spc)}"
 
         # Build model string based on feature extractor type
         if self.feature_extractor_type == 'bert':
@@ -546,6 +561,7 @@ class GGEURServer(Server):
                 raise ValueError("MDSent requires ggeur.feature_extractor='bert' for test feature extraction")
 
             from federatedscope.contrib.data.mdsent_data import (
+                _balance_dataset_by_class,
                 _domain_seed,
                 _get_mdsent_args,
                 _load_domain_all,
@@ -576,6 +592,13 @@ class GGEURServer(Server):
                 _, _, test_dataset = _split_train_val_test(
                     full_dataset, splits=splits, seed=_domain_seed(args, domain)
                 )
+                if getattr(args, "balance_test", False) or int(getattr(args, "test_samples_per_class", 0) or 0) > 0:
+                    test_dataset = _balance_dataset_by_class(
+                        test_dataset,
+                        num_classes=int(getattr(self._cfg.model, "num_classes", 4) or 4),
+                        seed=_domain_seed(args, domain) + 97,
+                        per_class=int(getattr(args, "test_samples_per_class", 0) or 0),
+                    )
                 if len(test_dataset) == 0:
                     logger.warning(f"Server: No test data for domain {domain}")
                     continue
