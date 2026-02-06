@@ -1,0 +1,90 @@
+# GGEUR on Multi-Domain Sentiment (Blitzer et al., 2007) using rating (4-class)
+#
+# - Domains: books / dvd / electronics / kitchen (data/sentiment/*)
+# - Labels: rating {1.0, 2.0, 4.0, 5.0} -> 4 classes
+# - Feature extractor (frozen): pretrained BERT
+# - Trainable model: LSTM/RNN classifier (NOT pretrained)
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 120          # must be divisible by 4 (domains)
+  total_round_num: 200
+  sample_client_num: 120
+
+# ========== Data Settings ==========
+data:
+  type: 'mdsent'
+  root: 'data/sentiment'
+  splits: [0.8, 0, 0.2]  # per-domain train/val/test split
+  dirichlet_alpha: 0.01    # within-domain client heterogeneity (label skew)
+  args:
+    - include_unlabeled: True
+      balance_test: True
+      seed: 42
+      use_cache: True
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_rnn'       # switch to 'ggeur_rnn' to use vanilla RNN
+  num_classes: 4
+  in_channels: 768         # BERT hidden size (embedding_dim)
+  hidden: 256
+  layer: 1                 # number of RNN/LSTM layers
+  dropout: 0.1
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 1e-3
+
+# ========== GGEUR Settings ==========
+ggeur:
+  use: True
+
+  # Feature extractor mode
+  feature_extractor: 'bert'
+
+  # BERT feature extraction (local path, feature extractor ONLY)
+  bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
+  bert_tokenizer_path: ''
+  bert_max_length: 128
+  bert_pooling: 'cls'
+  bert_batch_size: 32
+  bert_local_files_only: True
+  bert_use_pretrained_weights: True
+
+  # Embedding dimension (must match BERT hidden size)
+  embedding_dim: 768
+
+  # Feature caching
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # Feature augmentation
+  num_generated_per_sample: 200
+  num_generated_per_prototype: 200
+  target_size_per_class: 200
+  use_cross_client_prototypes: True
+  statistics_round: 0
+
+  # (Unused in RNN/LSTM mode; kept for compatibility)
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+# ========== Output Settings ==========
+outdir: 'exp/ggeur_rnn_sentiment'
+expname: 'ggeur_mdsent_rating4_rnn'

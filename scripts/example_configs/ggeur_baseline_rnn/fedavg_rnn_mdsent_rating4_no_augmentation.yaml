@@ -1,13 +1,12 @@
-# GGEUR on Multi-Domain Sentiment (Blitzer et al., 2007) using rating (4-class)
+# FedAvg baseline on Multi-Domain Sentiment (rating 4-class) using the same
+# GGEUR infrastructure (NO augmentation).
 #
-# - Domains: books / dvd / electronics / kitchen (data/sentiment/*)
-# - Labels: rating {1.0, 2.0, 4.0, 5.0} -> 4 classes
-# - Feature extractor (frozen): pretrained BERT
-# - Trainable model: LSTM/RNN classifier (NOT pretrained)
+# Key requirement: this config matches `ggeur_rnn_mdsent_rating4.yaml` except:
+#   - Disable augmentation (num_generated_*=0, target_size_per_class=0)
 
 # ========== Basic Settings ==========
 use_gpu: True
-device: 0
+device: 1
 seed: 42
 verbose: 1
 
@@ -15,7 +14,7 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 120          # must be divisible by 4 (domains)
+  client_num: 120
   total_round_num: 200
   sample_client_num: 120
 
@@ -23,10 +22,11 @@ federate:
 data:
   type: 'mdsent'
   root: 'data/sentiment'
-  splits: [0.8, 0, 0.2]  # per-domain train/val/test split
-  dirichlet_alpha: 0.01    # within-domain client heterogeneity (label skew)
+  splits: [0.8, 0, 0.2]
+  dirichlet_alpha: 0.01
   args:
     - include_unlabeled: True
+      balance_test: True
       seed: 42
       use_cache: True
 
@@ -36,11 +36,11 @@ dataloader:
 
 # ========== Model Settings ==========
 model:
-  type: 'ggeur_lstm'       # switch to 'ggeur_rnn' to use vanilla RNN
+  type: 'ggeur_rnn'
   num_classes: 4
-  in_channels: 768         # BERT hidden size (embedding_dim)
+  in_channels: 768
   hidden: 256
-  layer: 1                 # number of RNN/LSTM layers
+  layer: 1
   dropout: 0.1
 
 # ========== Training Settings ==========
@@ -48,16 +48,13 @@ train:
   local_update_steps: 1
   optimizer:
     type: 'Adam'
-    lr: 0.1
+    lr: 1e-3
 
-# ========== GGEUR Settings ==========
+# ========== GGEUR Settings (No Augmentation) ==========
 ggeur:
   use: True
-
-  # Feature extractor mode
   feature_extractor: 'bert'
 
-  # BERT feature extraction (local path, feature extractor ONLY)
   bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
   bert_tokenizer_path: ''
   bert_max_length: 128
@@ -66,17 +63,14 @@ ggeur:
   bert_local_files_only: True
   bert_use_pretrained_weights: True
 
-  # Embedding dimension (must match BERT hidden size)
   embedding_dim: 768
-
-  # Feature caching
   use_feature_cache: True
   feature_cache_dir: ''
 
-  # Feature augmentation
-  num_generated_per_sample: 200
-  num_generated_per_prototype: 200
-  target_size_per_class: 200
+  # === KEY DIFFERENCE: No augmentation ===
+  num_generated_per_sample: 0
+  num_generated_per_prototype: 0
+  target_size_per_class: 0
   use_cross_client_prototypes: True
   statistics_round: 0
 
@@ -85,6 +79,5 @@ ggeur:
   mlp_dropout: 0.0
 
 # ========== Output Settings ==========
-outdir: 'exp/ggeur_rnn_sentiment'
-expname: 'ggeur_mdsent_rating4_lstm'
-
+outdir: 'exp/fedavg_rnn_sentiment'
+expname: 'fedavg_mdsent_rating4_rnn_no_augmentation'

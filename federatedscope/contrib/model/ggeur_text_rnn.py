@@ -9,6 +9,8 @@ trainable model should NOT be the pretrained extractor.
 
 from __future__ import annotations
 
+from typing import Tuple, Union
+
 import torch
 import torch.nn as nn
 
@@ -62,16 +64,21 @@ class GGEURTextRNNClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.classifier = nn.Linear(hidden_dim, num_classes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, return_features: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if x.dim() == 2:
             x = x.unsqueeze(1)  # (B, 1, D)
         elif x.dim() != 3:
             raise ValueError(f"Expected input dim 2 or 3, got {x.dim()}")
 
         out, _ = self.rnn(x)
-        last = out[:, -1, :]  # (B, H)
-        last = self.dropout(last)
-        return self.classifier(last)
+        features = out[:, -1, :]  # (B, H)
+        dropped = self.dropout(features)
+        logits = self.classifier(dropped)
+        if return_features:
+            return logits, features
+        return logits
 
 
 def _build(model_config, input_shape, rnn_type: str):
@@ -107,4 +114,3 @@ def call_ggeur_text_rnn(model_config, input_shape):
 
 register_model("ggeur_rnn", call_ggeur_text_rnn)
 register_model("ggeur_lstm", call_ggeur_text_rnn)
-

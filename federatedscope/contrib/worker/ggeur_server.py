@@ -53,6 +53,14 @@ class GGEURServer(Server):
 
         self.ggeur_cfg = config.ggeur
 
+        # ===== FedOpt (Server-side Optimizer) =====
+        # NOTE: GGEUR uses a custom aggregation loop, so we need to apply FedOpt
+        # here (instead of relying on the core aggregator builder).
+        self.use_fedopt = bool(getattr(getattr(config, 'fedopt', None), 'use', False))
+        self.fedopt_mlp_optimizer = None
+        self.fedopt_mlp_scheduler = None
+        self._fedopt_annealing = bool(getattr(getattr(config, 'fedopt', None), 'annealing', False))
+
         # Statistics collection buffers
         self.local_statistics_buffer = {}  # {client_id: statistics}
         self.statistics_collected = False
@@ -65,6 +73,11 @@ class GGEURServer(Server):
 
         # Global prototypes (aggregated means) for feature alignment
         self.global_prototypes = {}  # {class_idx: mean_vector}
+
+        # ===== FedProto (Prototype Regularization on Representations) =====
+        # Optional comparison method built on top of the GGEUR pipeline.
+        self.use_fedproto = bool(getattr(self.ggeur_cfg, 'use_fedproto', False))
+        self.fedproto_global_prototypes = {}  # {class_idx: torch.Tensor}
 
         # MLP model for aggregation
         self.global_mlp = None
@@ -116,6 +129,61 @@ class GGEURServer(Server):
         self.training_phase = 'classifier'
         # Store pretrained classifier for Phase 2
         self.pretrained_classifier = None
+
+    def _maybe_init_fedopt_for_mlp(self):
+        if not self.use_fedopt or self.global_mlp is None:
+            return
+        if self.fedopt_mlp_optimizer is not None:
+            return
+
+        from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
+
+        self.fedopt_mlp_optimizer = get_optimizer(model=self.global_mlp,
+                                                  **self._cfg.fedopt.optimizer)
+        if self._fedopt_annealing:
+            self.fedopt_mlp_scheduler = torch.optim.lr_scheduler.StepLR(
+                self.fedopt_mlp_optimizer,
+                step_size=self._cfg.fedopt.annealing_step_size,
+                gamma=self._cfg.fedopt.annealing_gamma,
+            )
+        logger.info(
+            f"Server: FedOpt enabled for MLP (opt={self._cfg.fedopt.optimizer.type}, lr={self._cfg.fedopt.optimizer.lr})"
+        )
+
+    def _apply_fedopt_update_to_mlp(self, new_state_dict):
+        """
+        Apply FedOpt update on the server model using `new_state_dict` as the
+        FedAvg target (same logic as `FedOptAggregator`).
+        """
+        if not self.use_fedopt:
+            return False
+        if self.global_mlp is None or new_state_dict is None:
+            return False
+
+        self._maybe_init_fedopt_for_mlp()
+        if self.fedopt_mlp_optimizer is None:
+            return False
+
+        self.fedopt_mlp_optimizer.zero_grad()
+        for name, param in self.global_mlp.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name not in new_state_dict:
+                continue
+
+            target = new_state_dict[name]
+            if not isinstance(target, torch.Tensor):
+                target = torch.tensor(target)
+            target = target.to(device=param.device, dtype=param.dtype)
+
+            # gradient = w_t - w_avg (descent towards aggregated model)
+            param.grad = (param.data - target).detach()
+
+        self.fedopt_mlp_optimizer.step()
+        if self.fedopt_mlp_scheduler is not None:
+            self.fedopt_mlp_scheduler.step()
+
+        return True
 
     def _register_default_handlers(self):
         """Register message handlers"""
@@ -176,6 +244,7 @@ class GGEURServer(Server):
                 rnn_type=rnn_type,
             )
             self.global_mlp = self.global_mlp.to(self.device)
+            self._maybe_init_fedopt_for_mlp()
             logger.info(f"Server: Built global {model_type} classifier with {num_classes} classes")
             return
 
@@ -194,6 +263,7 @@ class GGEURServer(Server):
             self.global_mlp = nn.Linear(input_dim, num_classes)
 
         self.global_mlp = self.global_mlp.to(self.device)
+        self._maybe_init_fedopt_for_mlp()
         logger.info(f"Server: Built global MLP classifier with {num_classes} classes")
 
     def _build_global_cnn(self, num_classes):
@@ -883,6 +953,18 @@ class GGEURServer(Server):
             else:
                 model_para = None
 
+        # FedProto: attach global prototypes for clients, and wrap MLP params
+        if self.use_fedproto:
+            proto_payload = copy.deepcopy(self.fedproto_global_prototypes)
+            if isinstance(model_para, dict):
+                model_para = copy.deepcopy(model_para)
+                model_para['fedproto_global_prototypes'] = proto_payload
+            else:
+                model_para = {
+                    'mlp': model_para,
+                    'fedproto_global_prototypes': proto_payload,
+                }
+
         # Broadcast to all clients
         for client_id in range(1, self._client_num + 1):
             self.comm_manager.send(
@@ -1184,9 +1266,14 @@ class GGEURServer(Server):
                     # Update global MLP
                     if mlp_aggregated and self.global_mlp is not None:
                         try:
-                            self.global_mlp.load_state_dict(mlp_aggregated)
+                            if self.use_fedopt:
+                                applied = self._apply_fedopt_update_to_mlp(mlp_aggregated)
+                                if not applied:
+                                    self.global_mlp.load_state_dict(mlp_aggregated)
+                            else:
+                                self.global_mlp.load_state_dict(mlp_aggregated)
                         except Exception as e:
-                            logger.debug(f"Server: Could not load MLP params: {e}")
+                            logger.debug(f"Server: Could not update MLP params: {e}")
 
                     # Update global CNN
                     if cnn_aggregated and self.global_cnn is not None:
@@ -1200,9 +1287,18 @@ class GGEURServer(Server):
 
                     if mlp_aggregated and self.global_mlp is not None:
                         try:
-                            self.global_mlp.load_state_dict(mlp_aggregated)
+                            if self.use_fedopt:
+                                applied = self._apply_fedopt_update_to_mlp(mlp_aggregated)
+                                if not applied:
+                                    self.global_mlp.load_state_dict(mlp_aggregated)
+                            else:
+                                self.global_mlp.load_state_dict(mlp_aggregated)
                         except Exception as e:
-                            logger.debug(f"Server: Could not load MLP params: {e}")
+                            logger.debug(f"Server: Could not update MLP params: {e}")
+
+            # FedProto: aggregate global prototypes from clients
+            if self.use_fedproto:
+                self._aggregate_fedproto_prototypes(valid_params)
 
             # Evaluate MLP on test sets (using CLIP features)
             test_results = self._evaluate_on_test_sets()
@@ -1255,10 +1351,17 @@ class GGEURServer(Server):
 
             if classifier_aggregated and self.global_mlp is not None:
                 try:
-                    self.global_mlp.load_state_dict(classifier_aggregated)
-                    logger.info(f"Server: Phase 1 - Aggregated classifier from {len(valid_params)} clients")
+                    if self.use_fedopt:
+                        applied = self._apply_fedopt_update_to_mlp(classifier_aggregated)
+                        if not applied:
+                            self.global_mlp.load_state_dict(classifier_aggregated)
+                    else:
+                        self.global_mlp.load_state_dict(classifier_aggregated)
+                    logger.info(
+                        f"Server: Phase 1 - Aggregated classifier from {len(valid_params)} clients"
+                    )
                 except Exception as e:
-                    logger.debug(f"Server: Could not load classifier params: {e}")
+                    logger.debug(f"Server: Could not update classifier params: {e}")
 
         else:
             # Phase 2: Aggregate only CNN backbone parameters (classifier is frozen)
@@ -1304,6 +1407,72 @@ class GGEURServer(Server):
                 aggregated_params[key] += weight * param_tensor.float()
 
         return aggregated_params
+
+    def _aggregate_fedproto_prototypes(self, valid_params):
+        """
+        Aggregate FedProto prototypes from clients (weighted mean by per-class counts).
+
+        Expected format (client -> server) in `valid_params`:
+          - params is a dict that may contain:
+              - 'fedproto_local_prototypes': {class_idx: prototype_vector}
+              - 'fedproto_local_counts': {class_idx: count_int}
+        """
+        keep_last = bool(getattr(self.ggeur_cfg, 'fedproto_keep_last_global_prototypes', True))
+        aggregated = copy.deepcopy(self.fedproto_global_prototypes) if keep_last else {}
+
+        proto_sums = {}
+        proto_counts = {}
+
+        for _, params in valid_params:
+            if not isinstance(params, dict):
+                continue
+
+            local_protos = params.get('fedproto_local_prototypes', None)
+            local_counts = params.get('fedproto_local_counts', None)
+            if not local_protos or not local_counts:
+                continue
+
+            if not isinstance(local_protos, dict) or not isinstance(local_counts, dict):
+                continue
+
+            for class_idx, proto in local_protos.items():
+                try:
+                    class_idx_int = int(class_idx)
+                except Exception:
+                    continue
+
+                cnt = local_counts.get(class_idx_int, local_counts.get(str(class_idx_int), 0))
+                try:
+                    cnt = int(cnt)
+                except Exception:
+                    cnt = 0
+                if cnt <= 0 or proto is None:
+                    continue
+
+                if isinstance(proto, torch.Tensor):
+                    proto_tensor = proto.detach().cpu().float()
+                else:
+                    try:
+                        proto_tensor = torch.tensor(proto, dtype=torch.float32)
+                    except Exception:
+                        continue
+
+                if class_idx_int not in proto_sums:
+                    proto_sums[class_idx_int] = proto_tensor * float(cnt)
+                    proto_counts[class_idx_int] = cnt
+                else:
+                    proto_sums[class_idx_int] += proto_tensor * float(cnt)
+                    proto_counts[class_idx_int] += cnt
+
+        updated = 0
+        for class_idx_int, sum_vec in proto_sums.items():
+            cnt = int(proto_counts.get(class_idx_int, 0))
+            if cnt > 0:
+                aggregated[class_idx_int] = (sum_vec / float(cnt)).float()
+                updated += 1
+
+        self.fedproto_global_prototypes = aggregated
+        logger.info(f"Server: FedProto global prototypes aggregated ({updated} classes updated)")
 
     def _load_test_images(self):
         """Load test images for CNN evaluation"""

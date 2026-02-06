@@ -1,0 +1,93 @@
+# FedOpt baseline on Multi-Domain Sentiment (rating 4-class) using the same
+# GGEUR infrastructure (NO augmentation).
+#
+# This config is based on:
+#   `fedavg_rnn_mdsent_rating4_no_augmentation.yaml`
+# and only adds FedOpt server-side optimization (`fedopt.*`).
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 120
+  total_round_num: 200
+  sample_client_num: 120
+
+# ========== Data Settings ==========
+data:
+  type: 'mdsent'
+  root: 'data/sentiment'
+  splits: [0.8, 0, 0.2]
+  dirichlet_alpha: 0.01
+  args:
+    - include_unlabeled: True
+      balance_test: True
+      seed: 42
+      use_cache: True
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_rnn'
+  num_classes: 4
+  in_channels: 768
+  hidden: 256
+  layer: 1
+  dropout: 0.1
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 1e-3
+
+# ========== FedOpt Settings (Server Optimizer) ==========
+fedopt:
+  use: True
+  optimizer:
+    type: 'Adam'
+    lr: 0.01
+  annealing: False
+
+# ========== GGEUR Settings (No Augmentation) ==========
+ggeur:
+  use: True
+  feature_extractor: 'bert'
+
+  bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
+  bert_tokenizer_path: ''
+  bert_max_length: 128
+  bert_pooling: 'cls'
+  bert_batch_size: 32
+  bert_local_files_only: True
+  bert_use_pretrained_weights: True
+
+  embedding_dim: 768
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # === KEY DIFFERENCE: No augmentation ===
+  num_generated_per_sample: 0
+  num_generated_per_prototype: 0
+  target_size_per_class: 0
+  use_cross_client_prototypes: True
+  statistics_round: 0
+
+  # (Unused in RNN/LSTM mode; kept for compatibility)
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+# ========== Output Settings ==========
+outdir: 'exp/fedopt_rnn_sentiment'
+expname: 'fedopt_mdsent_rating4_rnn_no_augmentation'
+

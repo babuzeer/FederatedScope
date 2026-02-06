@@ -86,5 +86,5 @@ ggeur:
   mlp_dropout: 0.0
 
 # ========== Output Settings ==========
-outdir: 'exp/ggeur_rnn_sentiment'
+outdir: 'exp/ggeur_lstm_sentiment'
 expname: 'ggeur_mdsent_rating4_lstm'

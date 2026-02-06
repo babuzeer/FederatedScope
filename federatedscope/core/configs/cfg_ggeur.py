@@ -85,6 +85,20 @@ def extend_ggeur_cfg(cfg):
     # ========== Training Settings ==========
     cfg.ggeur.statistics_round = 0  # Round to collect statistics (usually 0)
 
+    # ========== FedProto (Prototype Regularization) ==========
+    # Enable FedProto-style prototype regularization on learned representations.
+    # NOTE: This is an optional extension for the GGEUR pipeline (mainly used for
+    # text RNN/LSTM classifiers) and does NOT change the evaluation logic.
+    cfg.ggeur.use_fedproto = False
+    # Weight for the prototype loss: total_loss = CE + proto_weight * proto_loss
+    cfg.ggeur.fedproto_proto_weight = 1.0
+    # Distance metric for prototype loss: 'mse' (squared L2) or 'cosine'
+    cfg.ggeur.fedproto_distance_metric = 'mse'
+    # Whether to L2-normalize embeddings/prototypes before distance computation
+    cfg.ggeur.fedproto_normalize = False
+    # Keep the previous round's global prototypes for classes missing this round
+    cfg.ggeur.fedproto_keep_last_global_prototypes = True
+
     # ========== LDS (Label Distribution Skew) Settings ==========
     # Whether to use Dirichlet distribution for non-IID data split
     cfg.ggeur.use_lds = False

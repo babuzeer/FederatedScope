@@ -79,5 +79,5 @@ ggeur:
   mlp_dropout: 0.0
 
 # ========== Output Settings ==========
-outdir: 'exp/fedavg_rnn_sentiment'
+outdir: 'exp/fedavg_lstm_sentiment'
 expname: 'fedavg_mdsent_rating4_lstm_no_augmentation'

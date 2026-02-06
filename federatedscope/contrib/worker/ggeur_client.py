@@ -179,6 +179,18 @@ class GGEURClient(Client):
         self.statistics_uploaded = False
         self.augmentation_done = False
 
+        # ===== FedProto (Prototype Regularization on Representations) =====
+        # This is an optional comparison method built on top of the GGEUR pipeline
+        # (keeps the same evaluation logic; adds an extra prototype loss during
+        # local training and prototype exchange across clients/rounds).
+        self.use_fedproto = bool(getattr(self.ggeur_cfg, 'use_fedproto', False))
+        self.fedproto_proto_weight = float(getattr(self.ggeur_cfg, 'fedproto_proto_weight', 1.0))
+        self.fedproto_distance_metric = str(getattr(self.ggeur_cfg, 'fedproto_distance_metric', 'mse')).lower()
+        self.fedproto_normalize = bool(getattr(self.ggeur_cfg, 'fedproto_normalize', False))
+        self.fedproto_global_prototypes = {}  # {class_idx: torch.Tensor}
+        self.fedproto_local_prototypes = {}  # {class_idx: torch.Tensor}
+        self.fedproto_local_counts = {}  # {class_idx: int}
+
         # ===== End-to-End Fine-tuning Mode (for CNN) =====
         self.use_end_to_end_finetune = getattr(self.ggeur_cfg, 'use_end_to_end_finetune', False)
         self.finetune_start_round = getattr(self.ggeur_cfg, 'finetune_start_round', 0)
@@ -1099,6 +1111,10 @@ class GGEURClient(Client):
 
         if content is not None:
             if isinstance(content, dict):
+                # FedProto: receive global prototypes from server (if provided)
+                if self.use_fedproto and 'fedproto_global_prototypes' in content:
+                    self._set_fedproto_global_prototypes(content.get('fedproto_global_prototypes'))
+
                 if 'mlp' in content:
                     mlp_para = content.get('mlp')
                     cnn_para = content.get('cnn')
@@ -1169,6 +1185,17 @@ class GGEURClient(Client):
             # Standard mode: only MLP
             combined_para = mlp_model_para
             sample_size = mlp_sample_size
+
+        # FedProto: attach local prototypes for server aggregation
+        if self.use_fedproto:
+            if isinstance(combined_para, dict):
+                if 'mlp' not in combined_para:
+                    combined_para = {'mlp': combined_para}
+            else:
+                combined_para = {'mlp': combined_para}
+
+            combined_para['fedproto_local_prototypes'] = copy.deepcopy(self.fedproto_local_prototypes)
+            combined_para['fedproto_local_counts'] = copy.deepcopy(self.fedproto_local_counts)
 
         # Send model parameters
         self.comm_manager.send(
@@ -1490,6 +1517,92 @@ class GGEURClient(Client):
 
         return total_samples, backbone_para, results
 
+    def _set_fedproto_global_prototypes(self, prototypes):
+        """Set FedProto global prototypes received from server (move to device)."""
+        if not self.use_fedproto:
+            return
+
+        if not prototypes:
+            self.fedproto_global_prototypes = {}
+            return
+
+        proto_dict = {}
+        if isinstance(prototypes, dict):
+            for class_idx, proto in prototypes.items():
+                try:
+                    class_idx = int(class_idx)
+                except Exception:
+                    continue
+
+                if proto is None:
+                    continue
+
+                if isinstance(proto, torch.Tensor):
+                    tensor = proto.detach().to(self.device).float()
+                else:
+                    try:
+                        tensor = torch.tensor(proto, device=self.device, dtype=torch.float32)
+                    except Exception:
+                        continue
+
+                proto_dict[class_idx] = tensor
+
+        self.fedproto_global_prototypes = proto_dict
+        logger.info(
+            f"Client {self.ID}: FedProto global prototypes updated ({len(self.fedproto_global_prototypes)} classes)"
+        )
+
+    def _compute_fedproto_local_prototypes(self):
+        """Compute local prototypes on the current augmented dataset (CPU tensors)."""
+        if not self.use_fedproto or self.augmented_loader is None or self.mlp_classifier is None:
+            return {}, {}
+
+        was_training = self.mlp_classifier.training
+        self.mlp_classifier.eval()
+
+        proto_sums = {}
+        proto_counts = {}
+
+        with torch.no_grad():
+            for features, labels in self.augmented_loader:
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+
+                try:
+                    _, embeddings = self.mlp_classifier(features, return_features=True)
+                except TypeError:
+                    # Model does not support returning features (disable proto upload)
+                    if was_training:
+                        self.mlp_classifier.train()
+                    return {}, {}
+
+                embeddings = embeddings.detach()
+                for cls in labels.unique():
+                    cls_int = int(cls.item())
+                    mask = labels == cls
+                    cnt = int(mask.sum().item())
+                    if cnt <= 0:
+                        continue
+
+                    emb_sum = embeddings[mask].sum(dim=0).cpu()
+                    if cls_int not in proto_sums:
+                        proto_sums[cls_int] = emb_sum
+                        proto_counts[cls_int] = cnt
+                    else:
+                        proto_sums[cls_int] += emb_sum
+                        proto_counts[cls_int] += cnt
+
+        local_prototypes = {}
+        for cls_int, sum_vec in proto_sums.items():
+            cnt = int(proto_counts.get(cls_int, 0))
+            if cnt > 0:
+                local_prototypes[cls_int] = (sum_vec / float(cnt)).float()
+
+        if was_training:
+            self.mlp_classifier.train()
+
+        return local_prototypes, proto_counts
+
     def _train_on_augmented_data(self):
         """Train MLP classifier on augmented features"""
         if self.augmented_loader is None or self.mlp_classifier is None:
@@ -1501,10 +1614,31 @@ class GGEURClient(Client):
         criterion = nn.CrossEntropyLoss()
 
         total_loss = 0.0
+        total_ce_loss = 0.0
+        total_proto_loss = 0.0
+        total_prox_loss = 0.0
         total_correct = 0
         total_samples = 0
 
         local_epochs = self._cfg.train.local_update_steps
+
+        # FedProx (proximal regularization) settings
+        fedprox_cfg = getattr(self._cfg, 'fedprox', None)
+        use_fedprox = bool(getattr(fedprox_cfg, 'use', False)) if fedprox_cfg is not None else False
+        fedprox_mu = float(getattr(fedprox_cfg, 'mu', 0.0)) if fedprox_cfg is not None else 0.0
+        if fedprox_mu <= 0:
+            use_fedprox = False
+
+        global_param_snapshot = None
+        if use_fedprox:
+            # Snapshot the received global parameters (before local updates)
+            global_param_snapshot = [
+                p.detach().clone() for p in self.mlp_classifier.parameters() if p.requires_grad
+            ]
+
+        # Reset local prototypes each round (avoid stale values)
+        self.fedproto_local_prototypes = {}
+        self.fedproto_local_counts = {}
 
         for epoch in range(local_epochs):
             for features, labels in self.augmented_loader:
@@ -1512,29 +1646,109 @@ class GGEURClient(Client):
                 labels = labels.to(self.device)
 
                 optimizer.zero_grad()
-                outputs = self.mlp_classifier(features)
-                loss = criterion(outputs, labels)
+
+                embeddings = None
+                if self.use_fedproto:
+                    try:
+                        outputs, embeddings = self.mlp_classifier(features, return_features=True)
+                    except TypeError:
+                        outputs = self.mlp_classifier(features)
+                        embeddings = None
+                else:
+                    outputs = self.mlp_classifier(features)
+
+                ce_loss = criterion(outputs, labels)
+                loss = ce_loss
+
+                proto_loss = None
+                if self.use_fedproto and embeddings is not None and self.fedproto_global_prototypes:
+                    # Build prototype targets for the batch labels
+                    proto_targets = torch.zeros_like(embeddings)
+                    valid_mask = torch.zeros(labels.shape[0], device=self.device, dtype=torch.bool)
+
+                    for class_idx, proto in self.fedproto_global_prototypes.items():
+                        mask = labels == int(class_idx)
+                        if mask.any():
+                            proto_targets[mask] = proto
+                            valid_mask |= mask
+
+                    if valid_mask.any():
+                        emb_sel = embeddings[valid_mask]
+                        proto_sel = proto_targets[valid_mask]
+
+                        if self.fedproto_normalize:
+                            emb_sel = F.normalize(emb_sel, p=2, dim=1)
+                            proto_sel = F.normalize(proto_sel, p=2, dim=1)
+
+                        metric = str(self.fedproto_distance_metric).lower()
+                        if metric in {'cos', 'cosine'}:
+                            proto_loss = 1.0 - F.cosine_similarity(emb_sel, proto_sel, dim=1).mean()
+                        else:
+                            # Default: squared L2 distance (mean over samples)
+                            proto_loss = (emb_sel - proto_sel).pow(2).sum(dim=1).mean()
+
+                        loss = ce_loss + self.fedproto_proto_weight * proto_loss
+
+                prox_reg = None
+                if use_fedprox and global_param_snapshot is not None:
+                    prox_term = torch.zeros((), device=self.device)
+                    idx = 0
+                    for p in self.mlp_classifier.parameters():
+                        if not p.requires_grad:
+                            continue
+                        prox_term = prox_term + (p - global_param_snapshot[idx]).pow(2).sum()
+                        idx += 1
+                    prox_reg = 0.5 * fedprox_mu * prox_term
+                    loss = loss + prox_reg
+
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item() * features.size(0)
+                batch_size = int(features.size(0))
+                total_loss += loss.item() * batch_size
+                total_ce_loss += ce_loss.item() * batch_size
+                if proto_loss is not None:
+                    total_proto_loss += proto_loss.item() * batch_size
+                if prox_reg is not None:
+                    total_prox_loss += prox_reg.item() * batch_size
                 _, predicted = torch.max(outputs, 1)
                 total_correct += (predicted == labels).sum().item()
-                total_samples += features.size(0)
+                total_samples += batch_size
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        avg_ce_loss = total_ce_loss / total_samples if total_samples > 0 else 0
+        avg_proto_loss = total_proto_loss / total_samples if total_samples > 0 else 0
+        avg_prox_loss = total_prox_loss / total_samples if total_samples > 0 else 0
         accuracy = total_correct / total_samples if total_samples > 0 else 0
 
-        logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
+        if self.use_fedproto or use_fedprox:
+            logger.info(
+                f"Client {self.ID}: Train loss={avg_loss:.4f} (ce={avg_ce_loss:.4f}, "
+                f"proto={avg_proto_loss:.4f}, prox={avg_prox_loss:.4f}), "
+                f"accuracy={accuracy:.4f}"
+            )
+        else:
+            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
+
+        # Compute and cache local prototypes for upload (FedProto)
+        if self.use_fedproto:
+            local_prototypes, local_counts = self._compute_fedproto_local_prototypes()
+            self.fedproto_local_prototypes = local_prototypes
+            self.fedproto_local_counts = local_counts
 
         # Get model parameters
         model_para = copy.deepcopy(self.mlp_classifier.state_dict())
 
         results = {
             'train_loss': avg_loss,
+            'train_ce_loss': avg_ce_loss,
             'train_acc': accuracy,
             'train_total': total_samples
         }
+        if self.use_fedproto:
+            results['train_proto_loss'] = avg_proto_loss
+        if use_fedprox:
+            results['train_prox_loss'] = avg_prox_loss
 
         return total_samples, model_para, results
 

@@ -77,89 +77,83 @@ class FedProtoServer(Server):
                    f"embedding_dim={self.embedding_dim}, "
                    f"aggregation={self.aggregation_method}")
 
-    def check_and_move_on(self,
-                         check_eval_result=False,
-                         min_received_num=None):
+    def callback_funcs_model_para(self, message: Message):
         """
-        Override to handle prototype aggregation along with model aggregation
+        Receive model updates and (optionally) local prototypes from clients.
 
-        This method is called when enough clients have responded.
+        Clients upload a dict:
+          {
+            'sample_count': int,
+            'model_para': state_dict (or list of state_dict for multi-model),
+            'prototypes': Tensor[num_classes, embedding_dim] (optional)
+          }
+
+        This handler converts the payload back to the standard
+        `(sample_size, model_para)` format used by the vanilla Server, while
+        separately storing prototypes for server-side aggregation.
         """
-        min_received_num = len(self.comm_manager.get_neighbors().keys()) \
-            if min_received_num is None else min_received_num
+        if self.is_finish:
+            return 'finish'
 
-        if check_eval_result:
-            # Check evaluation results (standard behavior)
-            minimal_number = min_received_num if self._cfg.federate.mode.lower() == "standalone" \
-                else len(self.comm_manager.get_neighbors())
-
-            if self.check_client_join_in() and len(self._outstanding_vals) >= minimal_number:
-                # Merge evaluation results
-                formatted_eval_res = self.merge_eval_results_from_all_clients()
-                self.history_results = self.merge_eval_results(
-                    self.history_results, formatted_eval_res, self.state
-                )
-
-                if self.mode == 'standalone':
-                    self.check_and_save()
-                return True
-
-        else:
-            # Check training results - this is where we aggregate prototypes
-            move_on_flag = self.check_client_join_in()
-
-            if move_on_flag:
-                # Aggregate prototypes before moving on
-                self.aggregate_prototypes()
-
-                # Standard model aggregation happens in the parent class
-                # via the aggregator mechanism
-
-                # Move to next round
-                return True
-
-        return False
-
-    def callback_funcs_for_model_para(self, message: Message):
-        """
-        Override to receive and store local prototypes from clients
-
-        Clients send both model parameters and local prototypes.
-        We need to extract and store the prototypes separately.
-        """
-        # Standard model parameter handling
-        round_number = message.state
+        rnd = message.state
         sender = message.sender
-        content = message.content
+        timestamp = message.timestamp
+        payload = message.content
         self.sampler.change_state(sender, 'idle')
 
-        # Check if prototypes are included in the message
-        # We expect content to be a dict with 'model_para' and 'prototypes' keys
-        if isinstance(content, dict) and 'prototypes' in content:
-            # Extract prototypes
-            prototypes = content['prototypes']
-            sample_count = content.get('sample_count', 1)
+        # update the currency timestamp according to the received message
+        assert timestamp >= self.cur_timestamp  # for test
+        self.cur_timestamp = timestamp
 
-            # Store prototypes for aggregation
-            self.received_prototypes[sender] = (prototypes, sample_count)
-            logger.debug(f"Received prototypes from client {sender}, "
-                        f"shape={prototypes.shape}, samples={sample_count}")
-
-            # Extract model parameters for standard aggregation
-            model_para = content.get('model_para', content)
+        # Parse payload
+        if isinstance(payload, dict):
+            sample_size = int(payload.get('sample_count', 0) or 0)
+            model_para = payload.get('model_para', {})
+            prototypes = payload.get('prototypes', None)
+            if rnd == self.state and prototypes is not None:
+                self.received_prototypes[sender] = (prototypes, sample_size)
         else:
-            # No prototypes in this message, use content as model_para
-            model_para = content
-            logger.warning(f"No prototypes received from client {sender}")
+            # Fallback to vanilla format: (sample_size, model_para)
+            sample_size, model_para = payload
 
-        # Call parent's model aggregation logic with just model_para
-        # We'll handle this via the aggregator
+        # dequantization
+        if self._cfg.quantization.method == 'uniform':
+            from federatedscope.core.compression import \
+                symmetric_uniform_dequantization
+            if isinstance(model_para, list):  # multiple model
+                model_para = [
+                    symmetric_uniform_dequantization(x) for x in model_para
+                ]
+            else:
+                model_para = symmetric_uniform_dequantization(model_para)
+
+        content = (sample_size, model_para)
+
+        if rnd == self.state:
+            if rnd not in self.msg_buffer['train']:
+                self.msg_buffer['train'][rnd] = dict()
+            self.msg_buffer['train'][rnd][sender] = content
+        elif rnd >= self.state - self.staleness_toleration:
+            self.staled_msg_buffer.append((rnd, sender, content))
+        else:
+            logger.info(f'Drop a out-of-date message from round #{rnd}')
+            self.dropout_num += 1
+
         if self._cfg.federate.online_aggr:
-            # Online aggregation
-            self.aggregator.inc(tuple(model_para.values()) if isinstance(model_para, dict) else model_para)
-        else:
-            # Store for batch aggregation
-            self.msg_buffer['train'][round_number].append((sender, model_para))
+            self.aggregator.inc(content)
+
+        move_on_flag = self.check_and_move_on()
+        if self._cfg.asyn.use and self._cfg.asyn.broadcast_manner == \
+                'after_receiving':
+            self.broadcast_model_para(msg_type='model_para',
+                                      sample_client_num=1)
+
+        return move_on_flag
+
+    def _perform_federated_aggregation(self):
+        aggregated_num = super()._perform_federated_aggregation()
+        self.aggregate_prototypes()
+        return aggregated_num
 
     def aggregate_prototypes(self):
         """
@@ -228,58 +222,74 @@ class FedProtoServer(Server):
                             sample_client_num=-1,
                             filter_unseen_clients=True):
         """
-        Override to broadcast both model parameters and global prototypes
+        Broadcast model parameters and (if available) global prototypes.
 
-        Flow:
-        1. Determine receiver list
-        2. Broadcast global model parameters (FedAvg result)
-        3. Additionally broadcast global prototypes
+        To ensure clients train with the latest prototypes, prototypes are
+        sent *before* the `model_para` message in each round.
         """
-        # Use parent class to broadcast model parameters
-        super().broadcast_model_para(
-            msg_type=msg_type,
-            sample_client_num=sample_client_num,
-            filter_unseen_clients=filter_unseen_clients
-        )
+        if filter_unseen_clients:
+            self.sampler.change_state(self.unseen_clients_id, 'unseen')
 
-        # Additionally broadcast global prototypes if available and msg_type is model_para
-        if self.global_prototypes is not None and msg_type == 'model_para':
-            # Determine receivers (same logic as parent)
-            if filter_unseen_clients:
-                self.sampler.change_state(self.unseen_clients_id, 'unseen')
-
-            if sample_client_num > 0:
-                receiver = self.sampler.sample(size=sample_client_num)
-            else:
-                receiver = list(self.comm_manager.neighbors.keys())
-
-            self.broadcast_global_prototypes(receiver=receiver)
-
-            if filter_unseen_clients:
-                self.sampler.change_state(self.unseen_clients_id, 'seen')
-
-    def broadcast_global_prototypes(self, receiver=None):
-        """
-        Broadcast global prototypes to clients
-
-        Args:
-            receiver: List of client IDs. If None, broadcast to all neighbors.
-        """
-        if receiver is None:
+        if sample_client_num > 0:
+            receiver = self.sampler.sample(size=sample_client_num)
+        else:
             receiver = list(self.comm_manager.neighbors.keys())
+            if msg_type == 'model_para':
+                self.sampler.change_state(receiver, 'working')
 
-        if not receiver:
-            logger.warning("No receivers available for global prototype broadcast")
-            return
+        # We define the evaluation happens at the end of an epoch
+        rnd = self.state - 1 if msg_type == 'evaluate' else self.state
+        state_to_send = min(rnd, self.total_round_num)
 
-        # Send prototypes as a separate message
+        if self.global_prototypes is not None and msg_type == 'model_para':
+            self.comm_manager.send(
+                Message(msg_type='global_prototypes',
+                        sender=self.ID,
+                        receiver=receiver,
+                        state=state_to_send,
+                        timestamp=self.cur_timestamp,
+                        content=self.global_prototypes.detach().cpu())
+            )
+
+        if self._noise_injector is not None and msg_type == 'model_para':
+            for model_idx_i in range(len(self.models)):
+                num_sample_clients = [
+                    v["num_sample"] for v in self.join_in_info.values()
+                ]
+                self._noise_injector(self._cfg, num_sample_clients,
+                                     self.models[model_idx_i])
+
+        skip_broadcast = self._cfg.federate.method in ["local", "global"]
+        if self.model_num > 1:
+            model_para = [{} if skip_broadcast else model.state_dict()
+                          for model in self.models]
+        else:
+            model_para = {} if skip_broadcast else self.models[0].state_dict()
+
+        # quantization
+        if msg_type == 'model_para' and not skip_broadcast and \
+                self._cfg.quantization.method == 'uniform':
+            from federatedscope.core.compression import \
+                symmetric_uniform_quantization
+            nbits = self._cfg.quantization.nbits
+            if self.model_num > 1:
+                model_para = [
+                    symmetric_uniform_quantization(x, nbits)
+                    for x in model_para
+                ]
+            else:
+                model_para = symmetric_uniform_quantization(model_para, nbits)
+
         self.comm_manager.send(
-            Message(msg_type='global_prototypes',
-                   sender=self.ID,
-                   receiver=receiver,
-                   state=self.state,
-                   timestamp=self.cur_timestamp,
-                   content=self.global_prototypes.detach().cpu())
-        )
+            Message(msg_type=msg_type,
+                    sender=self.ID,
+                    receiver=receiver,
+                    state=state_to_send,
+                    timestamp=self.cur_timestamp,
+                    content=model_para))
+        if self._cfg.federate.online_aggr:
+            for idx in range(self.model_num):
+                self.aggregators[idx].reset()
 
-        logger.debug(f"Broadcast global prototypes to {len(receiver)} clients")
+        if filter_unseen_clients:
+            self.sampler.change_state(self.unseen_clients_id, 'seen')

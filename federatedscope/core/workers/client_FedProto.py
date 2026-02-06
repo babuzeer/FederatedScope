@@ -11,6 +11,7 @@ Handles client-side operations for FedProto:
 import logging
 from federatedscope.core.workers import Client
 from federatedscope.core.message import Message
+from federatedscope.register import register_worker
 
 logger = logging.getLogger(__name__)
 
@@ -75,61 +76,132 @@ class FedProtoClient(Client):
 
     def callback_funcs_for_model_para(self, message: Message):
         """
-        Override to handle model parameter updates
-
-        This is called when server sends updated model parameters.
-        Standard behavior, no changes needed.
+        Override to include local prototypes in uploads.
         """
-        # Call parent implementation
-        super().callback_funcs_for_model_para(message)
+        if 'ss' in message.msg_type:
+            # Keep the secret-sharing fragment handling from the base client
+            return super().callback_funcs_for_model_para(message)
 
-    def callback_funcs_for_finish(self, message: Message):
-        """
-        Callback for training completion
+        import copy
 
-        After local training:
-        1. Extract local prototypes from trainer
-        2. Package model parameters and prototypes
-        3. Send to server
-        """
-        # Standard finish handling
-        if message.content is not None:
-            # This means we should update our model
-            self.trainer.update(message.content, strict=self._cfg.federate.share_local_model)
+        round = message.state
+        sender = message.sender
+        timestamp = message.timestamp
+        content = message.content
 
-        # Start local training
-        sample_size, model_para, results = self.trainer.train()
+        # dequantization
+        if self._cfg.quantization.method == 'uniform':
+            from federatedscope.core.compression import \
+                symmetric_uniform_dequantization
+            if isinstance(content, list):  # multiple model
+                content = [
+                    symmetric_uniform_dequantization(x) for x in content
+                ]
+            else:
+                content = symmetric_uniform_dequantization(content)
 
-        # Extract local prototypes from trainer
+        # When clients share the local model, we must set strict=True to
+        # ensure all the model params are overwritten and synchronized
+        if self._cfg.federate.process_num > 1:
+            for k, v in content.items():
+                content[k] = v.to(self.device)
+
+        self.trainer.update(content,
+                            strict=self._cfg.federate.share_local_model)
+        self.state = round
+
+        skip_train_isolated_or_global_mode = \
+            self.early_stopper.early_stopped and \
+            self._cfg.federate.method in ["local", "global"]
+        if self.is_unseen_client or skip_train_isolated_or_global_mode:
+            sample_size, model_para_all, results = \
+                0, self.trainer.get_model_para(), {}
+            if skip_train_isolated_or_global_mode:
+                logger.info(
+                    f"[Local/Global mode] Client #{self.ID} has been "
+                    f"early stopped, we will skip the local training")
+                self._monitor.local_converged()
+        else:
+            if self.early_stopper.early_stopped and \
+                    self._monitor.local_convergence_round == 0:
+                logger.info(
+                    f"[Normal FL Mode] Client #{self.ID} has been locally "
+                    f"early stopped. "
+                    f"The next FL update may result in negative effect")
+                self._monitor.local_converged()
+
+            sample_size, model_para_all, results = self.trainer.train()
+            if self._cfg.federate.share_local_model and not \
+                    self._cfg.federate.online_aggr:
+                model_para_all = copy.deepcopy(model_para_all)
+
+            train_log_res = self._monitor.format_eval_res(
+                results,
+                rnd=self.state,
+                role='Client #{}'.format(self.ID),
+                return_raw=True)
+            logger.info(train_log_res)
+            if self._cfg.wandb.use and self._cfg.wandb.client_train_info:
+                self._monitor.save_formatted_results(train_log_res,
+                                                     save_file_name="")
+
+        if self._cfg.federate.use_ss:
+            # FedProto currently does not support secret sharing uploads with prototypes
+            return super().callback_funcs_for_model_para(message)
+
+        if self._cfg.asyn.use or self._cfg.aggregator.robust_rule in \
+                ['krum', 'normbounding', 'median', 'trimmedmean',
+                 'bulyan']:
+            shared_model_para = self._calculate_model_delta(
+                init_model=content, updated_model=model_para_all)
+        else:
+            shared_model_para = model_para_all
+
+        # quantization
+        if self._cfg.quantization.method == 'uniform':
+            from federatedscope.core.compression import \
+                symmetric_uniform_quantization
+            nbits = self._cfg.quantization.nbits
+            if isinstance(shared_model_para, list):
+                shared_model_para = [
+                    symmetric_uniform_quantization(x, nbits)
+                    for x in shared_model_para
+                ]
+            else:
+                shared_model_para = symmetric_uniform_quantization(
+                    shared_model_para, nbits)
+
         local_prototypes = None
         if hasattr(self.trainer, 'get_local_prototypes'):
             local_prototypes = self.trainer.get_local_prototypes()
-            if local_prototypes is not None:
-                logger.info(f"Client {self.ID} computed local prototypes: "
-                           f"shape={local_prototypes.shape}")
-            else:
-                logger.warning(f"Client {self.ID} failed to compute local prototypes")
 
-        # Package content with both model and prototypes
+        send_content = {
+            'sample_count': sample_size,
+            'model_para': shared_model_para,
+        }
         if local_prototypes is not None:
-            content = {
-                'model_para': model_para,
-                'prototypes': local_prototypes.cpu(),
-                'sample_count': sample_size
-            }
-        else:
-            # Fallback: send only model parameters
-            content = model_para
-            logger.warning(f"Client {self.ID} sending model without prototypes")
+            send_content['prototypes'] = local_prototypes.detach().cpu()
 
-        # Create message to send back to server
         self.comm_manager.send(
             Message(msg_type='model_para',
-                   sender=self.ID,
-                   receiver=[self.server_id],
-                   state=self.state,
-                   content=content)
-        )
+                    sender=self.ID,
+                    receiver=[sender],
+                    state=self.state,
+                    timestamp=self._gen_timestamp(
+                        init_timestamp=timestamp,
+                        instance_number=sample_size),
+                    content=send_content))
 
-        logger.info(f"Client {self.ID} completed training round {self.state}, "
-                   f"sent model and prototypes to server")
+
+
+def call_fedproto_worker(method):
+    if method.lower() == 'fedproto':
+        from federatedscope.core.workers.server_FedProto import FedProtoServer
+        return {
+            'client': FedProtoClient,
+            'server': FedProtoServer
+        }
+    return None
+
+
+register_worker('fedproto', call_fedproto_worker)
