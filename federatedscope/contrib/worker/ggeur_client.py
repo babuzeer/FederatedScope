@@ -639,14 +639,16 @@ class GGEURClient(Client):
 
             # Serialize mean (512,) -> list
             mean = self.local_means[class_idx]
-            assert isinstance(mean, np.ndarray), f"mean should be ndarray, got {type(mean)}"
+            assert isinstance(
+                mean, np.ndarray), f"mean should be ndarray, got {type(mean)}"
             assert mean.shape == (self.ggeur_cfg.embedding_dim,), \
                 f"mean shape should be ({self.ggeur_cfg.embedding_dim},), got {mean.shape}"
             means_serialized[class_idx] = mean.tolist()
 
             # Serialize cov (512, 512) -> nested list
             cov = self.local_covs[class_idx]
-            assert isinstance(cov, np.ndarray), f"cov should be ndarray, got {type(cov)}"
+            assert isinstance(
+                cov, np.ndarray), f"cov should be ndarray, got {type(cov)}"
             assert cov.shape == (self.ggeur_cfg.embedding_dim, self.ggeur_cfg.embedding_dim), \
                 f"cov shape should be ({self.ggeur_cfg.embedding_dim}, {self.ggeur_cfg.embedding_dim}), got {cov.shape}"
             covs_serialized[class_idx] = cov.tolist()
@@ -663,7 +665,8 @@ class GGEURClient(Client):
         }
 
         logger.info(
-            f"Client {self.ID}: Serialized statistics for {len(means_serialized)} classes")
+            f"Client {self.ID}: Serialized statistics for {len(means_serialized)} classes"
+        )
 
         self.comm_manager.send(
             Message(msg_type='local_statistics',
@@ -681,11 +684,23 @@ class GGEURClient(Client):
             f"Client {self.ID}: Received global covariances from server")
 
         content = message.content
-        self.global_cov_matrices = content.get('cov_matrices', {})
-        self.other_prototypes = content.get('other_prototypes',
-                                            {}).get(self.ID, {})
-        self.global_prototypes = content.get('global_prototypes',
-                                             {})  # For feature alignment
+        raw_cov = content.get('cov_matrices', {})
+        self.global_cov_matrices = {
+            k: np.array(v) if isinstance(v, list) else v
+            for k, v in raw_cov.items()
+        }
+        raw_other = content.get('other_prototypes', {}).get(self.ID, {})
+        self.other_prototypes = {
+            k: [np.array(p) if isinstance(p, list) else p
+                for p in v] if isinstance(v, list) else v
+            for k, v in raw_other.items()
+        }
+        raw_global = content.get('global_prototypes',
+                                 {})  # For feature alignment
+        self.global_prototypes = {
+            k: np.array(v) if isinstance(v, list) else v
+            for k, v in raw_global.items()
+        }
 
         # Perform augmentation
         self._perform_augmentation()
