@@ -87,6 +87,11 @@ class OfficeHomeShardDataset(Dataset):
                 self.samples.append(item['path'])
                 self.targets.append(item['label'])
 
+    @property
+    def data(self):
+        """Alias for samples, compatible with ggeur_client cache logic."""
+        return self.samples
+
     def __len__(self):
         return len(self.samples)
 
