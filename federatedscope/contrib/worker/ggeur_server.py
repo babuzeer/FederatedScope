@@ -12,6 +12,7 @@ Handles:
 """
 
 import os
+import gc
 import logging
 import copy
 import numpy as np
@@ -452,6 +453,18 @@ class GGEURServer(Server):
         logger.info(
             f"Server: Loaded test data for {len(self.test_features)} domains")
 
+        # Unload CLIP model after test features are extracted/cached - no longer needed
+        if self.clip_model is not None:
+            del self.clip_model
+            self.clip_model = None
+            self.clip_preprocess = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info(
+                "Server: Unloaded CLIP model after test feature extraction (~600 MB freed)"
+            )
+
     def _evaluate_on_test_sets(self):
         """Evaluate global model on all test sets"""
         if self.global_mlp is None:
@@ -538,7 +551,7 @@ class GGEURServer(Server):
             cov = np.array(cov_list, dtype=np.float32)
 
             # Validate shapes
-            if mean.shape != (expected_dim,):
+            if mean.shape != (expected_dim, ):
                 raise ValueError(
                     f"Client {client_id}, Class {class_idx}: mean shape mismatch - expected ({expected_dim},), got {mean.shape}"
                 )
@@ -595,6 +608,9 @@ class GGEURServer(Server):
             self._broadcast_global_covariances(other_prototypes)
 
             self.statistics_collected = True
+
+            # Release large data structures no longer needed after broadcast
+            self._cleanup_after_broadcast()
 
     def callback_for_augmentation_ready(self, message: Message):
         """Handle client signaling augmentation is complete"""
@@ -870,17 +886,47 @@ class GGEURServer(Server):
         return other_prototypes
 
     def _broadcast_global_covariances(self, other_prototypes):
-        """Broadcast global covariance matrices and prototypes to all clients"""
+        """Broadcast global covariance matrices and prototypes to all clients.
+
+        IMPORTANT: Message.transform_to_list() mutates dict values IN-PLACE,
+        converting numpy arrays to Python lists (~7x memory expansion).
+        We pre-serialize cov_matrices ONCE and reuse for all clients to avoid
+        mutating self.global_cov_matrices and to reduce redundant conversions.
+        """
         logger.info("Server: Broadcasting global covariances to clients...")
 
+        # Pre-serialize covariance matrices once (65 × 512×512 numpy → Python lists)
+        # This avoids transform_to_list mutating self.global_cov_matrices in-place
+        cov_serialized = {
+            k: v.tolist() if hasattr(v, 'tolist') else v
+            for k, v in self.global_cov_matrices.items()
+        }
+
+        # Pre-serialize global prototypes once
+        global_proto_serialized = {
+            k: v.tolist() if hasattr(v, 'tolist') else v
+            for k, v in self.global_prototypes.items()
+        }
+
         for client_id in self.local_statistics_buffer.keys():
+            # Pre-serialize this client's other_prototypes
+            raw_other = other_prototypes.get(client_id, {})
+            other_serialized = {}
+            for cls_idx, protos in raw_other.items():
+                if isinstance(protos, list):
+                    other_serialized[cls_idx] = [
+                        p.tolist() if hasattr(p, 'tolist') else p
+                        for p in protos
+                    ]
+                else:
+                    other_serialized[cls_idx] = protos
+
             content = {
-                'cov_matrices': self.global_cov_matrices,
+                'cov_matrices': cov_serialized,
                 'other_prototypes': {
-                    client_id: other_prototypes.get(client_id, {})
+                    client_id: other_serialized
                 },
-                'global_prototypes': self.
-                global_prototypes  # For feature alignment
+                'global_prototypes': global_proto_serialized,
             }
 
             self.comm_manager.send(
@@ -890,8 +936,46 @@ class GGEURServer(Server):
                         state=self.state,
                         content=content))
 
+        # Free pre-serialized data
+        del cov_serialized, global_proto_serialized
+
         logger.info(
             f"Server: Broadcasted global covariances to {len(self.local_statistics_buffer)} clients"
+        )
+
+    def _cleanup_after_broadcast(self):
+        """Release large data structures no longer needed after broadcasting covariances.
+
+        After broadcast:
+        - local_statistics_buffer: 4 clients × 65 classes × 512×512 covs ≈ 260 MB
+        - all_prototypes: only used for preparing other_prototypes
+        - global_cov_matrices: already sent to all clients ≈ 67 MB
+        """
+        freed_mb = 0
+
+        # Clean up local statistics buffer (largest: contains all client covs)
+        for client_stats in self.local_statistics_buffer.values():
+            if 'covs' in client_stats:
+                for v in client_stats['covs'].values():
+                    if hasattr(v, 'nbytes'):
+                        freed_mb += v.nbytes / (1024 * 1024)
+        self.local_statistics_buffer = {}
+
+        # Clean up all_prototypes (cross-client prototypes already distributed)
+        self.all_prototypes = {}
+
+        # Clean up global covariance matrices (already sent to clients)
+        for v in self.global_cov_matrices.values():
+            if hasattr(v, 'nbytes'):
+                freed_mb += v.nbytes / (1024 * 1024)
+        self.global_cov_matrices = {}
+
+        # Keep global_prototypes - may be needed for feature alignment evaluation
+
+        gc.collect()
+
+        logger.info(
+            f"Server: Memory cleanup after broadcast completed, freed ~{freed_mb:.0f} MB"
         )
 
     def callback_funcs_model_para(self, message: Message):
@@ -928,8 +1012,11 @@ class GGEURServer(Server):
         logger.info(
             f"Server: Performing FedAvg aggregation for round {round_idx}")
 
-        # Collect all model parameters
+        # Collect all model parameters and clear buffer for this round
         all_params = self.msg_buffer['train'][round_idx]
+        # Clear buffer to prevent memory leak (base Server.check_and_move_on
+        # normally does this, but GGEUR bypasses it with custom _perform_fedavg)
+        self.msg_buffer['train'][round_idx] = []
 
         # Filter out empty updates
         valid_params = [(s, p) for s, p, _ in all_params

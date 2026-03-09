@@ -11,6 +11,7 @@ Handles:
 """
 
 import os
+import gc
 import logging
 import copy
 import numpy as np
@@ -505,6 +506,9 @@ class GGEURClient(Client):
                 if cache_updated:
                     self._save_feature_cache(cache_path, feature_cache)
 
+            # Free feature cache dict — no longer needed, all data is in self.local_features
+            del feature_cache
+
         else:
             # Fallback: Dataset without paths - cannot use caching
             logger.info(
@@ -738,6 +742,71 @@ class GGEURClient(Client):
                     state=self.state,
                     content=None))
 
+        # Release large data structures no longer needed after augmentation
+        self._cleanup_after_augmentation()
+
+    def _cleanup_after_augmentation(self):
+        """Release large data structures no longer needed after augmentation.
+
+        After augmentation is done and DataLoader is built:
+        - local_features/local_covs/local_means: only used during statistics & augmentation
+        - global_cov_matrices/other_prototypes: only used during augmentation
+        - CLIP model: only needed for feature extraction (Round 0), unless using
+          CNN distillation or feature alignment
+        """
+        freed_mb = 0
+
+        # Clean up local statistics
+        for name in ('local_features', 'local_labels', 'local_means',
+                     'local_covs', 'local_counts'):
+            attr = getattr(self, name, None)
+            if attr:
+                if isinstance(attr, dict):
+                    for v in attr.values():
+                        if hasattr(v, 'nbytes'):
+                            freed_mb += v.nbytes / (1024 * 1024)
+                setattr(self, name, {})
+
+        # Clean up received server data (covariance matrices are ~67 MB)
+        for name in ('global_cov_matrices', 'other_prototypes'):
+            attr = getattr(self, name, None)
+            if attr:
+                if isinstance(attr, dict):
+                    for v in attr.values():
+                        if hasattr(v, 'nbytes'):
+                            freed_mb += v.nbytes / (1024 * 1024)
+                        elif isinstance(v, list):
+                            for item in v:
+                                if hasattr(item, 'nbytes'):
+                                    freed_mb += item.nbytes / (1024 * 1024)
+                setattr(self, name, {})
+
+        # Keep global_prototypes - needed for feature alignment training
+
+        # Unload CLIP model if not needed for distillation/alignment
+        if not self.use_cnn_distillation and not self.use_feature_alignment:
+            if self.clip_model is not None:
+                del self.clip_model
+                self.clip_model = None
+                self.clip_preprocess = None
+                freed_mb += 600  # Approximate CLIP ViT-B/16 size
+
+        # Unload CNN feature extractor if not needed for end-to-end finetune
+        if not self.use_end_to_end_finetune:
+            if self.cnn_extractor is not None:
+                del self.cnn_extractor
+                self.cnn_extractor = None
+                freed_mb += 300  # Approximate CNN extractor size
+
+        # Force garbage collection and release GPU memory
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        logger.info(
+            f"Client {self.ID}: Memory cleanup completed, freed ~{freed_mb:.0f} MB"
+        )
+
     def _nearest_pos_def(self, cov_matrix):
         """Ensure covariance matrix is positive definite"""
         # 对于大维度矩阵，使用简化方法
@@ -803,6 +872,45 @@ class GGEURClient(Client):
 
         samples = np.random.multivariate_normal(mean, B @ B.T, num_samples)
         return samples
+
+    def _precompute_cholesky(self, cov_matrix):
+        """Precompute Cholesky factor for efficient repeated sampling from the same covariance.
+
+        Instead of calling _nearest_pos_def + cholesky per sample (N+3 times per class),
+        this computes it once per class, reducing ~14 GB total allocations to ~200 MB.
+
+        Returns float32 to avoid upcasting all generated samples to float64
+        (which would double memory usage for all intermediate augmentation arrays).
+        """
+        dim = cov_matrix.shape[0]
+
+        if dim > 512:
+            try:
+                jitter = 1e-5
+                L = np.linalg.cholesky(cov_matrix + jitter * np.eye(dim))
+                return L.astype(np.float32)
+            except np.linalg.LinAlgError:
+                var = np.diag(cov_matrix)
+                var = np.maximum(var, 1e-6)
+                return np.diag(np.sqrt(var)).astype(np.float32)
+
+        cov_matrix = self._nearest_pos_def(cov_matrix)
+        jitter = 1e-6
+
+        while True:
+            try:
+                L = np.linalg.cholesky(cov_matrix + jitter * np.eye(dim))
+                return L.astype(np.float32)
+            except np.linalg.LinAlgError:
+                jitter *= 10
+                if jitter > 1:
+                    return (np.eye(dim) * 0.1).astype(np.float32)
+
+    def _generate_samples_fast(self, mean, cholesky_L, num_samples):
+        """Generate samples using precomputed Cholesky factor (avoids redundant decompositions)"""
+        dim = cholesky_L.shape[0]
+        z = np.random.randn(num_samples, dim).astype(np.float32)
+        return mean + z @ cholesky_L.T
 
     def _perform_augmentation(self):
         """Perform GGEUR_Clip feature augmentation"""
@@ -870,31 +978,36 @@ class GGEURClient(Client):
                     all_labels.append(np.full(combined.shape[0], class_idx))
                 continue
 
-            # 2. Get global covariance matrix
+            # 2. Get global covariance matrix and precompute Cholesky once per class
             if class_idx in self.global_cov_matrices:
                 cov_matrix = self.global_cov_matrices[class_idx]
             else:
                 cov_matrix = np.eye(self.ggeur_cfg.embedding_dim) * 0.01
 
+            cholesky_L = self._precompute_cholesky(cov_matrix)
+
             # 3. Expand original features using global covariance
             if num_per_sample > 0 and class_idx in self.local_features and self.local_features[
                     class_idx].shape[0] > 0:
                 for feat in self.local_features[class_idx]:
-                    generated = self._generate_samples(feat, cov_matrix,
-                                                       num_per_sample)
+                    generated = self._generate_samples_fast(
+                        feat, cholesky_L, num_per_sample)
                     class_features.append(generated)
 
             # 4. Generate from other clients' prototypes
             if use_cross_client and num_per_prototype > 0 and self.other_prototypes:
                 if class_idx in self.other_prototypes:
                     for prototype in self.other_prototypes[class_idx]:
-                        generated = self._generate_samples(
-                            prototype, cov_matrix, num_per_prototype)
+                        generated = self._generate_samples_fast(
+                            prototype, cholesky_L, num_per_prototype)
                         class_features.append(generated)
+
+            del cholesky_L
 
             # Combine and sample to target size
             if class_features:
                 combined = np.vstack(class_features)
+                del class_features  # Free individual arrays immediately
 
                 # target_size = 0 means use all samples
                 if target_size > 0 and combined.shape[0] >= target_size:
@@ -902,6 +1015,7 @@ class GGEURClient(Client):
                                                target_size,
                                                replace=False)
                     selected = combined[indices]
+                    del combined  # Free large combined array
                 else:
                     selected = combined
 
@@ -912,25 +1026,32 @@ class GGEURClient(Client):
             f"Client {self.ID}: Augmentation complete, building dataset...")
 
         if all_features:
-            self.augmented_features = np.vstack(all_features)
-            self.augmented_labels = np.concatenate(all_labels)
+            augmented_features = np.vstack(all_features)
+            augmented_labels = np.concatenate(all_labels)
+            del all_features, all_labels  # Free intermediate lists
 
-            # Create data loader
-            dataset = AugmentedFeatureDataset(self.augmented_features,
-                                              self.augmented_labels)
+            # Create data loader (AugmentedFeatureDataset converts to torch tensors)
+            dataset = AugmentedFeatureDataset(augmented_features,
+                                              augmented_labels)
             self.augmented_loader = DataLoader(
                 dataset,
                 batch_size=self._cfg.dataloader.batch_size,
                 shuffle=True)
 
+            sample_count = len(augmented_labels)
+            class_count = len(np.unique(augmented_labels))
+
+            # Free numpy arrays - torch tensors in the Dataset already hold the data
+            del augmented_features, augmented_labels
+
             if no_augmentation:
                 logger.info(
-                    f"Client {self.ID}: Original data - {self.augmented_features.shape[0]} samples, "
-                    f"{len(np.unique(self.augmented_labels))} classes")
+                    f"Client {self.ID}: Original data - {sample_count} samples, "
+                    f"{class_count} classes")
             else:
                 logger.info(
-                    f"Client {self.ID}: Augmented data - {self.augmented_features.shape[0]} samples, "
-                    f"{len(np.unique(self.augmented_labels))} classes")
+                    f"Client {self.ID}: Augmented data - {sample_count} samples, "
+                    f"{class_count} classes")
 
         self.augmentation_done = True
 
