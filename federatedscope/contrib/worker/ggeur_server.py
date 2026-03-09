@@ -14,6 +14,7 @@ Handles:
 import os
 import gc
 import base64
+import pickle
 import logging
 import copy
 import numpy as np
@@ -953,6 +954,22 @@ class GGEURServer(Server):
             f"Server: Broadcasted global covariances to {len(self.local_statistics_buffer)} clients"
         )
 
+    def _deserialize_model_para(self, para):
+        """Deserialize model parameters from gRPC b64-encoded pickle format.
+
+        Message.b64serializer encodes each tensor as
+        base64(pickle(tensor)) -> bytes/str. This recursively restores them.
+        """
+        if isinstance(para, dict):
+            return {k: self._deserialize_model_para(v) for k, v in para.items()}
+        if isinstance(para, (bytes, str)):
+            try:
+                data = base64.b64decode(para)
+                return pickle.loads(data)
+            except Exception:
+                return para
+        return para
+
     def callback_funcs_model_para(self, message: Message):
         """
         Handle model parameter messages from clients.
@@ -966,6 +983,9 @@ class GGEURServer(Server):
             sample_size, model_para = content
         else:
             sample_size, model_para = 0, content
+
+        # Deserialize b64-encoded model parameters from gRPC transport
+        model_para = self._deserialize_model_para(model_para)
 
         # Store in message buffer
         if round_idx not in self.msg_buffer['train']:
