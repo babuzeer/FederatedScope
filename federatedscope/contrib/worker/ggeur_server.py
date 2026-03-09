@@ -331,6 +331,13 @@ class GGEURServer(Server):
         data_type = self._cfg.data.type.lower()
         data_root = self._cfg.data.root
 
+        # In distributed mode, data.type may be 'ggeur'; use
+        # distributed_data.dataset to identify the actual dataset.
+        if data_type == 'ggeur' and hasattr(self._cfg, 'distributed_data'):
+            ds = getattr(self._cfg.distributed_data, 'dataset', '')
+            if ds:
+                data_type = ds.lower().replace('-', '_')
+
         # Get the same split ratios and seed as client data loading
         if hasattr(self._cfg.data, 'splits'):
             splits = tuple(self._cfg.data.splits)
@@ -1194,6 +1201,13 @@ class GGEURServer(Server):
 
         data_type = self._cfg.data.type.lower()
         data_root = self._cfg.data.root
+
+        # In distributed mode, data.type may be 'ggeur'; use
+        # distributed_data.dataset to identify the actual dataset.
+        if data_type == 'ggeur' and hasattr(self._cfg, 'distributed_data'):
+            ds = getattr(self._cfg.distributed_data, 'dataset', '')
+            if ds:
+                data_type = ds.lower().replace('-', '_')
 
         # Get split parameters
         if hasattr(self._cfg.data, 'splits'):
