@@ -751,7 +751,7 @@ class GGEURClient(Client):
                     sender=self.ID,
                     receiver=[self.server_id],
                     state=self.state,
-                    content=None))
+                    content='ready'))
 
         # Release large data structures no longer needed after augmentation
         self._cleanup_after_augmentation()
