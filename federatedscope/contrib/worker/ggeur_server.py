@@ -609,9 +609,6 @@ class GGEURServer(Server):
 
             self.statistics_collected = True
 
-            # Release large data structures no longer needed after broadcast
-            self._cleanup_after_broadcast()
-
     def callback_for_augmentation_ready(self, message: Message):
         """Handle client signaling augmentation is complete"""
         client_id = message.sender
@@ -941,41 +938,6 @@ class GGEURServer(Server):
 
         logger.info(
             f"Server: Broadcasted global covariances to {len(self.local_statistics_buffer)} clients"
-        )
-
-    def _cleanup_after_broadcast(self):
-        """Release large data structures no longer needed after broadcasting covariances.
-
-        After broadcast:
-        - local_statistics_buffer: 4 clients × 65 classes × 512×512 covs ≈ 260 MB
-        - all_prototypes: only used for preparing other_prototypes
-        - global_cov_matrices: already sent to all clients ≈ 67 MB
-        """
-        freed_mb = 0
-
-        # Clean up local statistics buffer (largest: contains all client covs)
-        for client_stats in self.local_statistics_buffer.values():
-            if 'covs' in client_stats:
-                for v in client_stats['covs'].values():
-                    if hasattr(v, 'nbytes'):
-                        freed_mb += v.nbytes / (1024 * 1024)
-        self.local_statistics_buffer = {}
-
-        # Clean up all_prototypes (cross-client prototypes already distributed)
-        self.all_prototypes = {}
-
-        # Clean up global covariance matrices (already sent to clients)
-        for v in self.global_cov_matrices.values():
-            if hasattr(v, 'nbytes'):
-                freed_mb += v.nbytes / (1024 * 1024)
-        self.global_cov_matrices = {}
-
-        # Keep global_prototypes - may be needed for feature alignment evaluation
-
-        gc.collect()
-
-        logger.info(
-            f"Server: Memory cleanup after broadcast completed, freed ~{freed_mb:.0f} MB"
         )
 
     def callback_funcs_model_para(self, message: Message):
