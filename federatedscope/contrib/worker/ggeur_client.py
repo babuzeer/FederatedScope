@@ -12,6 +12,7 @@ Handles:
 
 import os
 import gc
+import base64
 import logging
 import copy
 import numpy as np
@@ -608,7 +609,7 @@ class GGEURClient(Client):
 
             # Compute covariance
             centered = features - mean
-            cov = (1.0 / n) * np.dot(centered.T, centered)
+            cov = np.dot(centered.T, centered) / np.float32(n)
 
             # Validate cov shape
             assert cov.shape == (
@@ -646,13 +647,20 @@ class GGEURClient(Client):
                 f"mean shape should be ({self.ggeur_cfg.embedding_dim},), got {mean.shape}"
             means_serialized[class_idx] = mean.tolist()
 
-            # Serialize cov (512, 512) -> nested list
+            # Serialize cov (512, 512) -> base64 encoded binary
+            # This avoids creating ~262K Python float objects per matrix
             cov = self.local_covs[class_idx]
             assert isinstance(
                 cov, np.ndarray), f"cov should be ndarray, got {type(cov)}"
             assert cov.shape == (self.ggeur_cfg.embedding_dim, self.ggeur_cfg.embedding_dim), \
                 f"cov shape should be ({self.ggeur_cfg.embedding_dim}, {self.ggeur_cfg.embedding_dim}), got {cov.shape}"
-            covs_serialized[class_idx] = cov.tolist()
+            cov_f32 = cov.astype(
+                np.float32) if cov.dtype != np.float32 else cov
+            covs_serialized[class_idx] = {
+                '_b64': base64.b64encode(cov_f32.tobytes()).decode('ascii'),
+                '_shape': list(cov_f32.shape),
+                '_dtype': 'float32',
+            }
 
             # Serialize prototype (same as mean)
             prototypes_serialized[class_idx] = mean.tolist()
@@ -686,10 +694,16 @@ class GGEURClient(Client):
 
         content = message.content
         raw_cov = content.get('cov_matrices', {})
-        self.global_cov_matrices = {
-            k: np.array(v) if isinstance(v, list) else v
-            for k, v in raw_cov.items()
-        }
+        self.global_cov_matrices = {}
+        for k, v in raw_cov.items():
+            if isinstance(v, dict) and '_b64' in v:
+                buf = base64.b64decode(v['_b64'])
+                arr = np.frombuffer(buf, dtype=np.dtype(v['_dtype']))
+                self.global_cov_matrices[k] = arr.reshape(v['_shape']).copy()
+            elif isinstance(v, list):
+                self.global_cov_matrices[k] = np.array(v)
+            else:
+                self.global_cov_matrices[k] = v
         raw_other = content.get('other_prototypes', {}).get(self.ID, {})
         self.other_prototypes = {
             k: [np.array(p) if isinstance(p, list) else p
@@ -757,8 +771,7 @@ class GGEURClient(Client):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 logger.debug(
-                    f"Client {self.ID}: Unloaded CLIP model (~600 MB freed)"
-                )
+                    f"Client {self.ID}: Unloaded CLIP model (~600 MB freed)")
 
     def _nearest_pos_def(self, cov_matrix):
         """Ensure covariance matrix is positive definite"""

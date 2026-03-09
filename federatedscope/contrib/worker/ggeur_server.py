@@ -13,6 +13,7 @@ Handles:
 
 import os
 import gc
+import base64
 import logging
 import copy
 import numpy as np
@@ -546,9 +547,14 @@ class GGEURServer(Server):
             mean_list = means[class_idx]
             mean = np.array(mean_list, dtype=np.float32)
 
-            # Convert cov nested list -> numpy array
-            cov_list = covs[class_idx]
-            cov = np.array(cov_list, dtype=np.float32)
+            # Convert cov: base64 dict -> numpy array, or nested list -> numpy array
+            cov_data = covs[class_idx]
+            if isinstance(cov_data, dict) and '_b64' in cov_data:
+                buf = base64.b64decode(cov_data['_b64'])
+                cov = np.frombuffer(buf, dtype=np.dtype(
+                    cov_data['_dtype'])).reshape(cov_data['_shape']).copy()
+            else:
+                cov = np.array(cov_data, dtype=np.float32)
 
             # Validate shapes
             if mean.shape != (expected_dim, ):
@@ -892,12 +898,19 @@ class GGEURServer(Server):
         """
         logger.info("Server: Broadcasting global covariances to clients...")
 
-        # Pre-serialize covariance matrices once (65 × 512×512 numpy → Python lists)
-        # This avoids transform_to_list mutating self.global_cov_matrices in-place
-        cov_serialized = {
-            k: v.tolist() if hasattr(v, 'tolist') else v
-            for k, v in self.global_cov_matrices.items()
-        }
+        # Pre-serialize covariance matrices once using base64 encoding
+        # This avoids creating ~17M protobuf objects (65 × 512×512 floats)
+        cov_serialized = {}
+        for k, v in self.global_cov_matrices.items():
+            if hasattr(v, 'tobytes'):
+                v_f32 = v.astype(np.float32) if v.dtype != np.float32 else v
+                cov_serialized[k] = {
+                    '_b64': base64.b64encode(v_f32.tobytes()).decode('ascii'),
+                    '_shape': list(v_f32.shape),
+                    '_dtype': 'float32',
+                }
+            else:
+                cov_serialized[k] = v
 
         # Pre-serialize global prototypes once
         global_proto_serialized = {
