@@ -328,15 +328,15 @@ class GGEURServer(Server):
 
         logger.info("Server: Loading test data from all domains...")
 
+        # In distributed shard mode, load from client test.json files
+        if hasattr(self._cfg, 'distributed_data'):
+            manifest_path = getattr(self._cfg.distributed_data, 'manifest', '')
+            if manifest_path and os.path.exists(manifest_path):
+                self._load_test_data_from_shards(manifest_path)
+                return
+
         data_type = self._cfg.data.type.lower()
         data_root = self._cfg.data.root
-
-        # In distributed mode, data.type may be 'ggeur'; use
-        # distributed_data.dataset to identify the actual dataset.
-        if data_type == 'ggeur' and hasattr(self._cfg, 'distributed_data'):
-            ds = getattr(self._cfg.distributed_data, 'dataset', '')
-            if ds:
-                data_type = ds.lower().replace('-', '_')
 
         # Get the same split ratios and seed as client data loading
         if hasattr(self._cfg.data, 'splits'):
@@ -361,12 +361,12 @@ class GGEURServer(Server):
             from federatedscope.cv.dataset.pacs import PACS
             dataset_class = PACS
         elif 'office' in data_type and 'home' in data_type:
-            domains = ['Art', 'Clipart', 'Product', 'Real_World']
             from federatedscope.cv.dataset.office_home import OfficeHome
+            domains = ['Art', 'Clipart', 'Product', 'Real_World']
             dataset_class = OfficeHome
         elif 'office' in data_type and 'caltech' in data_type:
-            domains = ['amazon', 'caltech', 'dslr', 'webcam']
             from federatedscope.cv.dataset.office_caltech import OfficeCaltech10
+            domains = ['amazon', 'caltech', 'dslr', 'webcam']
             dataset_class = OfficeCaltech10
         else:
             logger.warning(
@@ -414,43 +414,8 @@ class GGEURServer(Server):
                     logger.warning(f"Server: No test data for domain {domain}")
                     continue
 
-                # Log the split info for verification
-                logger.info(
-                    f"Server: {domain} test set has {len(test_dataset)} samples"
-                )
-
-                # Extract features using appropriate extractor (CLIP or CNN)
-                self._load_feature_extractor()
-                features_list = []
-                labels_list = []
-
-                dataloader = DataLoader(test_dataset,
-                                        batch_size=32,
-                                        shuffle=False)
-
-                extractor_name = 'CNN' if self.feature_extractor_type == 'cnn' else 'CLIP'
-
-                with torch.no_grad():
-                    for images, labels in dataloader:
-                        images = images.to(self.device)
-                        if self.feature_extractor_type == 'cnn':
-                            features = self.cnn_extractor(images)
-                        else:
-                            features = self.clip_model.encode_image(images)
-                        features_list.append(features.cpu().numpy())
-                        labels_list.append(labels.numpy())
-
-                self.test_features[domain] = np.vstack(features_list)
-                self.test_labels[domain] = np.concatenate(labels_list)
-
-                # Save to cache
-                np.savez(cache_path,
-                         features=self.test_features[domain],
-                         labels=self.test_labels[domain])
-
-                logger.info(
-                    f"Server: Extracted and cached {len(self.test_labels[domain])} test features for {domain}"
-                )
+                self._extract_and_cache_features(domain, test_dataset,
+                                                 cache_path)
 
             except Exception as e:
                 logger.warning(
@@ -462,7 +427,7 @@ class GGEURServer(Server):
         logger.info(
             f"Server: Loaded test data for {len(self.test_features)} domains")
 
-        # Unload CLIP model after test features are extracted/cached - no longer needed
+        # Unload CLIP model after test features are extracted/cached
         if self.clip_model is not None:
             del self.clip_model
             self.clip_model = None
@@ -473,6 +438,142 @@ class GGEURServer(Server):
             logger.debug(
                 "Server: Unloaded CLIP model after test feature extraction (~600 MB freed)"
             )
+
+    def _load_test_data_from_shards(self, manifest_path):
+        """Load test data from distributed client shards grouped by domain."""
+        import json as _json
+        from federatedscope.core.data.distributed_loader import OfficeHomeShardDataset
+
+        with open(manifest_path, 'r') as f:
+            manifest = _json.load(f)
+
+        dataset_root = manifest.get('root', '')
+
+        # Collect all test items from all client shards and deduplicate
+        seen_paths = set()
+        domain_items = {}  # {domain: [{path, label}, ...]}
+
+        for client_info in manifest.get('clients', []):
+            test_json = os.path.join(client_info['shard_path'], 'test.json')
+            if not os.path.exists(test_json):
+                continue
+            with open(test_json, 'r') as f:
+                items = _json.load(f)
+            for item in items:
+                path = item['path']
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                # Extract domain from path: .../Root/Domain/Category/image.jpg
+                rel = os.path.relpath(path, dataset_root)
+                domain = rel.split(os.sep)[0]
+                if domain not in domain_items:
+                    domain_items[domain] = []
+                domain_items[domain].append(item)
+
+        logger.info(
+            f"Server: Found {len(seen_paths)} unique test samples across "
+            f"{len(domain_items)} domains from shards")
+
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        for domain, items in sorted(domain_items.items()):
+            cache_path = self._get_test_cache_path(domain)
+
+            # Try cache first
+            if os.path.exists(cache_path):
+                try:
+                    data = np.load(cache_path)
+                    self.test_features[domain] = data['features']
+                    self.test_labels[domain] = data['labels']
+                    logger.info(
+                        f"Server: Loaded {len(self.test_labels[domain])} cached test features for {domain}"
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(
+                        f"Server: Failed to load cache for {domain}: {e}")
+
+            # Write a temporary JSON for OfficeHomeShardDataset
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False)
+            _json.dump(items, tmp)
+            tmp.close()
+
+            try:
+                test_dataset = OfficeHomeShardDataset(
+                    shard_json=tmp.name, transform=transform)
+                self._extract_and_cache_features(domain, test_dataset,
+                                                 cache_path)
+            except Exception as e:
+                logger.warning(
+                    f"Server: Failed to extract features for {domain}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                os.unlink(tmp.name)
+
+        self.test_data_loaded = True
+        logger.info(
+            f"Server: Loaded test data for {len(self.test_features)} domains")
+
+        # Unload CLIP model after extraction
+        if self.clip_model is not None:
+            del self.clip_model
+            self.clip_model = None
+            self.clip_preprocess = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.debug(
+                "Server: Unloaded CLIP model after test feature extraction")
+
+    def _extract_and_cache_features(self, domain, dataset, cache_path):
+        """Extract features from a dataset and cache to disk."""
+        if len(dataset) == 0:
+            logger.warning(f"Server: No test data for domain {domain}")
+            return
+
+        logger.info(
+            f"Server: {domain} test set has {len(dataset)} samples")
+
+        self._load_feature_extractor()
+        features_list = []
+        labels_list = []
+
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+
+        with torch.no_grad():
+            for images, labels in dataloader:
+                images = images.to(self.device)
+                if self.feature_extractor_type == 'cnn':
+                    features = self.cnn_extractor(images)
+                else:
+                    features = self.clip_model.encode_image(images)
+                features_list.append(features.cpu().numpy())
+                if isinstance(labels, torch.Tensor):
+                    labels_list.append(labels.numpy())
+                else:
+                    labels_list.append(np.array(labels))
+
+        self.test_features[domain] = np.vstack(features_list)
+        self.test_labels[domain] = np.concatenate(labels_list)
+
+        # Save to cache
+        np.savez(cache_path,
+                 features=self.test_features[domain],
+                 labels=self.test_labels[domain])
+
+        logger.info(
+            f"Server: Extracted and cached {len(self.test_labels[domain])} test features for {domain}"
+        )
 
     def _evaluate_on_test_sets(self):
         """Evaluate global model on all test sets"""
@@ -1199,15 +1300,15 @@ class GGEURServer(Server):
 
         logger.info("Server: Loading test images for CNN evaluation...")
 
+        # In distributed shard mode, load from client test.json files
+        if hasattr(self._cfg, 'distributed_data'):
+            manifest_path = getattr(self._cfg.distributed_data, 'manifest', '')
+            if manifest_path and os.path.exists(manifest_path):
+                self._load_test_images_from_shards(manifest_path)
+                return
+
         data_type = self._cfg.data.type.lower()
         data_root = self._cfg.data.root
-
-        # In distributed mode, data.type may be 'ggeur'; use
-        # distributed_data.dataset to identify the actual dataset.
-        if data_type == 'ggeur' and hasattr(self._cfg, 'distributed_data'):
-            ds = getattr(self._cfg.distributed_data, 'dataset', '')
-            if ds:
-                data_type = ds.lower().replace('-', '_')
 
         # Get split parameters
         if hasattr(self._cfg.data, 'splits'):
@@ -1227,8 +1328,8 @@ class GGEURServer(Server):
             from federatedscope.cv.dataset.pacs import PACS
             dataset_class = PACS
         elif 'office' in data_type and 'home' in data_type:
-            domains = ['Art', 'Clipart', 'Product', 'Real_World']
             from federatedscope.cv.dataset.office_home import OfficeHome
+            domains = ['Art', 'Clipart', 'Product', 'Real_World']
             dataset_class = OfficeHome
         else:
             logger.warning(
@@ -1265,6 +1366,71 @@ class GGEURServer(Server):
             except Exception as e:
                 logger.warning(
                     f"Server: Failed to load test images for {domain}: {e}")
+
+        self.test_images_loaded = True
+
+    def _load_test_images_from_shards(self, manifest_path):
+        """Load test images from distributed shards grouped by domain."""
+        import json as _json
+        from federatedscope.core.data.distributed_loader import OfficeHomeShardDataset
+
+        with open(manifest_path, 'r') as f:
+            manifest = _json.load(f)
+
+        dataset_root = manifest.get('root', '')
+
+        # Collect all test items, deduplicate, group by domain
+        seen_paths = set()
+        domain_items = {}
+
+        for client_info in manifest.get('clients', []):
+            test_json = os.path.join(client_info['shard_path'], 'test.json')
+            if not os.path.exists(test_json):
+                continue
+            with open(test_json, 'r') as f:
+                items = _json.load(f)
+            for item in items:
+                path = item['path']
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                rel = os.path.relpath(path, dataset_root)
+                domain = rel.split(os.sep)[0]
+                if domain not in domain_items:
+                    domain_items[domain] = []
+                domain_items[domain].append(item)
+
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        ])
+
+        import tempfile
+        for domain, items in sorted(domain_items.items()):
+            tmp = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.json', delete=False)
+            _json.dump(items, tmp)
+            tmp.close()
+            try:
+                test_dataset = OfficeHomeShardDataset(
+                    shard_json=tmp.name, transform=transform)
+                if len(test_dataset) > 0:
+                    self.test_image_loaders[domain] = DataLoader(
+                        test_dataset,
+                        batch_size=32,
+                        shuffle=False,
+                        num_workers=0)
+                    logger.info(
+                        f"Server: Loaded {len(test_dataset)} test images for {domain}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Server: Failed to load test images for {domain}: {e}")
+            finally:
+                os.unlink(tmp.name)
 
         self.test_images_loaded = True
 
