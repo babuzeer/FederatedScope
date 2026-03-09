@@ -962,7 +962,7 @@ class GGEURServer(Server):
         sender = message.sender
         content = message.content
 
-        if isinstance(content, tuple) and len(content) == 2:
+        if isinstance(content, (tuple, list)) and len(content) == 2:
             sample_size, model_para = content
         else:
             sample_size, model_para = 0, content
