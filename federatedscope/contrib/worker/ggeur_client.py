@@ -756,7 +756,7 @@ class GGEURClient(Client):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                logger.info(
+                logger.debug(
                     f"Client {self.ID}: Unloaded CLIP model (~600 MB freed)"
                 )
 

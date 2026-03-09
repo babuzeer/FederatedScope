@@ -461,7 +461,7 @@ class GGEURServer(Server):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            logger.info(
+            logger.debug(
                 "Server: Unloaded CLIP model after test feature extraction (~600 MB freed)"
             )
 
