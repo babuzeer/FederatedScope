@@ -1576,6 +1576,6 @@ class GGEURServer(Server):
                         sender=self.ID,
                         receiver=[client_id],
                         state=self.state,
-                        content=None))
+                        content='finish'))
 
         self._monitor.finish_fl()

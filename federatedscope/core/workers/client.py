@@ -351,6 +351,10 @@ class Client(BaseClient):
                      f'{max_attempts} attempts')
         with self._reconnect_lock:
             self._is_reconnecting = False
+        # Server is permanently unreachable; terminate the client process
+        logger.error(f'Client #{self.ID}: Server unreachable, exiting.')
+        import os
+        os._exit(1)
 
     def _stop_reconnect_monitor(self):
         """Stop the reconnect monitor thread."""
