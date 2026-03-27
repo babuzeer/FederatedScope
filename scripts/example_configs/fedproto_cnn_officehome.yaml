@@ -1,0 +1,98 @@
+# FedProto Baseline with CNN (ConvNeXt-Base) for Office-Home
+#
+# FedProto (Federated Prototype Learning) learns class prototypes
+# in the embedding space for personalized federated learning.
+#
+# Key Features:
+# - Learns local prototypes for each class based on embeddings
+# - Aggregates prototypes on server to form global prototypes
+# - Uses prototype distances for classification and regularization
+#
+# Note: Uses ConvNeXt-Base as backbone (same as GGEUR) for fair comparison.
+#
+# Reference:
+# FedProto: Federated Prototype Learning across Heterogeneous Clients
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 1
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'fedavg'  # FedProto uses trainer, not method
+  mode: 'standalone'
+  client_num: 60
+  sample_client_num: 60
+  total_round_num: 100
+  share_local_model: True
+  online_aggr: False
+  make_global_eval: False
+
+# ========== Data Settings ==========
+# Note: Data will be loaded via ggeur_data.py which supports LDS partitioning
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  shuffle: True
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'convnext_base'
+  num_classes: 65
+  out_channels: 1024
+
+# ========== Trainer Settings ==========
+trainer:
+  type: 'fedproto_trainer'
+
+# ========== Training Settings ==========
+train:
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+  local_update_steps: 10
+  batch_or_epoch: batch
+
+# ========== Evaluation Settings ==========
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+  best_res_update_round_wise_key: test_acc
+
+# ========== Loss Function ==========
+criterion:
+  type: 'CrossEntropyLoss'
+
+# ========== FedProto Settings ==========
+fedproto:
+  use: True
+  proto_weight: 1.0
+  embedding_dim: 1024
+  use_projector: True
+  projector_hidden_dim: 512
+  distance_metric: 'cosine'
+  temperature: 0.1
+  aggregation_method: 'weighted_mean'
+  local_proto_epochs: 1
+  normalize_prototypes: True
+  freeze_backbone: False
+
+# ========== GGEUR Settings (for LDS data partitioning) ==========
+# Even though ggeur.use is False, the data loader uses ggeur.use_lds
+# to apply Dirichlet distribution for non-IID data split
+ggeur:
+  use: False
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+# ========== Output Settings ==========
+outdir: 'exp/fedproto_convnext_officehome'
+expname: 'fedproto_convnext_officehome'

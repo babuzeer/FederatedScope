@@ -26,6 +26,7 @@ def extend_ggeur_cfg(cfg):
     # ========== Feature Extractor Mode ==========
     # 'clip': Use CLIP (ViT-based, original method)
     # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, EfficientNet, etc.)
+    # 'timm': Use any timm vision backbone (e.g., GFNet / Mixer / etc.)
     cfg.ggeur.feature_extractor = 'clip'
 
     # ========== CNN Feature Extractor Settings ==========
@@ -37,6 +38,18 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.cnn_backbone = 'convnext_base'
     # Whether to freeze CNN backbone during feature extraction
     cfg.ggeur.freeze_backbone = True
+
+    # ========== timm Feature Extractor Settings ==========
+    # Only used when cfg.ggeur.feature_extractor == 'timm'
+    # Use a widely available timm model id by default (non-CNN, non-attention-ViT).
+    # You can change to GFNet etc., e.g. 'gfnet_tiny_patch4_224' if your timm provides it.
+    cfg.ggeur.timm_model = 'mixer_b16_224'
+    cfg.ggeur.timm_pretrained = True
+    # Optional local checkpoint to avoid downloading from HuggingFace at runtime.
+    # If set, weights are loaded from this file and `timm_pretrained` is ignored.
+    cfg.ggeur.timm_checkpoint_path = ''
+    cfg.ggeur.timm_in_chans = 3
+    cfg.ggeur.timm_global_pool = 'avg'
 
     # ========== CLIP Feature Extraction ==========
     cfg.ggeur.clip_model = 'ViT-B-16'  # CLIP backbone: ViT-B-16, ViT-B-32, etc.
@@ -68,6 +81,17 @@ def extend_ggeur_cfg(cfg):
 
     # ========== Training Settings ==========
     cfg.ggeur.statistics_round = 0  # Round to collect statistics (usually 0)
+
+    # ========== FedProto Integration Settings ==========
+    # Whether to use FedProto-style prototype regularization during MLP training
+    # If True: Add prototype distance loss to regularize embeddings
+    cfg.ggeur.use_fedproto = False
+    # Weight for prototype loss: total_loss = CE + proto_weight * proto_loss
+    cfg.ggeur.proto_weight = 1.0
+    # Distance metric for prototype loss: 'euclidean' or 'cosine'
+    cfg.ggeur.proto_distance = 'cosine'
+    # Temperature for cosine distance (only used when proto_distance='cosine')
+    cfg.ggeur.proto_temperature = 0.1
 
     # ========== LDS (Label Distribution Skew) Settings ==========
     # Whether to use Dirichlet distribution for non-IID data split
@@ -147,6 +171,37 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.finetune_start_round = 30
     # Learning rate for fine-tuning (should be lower than initial training)
     cfg.ggeur.finetune_lr = 0.0001
+
+    # ========== MOON Settings ==========
+    # Model-Contrastive Federated Learning (MOON)
+    # Ref: Li et al., "Model-Contrastive Federated Learning", CVPR 2021
+    cfg.ggeur.use_moon = False
+    # Contrastive loss weight (mu in the paper)
+    cfg.ggeur.moon_mu = 5.0
+    # Temperature for contrastive loss
+    cfg.ggeur.moon_temperature = 0.5
+
+    # ========== PromptFL Settings ==========
+    # Enable federated soft prompt training (CoOp style) on augmented CLIP features.
+    # Only supported when feature_extractor='clip'.
+    # When enabled, ctx vectors (n_ctx × 512) are trained and federated instead of MLP.
+    cfg.ggeur.use_promptfl = False
+    # Number of learnable context tokens prepended to class name tokens
+    cfg.ggeur.prompt_length = 16
+    # Learning rate for prompt optimizer (Adam)
+    cfg.ggeur.prompt_lr = 0.002
+    # Local training epochs per round for prompt
+    cfg.ggeur.prompt_local_epochs = 10
+    # Temperature for cosine similarity logits
+    cfg.ggeur.prompt_temperature = 0.07
+    # Optional: manually specify class names (list of strings).
+    # If empty, class names are inferred from the dataset (OfficeHome/PACS/etc.)
+    cfg.ggeur.prompt_class_names = []
+    # Text prompt template, {} is replaced by class name
+    cfg.ggeur.prompt_template = 'a photo of a {}'
+    # HuggingFace CLIP model directory or Hub ID for PromptFL
+    # e.g. '/root/model/clip-vit-base-patch16' or 'openai/clip-vit-base-patch16'
+    cfg.ggeur.hf_clip_model_id = 'openai/clip-vit-base-patch16'
 
     return cfg
 

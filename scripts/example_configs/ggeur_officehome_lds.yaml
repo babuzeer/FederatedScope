@@ -36,7 +36,7 @@ model:
 
 # ========== Training Settings ==========
 train:
-  local_update_steps: 1  # Paper uses 10 local epochs
+  local_update_steps: 5  # Paper uses 10 local epochs
   optimizer:
     type: 'Adam'
     lr: 0.001
@@ -56,9 +56,9 @@ ggeur:
   feature_cache_dir: ''
 
   # Feature Augmentation
-  num_generated_per_sample: 50
-  num_generated_per_prototype: 50
-  target_size_per_class: 50
+  num_generated_per_sample: 100
+  num_generated_per_prototype: 100
+  target_size_per_class: 100
 
   # MLP Classifier (linear, no hidden layer - matches paper)
   mlp_hidden_dim: 0

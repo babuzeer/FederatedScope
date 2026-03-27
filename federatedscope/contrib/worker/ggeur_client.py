@@ -133,6 +133,7 @@ class GGEURClient(Client):
         # ===== Feature Extractor Mode =====
         # 'clip': Use CLIP (ViT-based, original method)
         # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, etc.)
+        # 'timm': Use any timm vision backbone (e.g., GFNet / Mixer / etc.)
         self.feature_extractor_type = getattr(self.ggeur_cfg, 'feature_extractor', 'clip')
 
         # CLIP model (for 'clip' mode)
@@ -141,6 +142,13 @@ class GGEURClient(Client):
 
         # CNN feature extractor (for 'cnn' mode)
         self.cnn_extractor = None
+
+        # timm feature extractor (for 'timm' mode)
+        self.timm_extractor = None
+
+        # The actual embedding dimension used by the feature extractor.
+        # (May differ from cfg.ggeur.embedding_dim if user changes backbone.)
+        self.embedding_dim = getattr(self.ggeur_cfg, 'embedding_dim', 512)
 
         # Local features and labels
         self.local_features = {}  # {class_idx: features array}
@@ -185,6 +193,18 @@ class GGEURClient(Client):
         self.pretrained_classifier = None
         self.cnn_backbone = None
 
+        # ===== MOON Mode =====
+        self.use_moon = getattr(self.ggeur_cfg, 'use_moon', False)
+        self.moon_prev_model = None    # Previous local model snapshot
+        self.moon_global_model = None  # Global model snapshot (received this round)
+
+        # ===== PromptFL Mode =====
+        self.use_promptfl = getattr(self.ggeur_cfg, 'use_promptfl', False)
+        self.prompt_learner = None
+        self.text_encoder = None
+        self.custom_clip = None        # CustomCLIP (HuggingFace-based) for PromptFL
+        self.hf_clip_model = None      # HuggingFace CLIPModel (separate from open_clip)
+
     def _register_default_handlers(self):
         """Register message handlers"""
         super()._register_default_handlers()
@@ -194,9 +214,11 @@ class GGEURClient(Client):
                                self.callback_for_global_covariances)
 
     def _load_feature_extractor(self):
-        """Load feature extractor (CLIP or CNN based on config)"""
+        """Load feature extractor (CLIP / CNN / timm based on config)"""
         if self.feature_extractor_type == 'cnn':
             self._load_cnn_extractor()
+        elif self.feature_extractor_type == 'timm':
+            self._load_timm_extractor()
         else:
             self._load_clip_model()
 
@@ -219,11 +241,45 @@ class GGEURClient(Client):
             )
             self.cnn_extractor = self.cnn_extractor.to(self.device)
 
+            self.embedding_dim = int(self.cnn_extractor.get_feature_dim())
             logger.info(f"Client {self.ID}: Loaded CNN extractor {model_name}, "
                        f"feature_dim={self.cnn_extractor.get_feature_dim()}")
 
         except Exception as e:
             logger.error(f"Client {self.ID}: Failed to load CNN extractor: {e}")
+            raise
+
+    def _load_timm_extractor(self):
+        """Load timm feature extractor"""
+        if self.timm_extractor is not None:
+            return
+
+        try:
+            from federatedscope.contrib.model.ggeur_timm_extractor import TimmFeatureExtractor
+
+            model_name = getattr(self.ggeur_cfg, 'timm_model', 'gfnet_tiny')
+            pretrained = getattr(self.ggeur_cfg, 'timm_pretrained', True)
+            checkpoint_path = getattr(self.ggeur_cfg, 'timm_checkpoint_path', '')
+            freeze = getattr(self.ggeur_cfg, 'freeze_backbone', True)
+            in_chans = getattr(self.ggeur_cfg, 'timm_in_chans', 3)
+            global_pool = getattr(self.ggeur_cfg, 'timm_global_pool', 'avg')
+
+            self.timm_extractor = TimmFeatureExtractor(
+                model_name=model_name,
+                pretrained=pretrained,
+                freeze=freeze,
+                checkpoint_path=checkpoint_path,
+                in_chans=in_chans,
+                global_pool=global_pool,
+            )
+            self.timm_extractor = self.timm_extractor.to(self.device)
+
+            self.embedding_dim = int(self.timm_extractor.get_feature_dim())
+            logger.info(f"Client {self.ID}: Loaded timm extractor {model_name}, "
+                        f"feature_dim={self.embedding_dim}")
+
+        except Exception as e:
+            logger.error(f"Client {self.ID}: Failed to load timm extractor: {e}")
             raise
 
     def _load_clip_model(self):
@@ -284,6 +340,10 @@ class GGEURClient(Client):
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             model_str = model_name.replace('/', '_').replace('-', '_')
             prefix = 'cnn'
+        elif self.feature_extractor_type == 'timm':
+            model_name = getattr(self.ggeur_cfg, 'timm_model', 'gfnet_tiny')
+            model_str = str(model_name).replace('/', '_').replace('-', '_')
+            prefix = 'timm'
         else:
             clip_model = self.ggeur_cfg.clip_model.replace('/', '_').replace('-', '_')
             pretrained = self.ggeur_cfg.clip_pretrained.replace('/', '_').replace('-', '_')
@@ -334,7 +394,12 @@ class GGEURClient(Client):
         Extract features from local data using either CLIP or CNN.
         Supports caching for both modes.
         """
-        extractor_name = 'CNN' if self.feature_extractor_type == 'cnn' else 'CLIP'
+        if self.feature_extractor_type == 'cnn':
+            extractor_name = 'CNN'
+        elif self.feature_extractor_type == 'timm':
+            extractor_name = 'timm'
+        else:
+            extractor_name = 'CLIP'
         logger.info(f"Client {self.ID}: Extracting {extractor_name} features...")
 
         # Get train data
@@ -436,6 +501,8 @@ class GGEURClient(Client):
                         # Extract features using appropriate extractor
                         if self.feature_extractor_type == 'cnn':
                             features = self.cnn_extractor(images)
+                        elif self.feature_extractor_type == 'timm':
+                            features = self.timm_extractor(images)
                         else:
                             features = self.clip_model.encode_image(images)
                         features = features.cpu().numpy()
@@ -479,6 +546,8 @@ class GGEURClient(Client):
                     # Extract features using appropriate extractor
                     if self.feature_extractor_type == 'cnn':
                         features = self.cnn_extractor(images)
+                    elif self.feature_extractor_type == 'timm':
+                        features = self.timm_extractor(images)
                     else:
                         features = self.clip_model.encode_image(images)
                     features = features.cpu().numpy()
@@ -539,6 +608,7 @@ class GGEURClient(Client):
 
         content = {
             'client_id': self.ID,
+            'embedding_dim': int(self.embedding_dim),
             'means': self.local_means,
             'covs': self.local_covs,
             'counts': self.local_counts,
@@ -567,11 +637,24 @@ class GGEURClient(Client):
         self.other_prototypes = content.get('other_prototypes', {}).get(self.ID, {})
         self.global_prototypes = content.get('global_prototypes', {})  # For feature alignment
 
+        # Debug logging for received prototypes
+        logger.info(f"Client {self.ID}: Received global_prototypes with {len(self.global_prototypes)} classes")
+        if self.global_prototypes:
+            sample_classes = list(self.global_prototypes.keys())[:3]
+            for cls in sample_classes:
+                proto = self.global_prototypes[cls]
+                if hasattr(proto, 'shape'):
+                    logger.info(f"  Class {cls}: shape={proto.shape}, mean={proto.mean():.4f}")
+
         # Perform augmentation
         self._perform_augmentation()
 
         # Build MLP classifier
         self._build_mlp_classifier()
+
+        # Build PromptFL model if enabled
+        if self.use_promptfl:
+            self._build_prompt_model()
 
         # Build CNN based on mode
         if self.use_feature_alignment:
@@ -695,7 +778,7 @@ class GGEURClient(Client):
         total_classes = len(all_classes)
 
         # 获取特征维度用于日志
-        feature_dim = self.ggeur_cfg.embedding_dim
+        feature_dim = self.embedding_dim
         if self.local_features:
             first_key = next(iter(self.local_features.keys()))
             if len(self.local_features[first_key]) > 0:
@@ -729,7 +812,7 @@ class GGEURClient(Client):
             if class_idx in self.global_cov_matrices:
                 cov_matrix = self.global_cov_matrices[class_idx]
             else:
-                cov_matrix = np.eye(self.ggeur_cfg.embedding_dim) * 0.01
+                cov_matrix = np.eye(self.embedding_dim) * 0.01
 
             # 3. Expand original features using global covariance
             if num_per_sample > 0 and class_idx in self.local_features and self.local_features[class_idx].shape[0] > 0:
@@ -787,7 +870,7 @@ class GGEURClient(Client):
         # In LDS mode, each client may only have a subset of classes, but the model
         # must support all classes for proper FedAvg aggregation
         num_classes = self._cfg.model.num_classes
-        input_dim = self.ggeur_cfg.embedding_dim
+        input_dim = self.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
         if hidden_dim > 0:
@@ -874,12 +957,30 @@ class GGEURClient(Client):
                     # Backward compatibility: content is just MLP parameters
                     mlp_para = content
 
+        # Load global prompt ctx if PromptFL enabled
+        if self.use_promptfl and content is not None and isinstance(content, dict):
+            prompt_para = content.get('prompt')
+            if prompt_para is not None and self.prompt_learner is not None:
+                try:
+                    ctx_tensor = prompt_para.get('ctx')
+                    if ctx_tensor is not None:
+                        self.prompt_learner.ctx.data = ctx_tensor.to(self.device)
+                except Exception as e:
+                    logger.debug(f"Client {self.ID}: Could not load prompt ctx: {e}")
+
         # Update MLP with global model parameters
         if mlp_para is not None and self.mlp_classifier is not None:
             try:
                 self.mlp_classifier.load_state_dict(mlp_para)
             except Exception as e:
                 logger.debug(f"Client {self.ID}: Could not load MLP state dict: {e}")
+
+        # MOON: snapshot global model after loading global params, before local training
+        if self.use_moon and self.mlp_classifier is not None:
+            self.moon_global_model = copy.deepcopy(self.mlp_classifier)
+            self.moon_global_model.eval()
+            for p in self.moon_global_model.parameters():
+                p.requires_grad_(False)
 
         # Update CNN with global model parameters (for both distillation and feature alignment)
         if (self.use_cnn_distillation or self.use_feature_alignment) and cnn_para is not None and self.cnn_model is not None:
@@ -890,6 +991,13 @@ class GGEURClient(Client):
 
         # Train MLP on augmented features
         mlp_sample_size, mlp_model_para, mlp_results = self._train_on_augmented_data()
+
+        # MOON: save current local model as previous model for next round
+        if self.use_moon and self.mlp_classifier is not None:
+            self.moon_prev_model = copy.deepcopy(self.mlp_classifier)
+            self.moon_prev_model.eval()
+            for p in self.moon_prev_model.parameters():
+                p.requires_grad_(False)
 
         # Train CNN based on mode
         cnn_warmup_rounds = getattr(self.ggeur_cfg, 'cnn_warmup_rounds', 0)
@@ -937,6 +1045,14 @@ class GGEURClient(Client):
             # Standard mode: only MLP
             combined_para = mlp_model_para
             sample_size = mlp_sample_size
+
+        # PromptFL: train soft prompts on augmented features and attach to combined_para
+        if self.use_promptfl:
+            _, prompt_para, _ = self._train_prompt_on_augmented_data()
+            if isinstance(combined_para, dict):
+                combined_para['prompt'] = prompt_para
+            else:
+                combined_para = {'mlp': combined_para, 'prompt': prompt_para}
 
         # Send model parameters
         self.comm_manager.send(
@@ -1041,7 +1157,7 @@ class GGEURClient(Client):
 
         # Build classifier with same architecture as MLP
         num_classes = self._cfg.model.num_classes
-        input_dim = self.ggeur_cfg.embedding_dim
+        input_dim = self.embedding_dim
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
         if hidden_dim > 0:
@@ -1259,7 +1375,7 @@ class GGEURClient(Client):
         return total_samples, backbone_para, results
 
     def _train_on_augmented_data(self):
-        """Train MLP classifier on augmented features"""
+        """Train MLP classifier on augmented features with optional FedProto/FedProx regularization"""
         if self.augmented_loader is None or self.mlp_classifier is None:
             return 0, {}, {}
 
@@ -1268,7 +1384,57 @@ class GGEURClient(Client):
                                      lr=self._cfg.train.optimizer.lr)
         criterion = nn.CrossEntropyLoss()
 
+        # FedProx settings (proximal term to the received global model)
+        use_fedprox = getattr(self._cfg.fedprox, 'use', False) if hasattr(self._cfg, 'fedprox') else False
+        fedprox_mu = getattr(self._cfg.fedprox, 'mu', 0.0) if hasattr(self._cfg, 'fedprox') else 0.0
+        global_params_ref = None
+        if use_fedprox and fedprox_mu > 0:
+            # Snapshot current model params as the global reference before local updates
+            global_params_ref = {
+                k: v.detach().clone()
+                for k, v in self.mlp_classifier.state_dict().items()
+            }
+
+        # MOON settings
+        use_moon = getattr(self.ggeur_cfg, 'use_moon', False)
+        moon_mu = getattr(self.ggeur_cfg, 'moon_mu', 5.0)
+        moon_temperature = getattr(self.ggeur_cfg, 'moon_temperature', 0.5)
+        if use_moon:
+            logger.info(f"Client {self.ID}: MOON enabled - mu={moon_mu}, temperature={moon_temperature}")
+
+        # FedProto settings
+        use_fedproto = getattr(self.ggeur_cfg, 'use_fedproto', False)
+        proto_weight = getattr(self.ggeur_cfg, 'proto_weight', 1.0)
+        proto_distance = getattr(self.ggeur_cfg, 'proto_distance', 'cosine')
+        proto_temperature = getattr(self.ggeur_cfg, 'proto_temperature', 0.1)
+
+        # Debug logging for FedProto
+        logger.info(f"Client {self.ID}: FedProto settings - use_fedproto={use_fedproto}, "
+                   f"proto_weight={proto_weight}, proto_distance={proto_distance}, "
+                   f"global_prototypes_count={len(self.global_prototypes) if self.global_prototypes else 0}")
+        if use_fedprox and fedprox_mu > 0:
+            logger.info(f"Client {self.ID}: FedProx enabled - mu={fedprox_mu}")
+
+        # Prepare global prototypes tensor if using FedProto
+        proto_tensor = None
+        if use_fedproto and self.global_prototypes:
+            num_classes = self._cfg.model.num_classes
+            embedding_dim = self.embedding_dim
+            proto_tensor = torch.zeros(num_classes, embedding_dim).to(self.device)
+            for class_idx, proto in self.global_prototypes.items():
+                class_idx = int(class_idx)
+                if class_idx < num_classes:
+                    if isinstance(proto, np.ndarray):
+                        proto_tensor[class_idx] = torch.from_numpy(proto).float()
+                    else:
+                        proto_tensor[class_idx] = proto.float()
+            logger.info(f"Client {self.ID}: FedProto enabled with {len(self.global_prototypes)} prototypes")
+
         total_loss = 0.0
+        total_ce_loss = 0.0
+        total_proto_loss = 0.0
+        total_prox_loss = 0.0
+        total_moon_loss = 0.0
         total_correct = 0
         total_samples = 0
 
@@ -1281,25 +1447,147 @@ class GGEURClient(Client):
 
                 optimizer.zero_grad()
                 outputs = self.mlp_classifier(features)
-                loss = criterion(outputs, labels)
+                ce_loss = criterion(outputs, labels)
+
+                # Compute FedProto prototype loss
+                proto_loss = torch.tensor(0.0, device=self.device)
+                if use_fedproto and proto_tensor is not None:
+                    # NOTE: If we compute prototype loss directly on `features`,
+                    # it will NOT affect training because `features` are inputs
+                    # (no gradients). Therefore we compute FedProto loss on
+                    # trainable quantities:
+                    #  - for linear classifier: align class weight vectors with prototypes
+                    #  - for MLP: align a trainable representation with transformed prototypes
+
+                    # Build a mask for available prototypes (some classes may be missing under LDS)
+                    proto_norms = torch.norm(proto_tensor, p=2, dim=1)
+                    proto_mask = proto_norms > 0
+
+                    if isinstance(self.mlp_classifier, nn.Linear):
+                        # Align classifier weights with corresponding prototypes
+                        if proto_mask.any():
+                            weight = self.mlp_classifier.weight  # (C, D)
+                            weight_sel = weight[proto_mask]
+                            proto_sel = proto_tensor[proto_mask]
+
+                            if proto_distance == 'cosine':
+                                weight_norm = nn.functional.normalize(weight_sel, p=2, dim=1)
+                                proto_norm = nn.functional.normalize(proto_sel, p=2, dim=1)
+                                similarity = (weight_norm * proto_norm).sum(dim=1)
+                                proto_loss = (1 - similarity).mean()
+                            else:
+                                proto_loss = nn.functional.mse_loss(weight_sel, proto_sel)
+                    else:
+                        # If the classifier is a small MLP, align the *trainable* representation.
+                        # We use the first Linear (+ ReLU if present) as a representation mapper.
+                        mapper = None
+                        mapper_act = None
+                        if isinstance(self.mlp_classifier, nn.Sequential) and len(self.mlp_classifier) >= 1:
+                            if isinstance(self.mlp_classifier[0], nn.Linear):
+                                mapper = self.mlp_classifier[0]
+                            if len(self.mlp_classifier) >= 2 and isinstance(self.mlp_classifier[1], nn.ReLU):
+                                mapper_act = self.mlp_classifier[1]
+
+                        if mapper is not None and proto_mask.any():
+                            rep = mapper(features)
+                            proto_rep = mapper(proto_tensor)
+                            if mapper_act is not None:
+                                rep = mapper_act(rep)
+                                proto_rep = mapper_act(proto_rep)
+
+                            target_protos = proto_rep[labels]
+                            if proto_distance == 'cosine':
+                                rep_norm = nn.functional.normalize(rep, p=2, dim=1)
+                                target_norm = nn.functional.normalize(target_protos, p=2, dim=1)
+                                similarity = (rep_norm * target_norm).sum(dim=1)
+                                proto_loss = (1 - similarity).mean()
+                            else:
+                                proto_loss = nn.functional.mse_loss(rep, target_protos)
+
+                # Compute FedProx proximal loss on model parameters
+                prox_loss = torch.tensor(0.0, device=self.device)
+                if use_fedprox and fedprox_mu > 0 and global_params_ref is not None:
+                    for name, param in self.mlp_classifier.named_parameters():
+                        if not param.requires_grad:
+                            continue
+                        ref = global_params_ref.get(name, None)
+                        if ref is None:
+                            continue
+                        if isinstance(ref, torch.Tensor) and ref.device != param.device:
+                            ref = ref.to(param.device)
+                        prox_loss = prox_loss + torch.sum((param - ref) ** 2)
+
+                # Compute MOON contrastive loss
+                # L_con = -log( exp(sim(z,z_global)/τ) / (exp(sim(z,z_global)/τ) + exp(sim(z,z_prev)/τ)) )
+                moon_loss = torch.tensor(0.0, device=self.device)
+                if use_moon and self.moon_global_model is not None:
+                    with torch.no_grad():
+                        z_global = self.moon_global_model(features)
+                        if self.moon_prev_model is not None:
+                            z_prev = self.moon_prev_model(features)
+                        else:
+                            # First round: no previous local model, use global as prev (loss = 0)
+                            z_prev = z_global.clone()
+
+                    z = outputs  # current model logits as representation
+                    z_norm = F.normalize(z, dim=1)
+                    z_global_norm = F.normalize(z_global, dim=1)
+                    z_prev_norm = F.normalize(z_prev, dim=1)
+
+                    sim_global = (z_norm * z_global_norm).sum(dim=1, keepdim=True) / moon_temperature
+                    sim_prev = (z_norm * z_prev_norm).sum(dim=1, keepdim=True) / moon_temperature
+
+                    logits_con = torch.cat([sim_global, sim_prev], dim=1)
+                    labels_con = torch.zeros(features.size(0), dtype=torch.long, device=self.device)
+                    moon_loss = criterion(logits_con, labels_con)
+
+                # Total loss
+                loss = ce_loss + proto_weight * proto_loss
+                if use_fedprox and fedprox_mu > 0:
+                    loss = loss + (fedprox_mu / 2.0) * prox_loss
+                if use_moon:
+                    loss = loss + moon_mu * moon_loss
                 loss.backward()
                 optimizer.step()
 
-                total_loss += loss.item() * features.size(0)
+                batch_size = features.size(0)
+                total_loss += loss.item() * batch_size
+                total_ce_loss += ce_loss.item() * batch_size
+                total_proto_loss += proto_loss.item() * batch_size
+                total_prox_loss += prox_loss.item() * batch_size
+                total_moon_loss += moon_loss.item() * batch_size
                 _, predicted = torch.max(outputs, 1)
                 total_correct += (predicted == labels).sum().item()
-                total_samples += features.size(0)
+                total_samples += batch_size
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        avg_ce_loss = total_ce_loss / total_samples if total_samples > 0 else 0
+        avg_proto_loss = total_proto_loss / total_samples if total_samples > 0 else 0
+        avg_prox_loss = total_prox_loss / total_samples if total_samples > 0 else 0
+        avg_moon_loss = total_moon_loss / total_samples if total_samples > 0 else 0
         accuracy = total_correct / total_samples if total_samples > 0 else 0
 
-        logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
+        if use_fedproto:
+            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+                       f"proto={avg_proto_loss:.4f}), accuracy={accuracy:.4f}")
+        elif use_fedprox and fedprox_mu > 0:
+            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+                       f"prox={avg_prox_loss:.4f}), accuracy={accuracy:.4f}")
+        elif use_moon:
+            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+                       f"moon={avg_moon_loss:.4f}), accuracy={accuracy:.4f}")
+        else:
+            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
 
         # Get model parameters
         model_para = copy.deepcopy(self.mlp_classifier.state_dict())
 
         results = {
             'train_loss': avg_loss,
+            'train_ce_loss': avg_ce_loss,
+            'train_proto_loss': avg_proto_loss,
+            'train_prox_loss': avg_prox_loss,
+            'train_moon_loss': avg_moon_loss,
             'train_acc': accuracy,
             'train_total': total_samples
         }
@@ -1712,6 +2000,145 @@ class GGEURClient(Client):
         }
 
         return total_samples, cnn_para, results
+
+    # ==================== PromptFL Methods ====================
+
+    def _get_class_names(self):
+        """Get class names from dataset or config, falling back to generic names."""
+        # 1. Check config override
+        cfg_names = getattr(self.ggeur_cfg, 'prompt_class_names', [])
+        if cfg_names:
+            return list(cfg_names)
+
+        # 2. Try to infer from dataset type
+        data_type = self._cfg.data.type.lower()
+        try:
+            if 'office' in data_type and 'home' in data_type:
+                from federatedscope.cv.dataset.office_home import OfficeHome
+                return list(OfficeHome.CLASSES)
+            elif 'pacs' in data_type:
+                from federatedscope.cv.dataset.pacs import PACS
+                return list(PACS.CLASSES)
+            elif 'office' in data_type and 'caltech' in data_type:
+                from federatedscope.cv.dataset.office_caltech import OfficeCaltech10
+                return list(OfficeCaltech10.CLASSES)
+        except Exception as e:
+            logger.warning(f"Client {self.ID}: Could not load class names from dataset: {e}")
+
+        # 3. Fallback: generic names
+        num_classes = self._cfg.model.num_classes
+        logger.warning(f"Client {self.ID}: Using generic class names for {num_classes} classes")
+        return [f"class {i}" for i in range(num_classes)]
+
+    def _build_prompt_model(self):
+        """Build CustomCLIP (HuggingFace-based) for PromptFL."""
+        from federatedscope.contrib.model.ggeur_prompt import CustomCLIP
+        from transformers import CLIPModel, CLIPProcessor
+
+        n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
+        class_names = self._get_class_names()
+        model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
+        clip_pretrained = getattr(self.ggeur_cfg, 'clip_pretrained', 'openai')
+
+        # Determine HuggingFace model identifier
+        # Support local path or HuggingFace hub id
+        if model_path and os.path.isdir(model_path):
+            hf_model_id = model_path
+        else:
+            # Map open_clip model names to HuggingFace ids
+            clip_model_name = getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16')
+            hf_model_id = getattr(self.ggeur_cfg, 'hf_clip_model_id', 'openai/clip-vit-base-patch16')
+
+        try:
+            logger.info(f"Client {self.ID}: Loading HuggingFace CLIP from {hf_model_id}")
+            self.hf_clip_model = CLIPModel.from_pretrained(hf_model_id)
+            processor = CLIPProcessor.from_pretrained(hf_model_id)
+        except Exception as e:
+            logger.error(f"Client {self.ID}: Failed to load HF CLIP: {e}")
+            return
+
+        template = getattr(self.ggeur_cfg, 'prompt_template', 'a photo of a {}')
+
+        self.custom_clip = CustomCLIP(
+            clip_model=self.hf_clip_model,
+            processor=processor,
+            classnames=class_names,
+            n_ctx=n_ctx,
+            template=template,
+            device=self.device,
+        )
+        # Keep backward-compat references
+        self.prompt_learner = self.custom_clip.prompt_learner
+        self.text_encoder = self.custom_clip.text_encoder
+
+        logger.info(f"Client {self.ID}: Built CustomCLIP with {n_ctx} ctx tokens, "
+                    f"{len(class_names)} classes")
+
+    def _train_prompt_on_augmented_data(self):
+        """
+        Train soft prompt ctx vectors on augmented CLIP features.
+
+        Uses CustomCLIP's PromptLearner + TextEncoder (HuggingFace-based).
+        Image features are pre-extracted; only ctx vectors are updated.
+
+        Returns:
+            sample_size, prompt_para dict, results dict
+        """
+        if self.custom_clip is None or self.augmented_loader is None:
+            return 0, {}, {}
+
+        lr = getattr(self.ggeur_cfg, 'prompt_lr', 0.002)
+        local_epochs = getattr(self.ggeur_cfg, 'prompt_local_epochs', 10)
+
+        self.custom_clip.prompt_learner.train()
+
+        optimizer = torch.optim.Adam([self.custom_clip.prompt_learner.ctx], lr=lr)
+
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        for epoch in range(local_epochs):
+            for features, labels in self.augmented_loader:
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+
+                # Normalize pre-extracted image features
+                img_feats = F.normalize(features, p=2, dim=1)
+
+                # Get text features via CustomCLIP's prompt + text encoder
+                prompt_embeds, attn_mask = self.custom_clip.prompt_learner()
+                text_feats = self.custom_clip.text_encoder(
+                    prompt_embeds, attn_mask, self.custom_clip.clip_model
+                )
+                text_feats = F.normalize(text_feats, p=2, dim=1)
+
+                # Scale by learned logit_scale (same as CustomCLIP.forward)
+                logit_scale = self.custom_clip.clip_model.logit_scale.exp()
+                logits = logit_scale * img_feats @ text_feats.T
+
+                loss = F.cross_entropy(logits, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                batch_size = features.size(0)
+                total_loss += loss.item() * batch_size
+                _, predicted = torch.max(logits, 1)
+                total_correct += (predicted == labels).sum().item()
+                total_samples += batch_size
+
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0
+        accuracy = total_correct / total_samples if total_samples > 0 else 0
+
+        logger.info(f"Client {self.ID}: Prompt training - loss={avg_loss:.4f}, acc={accuracy:.4f}, "
+                    f"samples={total_samples}")
+
+        prompt_para = {'ctx': copy.deepcopy(self.custom_clip.prompt_learner.ctx.data.cpu())}
+        results = {'prompt_loss': avg_loss, 'prompt_acc': accuracy, 'prompt_total': total_samples}
+
+        return total_samples, prompt_para, results
 
 
 def call_ggeur_worker(method):

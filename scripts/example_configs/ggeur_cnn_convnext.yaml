@@ -18,7 +18,7 @@
 
 # ========== Basic Settings ==========
 use_gpu: True
-device: 1
+device: 0
 seed: 42
 verbose: 1
 
@@ -37,7 +37,7 @@ data:
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
-  batch_size: 32
+  batch_size: 16
   num_workers: 0
 
 # ========== Model Settings ==========
@@ -50,7 +50,7 @@ train:
   local_update_steps: 10
   optimizer:
     type: 'Adam'
-    lr: 0.0001
+    lr: 0.001
 
 # ========== GGEUR_Clip Specific Settings ==========
 ggeur:

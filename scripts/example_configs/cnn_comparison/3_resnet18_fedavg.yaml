@@ -1,0 +1,59 @@
+# Config 3: ResNet18 + FedAvg (No Pretrain)
+#
+# End-to-end training with ResNet18 from scratch
+# - Model: ResNet18 (randomly initialized)
+# - Aggregation: FedAvg
+# - No GGEUR augmentation
+
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'fedavg'
+  mode: 'standalone'
+  client_num: 60
+  total_round_num: 100
+  sample_client_num: 60
+
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  shuffle: True
+  num_workers: 0
+
+model:
+  type: 'resnet18'
+  num_classes: 65
+
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'SGD'
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 0.0005
+
+criterion:
+  type: 'CrossEntropyLoss'
+
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+  split: ['test']
+  best_res_update_round_wise_key: test_avg_loss
+
+# LDS settings (for data partitioning only)
+ggeur:
+  use: False
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+outdir: 'exp/cnn_comparison/resnet18_fedavg'
+expname: 'resnet18_fedavg'

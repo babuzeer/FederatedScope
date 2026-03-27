@@ -24,7 +24,7 @@ verbose: 1
 
 # ========== Federated Learning Settings ==========
 federate:
-  method: 'ggeur'
+  method: 'fedavg'
   mode: 'standalone'
   client_num: 60  # One client per domain
   total_round_num: 100
@@ -50,11 +50,11 @@ train:
   local_update_steps: 10
   optimizer:
     type: 'Adam'
-    lr: 0.0001
+    lr: 0.001
 
-# ========== GGEUR_Clip Specific Settings ==========
+# ========== GGEUR_Clip Specific Settings (Disabled for FedAvg baseline) ==========
 ggeur:
-  use: True
+  use: False
 
   # ===== Feature Extractor Mode =====
   # 'clip': Use CLIP ViT model (requires open_clip)
@@ -97,6 +97,9 @@ ggeur:
 
   # ===== Training Settings =====
   statistics_round: 0
+
+  # ===== FedProto Settings (Disabled for FedAvg baseline) =====
+  use_fedproto: False
 
   # ===== LDS Settings (Optional) =====
   use_lds: True

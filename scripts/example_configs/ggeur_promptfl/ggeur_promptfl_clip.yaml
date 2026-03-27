@@ -1,0 +1,105 @@
+# GGEUR + PromptFL (CLIP Text Soft Prompts)
+#
+# Combines GGEUR Gaussian feature augmentation with PromptFL:
+# 1. GGEUR extracts CLIP features and augments them via global covariance
+# 2. PromptFL trains soft text prompts (ctx vectors) on the augmented features
+# 3. Only ctx vectors are federated (16x512 = 8192 params vs MLP's 33280)
+#
+# Requires: feature_extractor='clip' (text prompts need CLIP text encoder)
+# Reference: PromptFL (Guo et al., 2022) + GGEUR
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 20
+  total_round_num: 100
+  sample_client_num: 0
+
+# ========== Data Settings ==========
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 16
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'Adam'
+    lr: 0.001
+
+# ========== GGEUR + PromptFL Settings ==========
+ggeur:
+  use: True
+
+  # ===== Feature Extractor: must be 'clip' for PromptFL =====
+  feature_extractor: 'clip'
+  clip_model: 'ViT-B-16'
+  clip_pretrained: 'openai'
+  clip_model_path: '/root/model/open_clip_vitb16.bin'
+  embedding_dim: 512
+
+  # ===== Feature Caching =====
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # ===== Feature Augmentation =====
+  num_generated_per_sample: 50
+  num_generated_per_prototype: 50
+  target_size_per_class: 50
+
+  # ===== MLP Classifier (still trained alongside PromptFL) =====
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  # ===== Multi-domain Settings =====
+  use_cross_client_prototypes: True
+  statistics_round: 0
+
+  # ===== LDS Settings =====
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+  # ===== Disable CNN modes =====
+  use_cnn_distillation: False
+  use_feature_alignment: False
+  use_separated_training: False
+
+  # ===== PromptFL Settings =====
+  use_promptfl: True
+  # Number of learnable context tokens (paper uses 16)
+  prompt_length: 16
+  # Learning rate for prompt optimizer
+  prompt_lr: 0.002
+  # Local training epochs per round for prompt
+  prompt_local_epochs: 10
+  # Temperature for cosine similarity logits
+  prompt_temperature: 0.07
+  # Optional: override class names (leave empty to auto-detect from dataset)
+  prompt_class_names: []
+  # Text prompt template
+  prompt_template: 'a photo of a {}'
+  # HuggingFace CLIP model directory (must contain config.json + pytorch_model.bin)
+  # Set this to your local HF CLIP model path
+  hf_clip_model_id: 'openai/clip-vit-base-patch16'
+
+# ========== Output Settings ==========
+outdir: 'exp/ggeur_promptfl_clip'
+expname: 'ggeur_promptfl_officehome'

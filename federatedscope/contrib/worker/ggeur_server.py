@@ -14,13 +14,16 @@ Handles:
 import os
 import logging
 import copy
+import re
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from federatedscope.core.message import Message
 from federatedscope.core.workers import Server
+from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,12 @@ class GGEURServer(Server):
         # MLP model for aggregation
         self.global_mlp = None
 
+        # ===== FedOpt (server-side) =====
+        self.use_fedopt = getattr(config.fedopt, 'use', False) if hasattr(config, 'fedopt') else False
+        self.fedopt_optimizer = None
+        self.fedopt_scheduler = None
+        self.fedopt_annealing = getattr(config.fedopt, 'annealing', False) if hasattr(config, 'fedopt') else False
+
         # Track which clients have completed augmentation
         self.augmentation_ready_clients = set()
 
@@ -96,8 +105,13 @@ class GGEURServer(Server):
         # ===== Feature Extractor Mode =====
         # 'clip': Use CLIP (ViT-based, original method)
         # 'cnn': Use pretrained CNN (ConvNeXt, ResNet, etc.)
+        # 'timm': Use any timm vision backbone (e.g., GFNet / Mixer / etc.)
         self.feature_extractor_type = getattr(self.ggeur_cfg, 'feature_extractor', 'clip')
         self.cnn_extractor = None  # CNN feature extractor for evaluation
+        self.timm_extractor = None  # timm feature extractor for evaluation
+
+        # Embedding dim inferred from clients/statistics (preferred over cfg.ggeur.embedding_dim)
+        self.inferred_embedding_dim = None
 
         # ===== Separated Training Mode =====
         self.use_separated_training = getattr(self.ggeur_cfg, 'use_separated_training', False)
@@ -107,6 +121,36 @@ class GGEURServer(Server):
         self.training_phase = 'classifier'
         # Store pretrained classifier for Phase 2
         self.pretrained_classifier = None
+
+        # ===== PromptFL Mode =====
+        self.use_promptfl = getattr(self.ggeur_cfg, 'use_promptfl', False)
+        self.global_prompt_ctx = None          # Aggregated ctx tensor [n_ctx, ctx_dim]
+        self.prompt_test_accuracies_history = {}
+        self.best_prompt_avg_accuracy = 0.0
+        # CLIP model and prompt components for server-side evaluation
+        self.prompt_learner_eval = None
+        self.text_encoder_eval = None
+
+    def _get_embedding_dim(self):
+        """Get embedding dim, preferring inferred value from client statistics."""
+        if isinstance(self.inferred_embedding_dim, int) and self.inferred_embedding_dim > 0:
+            return int(self.inferred_embedding_dim)
+
+        # Infer from any received mean vector
+        for client_stats in self.local_statistics_buffer.values():
+            means = client_stats.get('means', {})
+            for _, mean in means.items():
+                if hasattr(mean, 'shape') and len(mean.shape) == 1:
+                    self.inferred_embedding_dim = int(mean.shape[0])
+                    return int(self.inferred_embedding_dim)
+                try:
+                    # Fallback for list-like
+                    self.inferred_embedding_dim = int(len(mean))
+                    return int(self.inferred_embedding_dim)
+                except Exception:
+                    continue
+
+        return int(getattr(self.ggeur_cfg, 'embedding_dim', 512))
 
     def _register_default_handlers(self):
         """Register message handlers"""
@@ -122,7 +166,7 @@ class GGEURServer(Server):
 
     def _build_global_mlp(self, num_classes):
         """Build global MLP classifier"""
-        input_dim = self.ggeur_cfg.embedding_dim
+        input_dim = self._get_embedding_dim()
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
 
         if hidden_dim > 0:
@@ -137,6 +181,42 @@ class GGEURServer(Server):
 
         self.global_mlp = self.global_mlp.to(self.device)
         logger.info(f"Server: Built global MLP classifier with {num_classes} classes")
+
+        # Initialize FedOpt optimizer if enabled (needs a built global model)
+        self._init_fedopt_if_needed()
+
+    def _init_fedopt_if_needed(self):
+        """Initialize FedOpt optimizer/scheduler for global MLP if enabled."""
+        if not self.use_fedopt:
+            return
+        if self.global_mlp is None:
+            return
+        if self.fedopt_optimizer is not None:
+            return
+
+        try:
+            self.fedopt_optimizer = get_optimizer(model=self.global_mlp,
+                                                  **self._cfg.fedopt.optimizer)
+        except Exception as e:
+            logger.error(f"Server: Failed to build FedOpt optimizer: {e}")
+            self.fedopt_optimizer = None
+            return
+
+        if self.fedopt_annealing:
+            try:
+                self.fedopt_scheduler = torch.optim.lr_scheduler.StepLR(
+                    self.fedopt_optimizer,
+                    step_size=self._cfg.fedopt.annealing_step_size,
+                    gamma=self._cfg.fedopt.annealing_gamma
+                )
+            except Exception as e:
+                logger.warning(f"Server: Failed to build FedOpt scheduler, disabling annealing: {e}")
+                self.fedopt_scheduler = None
+                self.fedopt_annealing = False
+
+        opt_type = getattr(self._cfg.fedopt.optimizer, 'type', 'Unknown')
+        opt_lr = getattr(self._cfg.fedopt.optimizer, 'lr', 'Unknown')
+        logger.info(f"Server: FedOpt enabled - optimizer={opt_type}, lr={opt_lr}, annealing={self.fedopt_annealing}")
 
     def _build_global_cnn(self, num_classes):
         """Build global CNN model for knowledge distillation or feature alignment"""
@@ -220,10 +300,44 @@ class GGEURServer(Server):
             logger.error(f"Server: Failed to load CNN extractor: {e}")
             raise
 
+    def _load_timm_extractor(self):
+        """Load timm feature extractor for test feature extraction"""
+        if self.timm_extractor is not None:
+            return
+
+        try:
+            from federatedscope.contrib.model.ggeur_timm_extractor import TimmFeatureExtractor
+
+            model_name = getattr(self.ggeur_cfg, 'timm_model', 'gfnet_tiny')
+            pretrained = getattr(self.ggeur_cfg, 'timm_pretrained', True)
+            checkpoint_path = getattr(self.ggeur_cfg, 'timm_checkpoint_path', '')
+            freeze = True  # Always freeze for feature extraction
+            in_chans = getattr(self.ggeur_cfg, 'timm_in_chans', 3)
+            global_pool = getattr(self.ggeur_cfg, 'timm_global_pool', 'avg')
+
+            self.timm_extractor = TimmFeatureExtractor(
+                model_name=model_name,
+                pretrained=pretrained,
+                freeze=freeze,
+                checkpoint_path=checkpoint_path,
+                in_chans=in_chans,
+                global_pool=global_pool,
+            )
+            self.timm_extractor = self.timm_extractor.to(self.device)
+
+            logger.info(f"Server: Loaded timm extractor {model_name}, "
+                        f"feature_dim={self.timm_extractor.get_feature_dim()}")
+
+        except Exception as e:
+            logger.error(f"Server: Failed to load timm extractor: {e}")
+            raise
+
     def _load_feature_extractor(self):
         """Load the appropriate feature extractor (CLIP or CNN)"""
         if self.feature_extractor_type == 'cnn':
             self._load_cnn_extractor()
+        elif self.feature_extractor_type == 'timm':
+            self._load_timm_extractor()
         else:
             self._load_clip_model()
 
@@ -253,6 +367,10 @@ class GGEURServer(Server):
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             model_str = model_name.replace('/', '_').replace('-', '_')
             prefix = 'cnn'
+        elif self.feature_extractor_type == 'timm':
+            model_name = getattr(self.ggeur_cfg, 'timm_model', 'gfnet_tiny')
+            model_str = str(model_name).replace('/', '_').replace('-', '_')
+            prefix = 'timm'
         else:
             clip_model = self.ggeur_cfg.clip_model.replace('/', '_').replace('-', '_')
             pretrained = self.ggeur_cfg.clip_pretrained.replace('/', '_').replace('-', '_')
@@ -356,13 +474,20 @@ class GGEURServer(Server):
 
                 dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-                extractor_name = 'CNN' if self.feature_extractor_type == 'cnn' else 'CLIP'
+                if self.feature_extractor_type == 'cnn':
+                    extractor_name = 'CNN'
+                elif self.feature_extractor_type == 'timm':
+                    extractor_name = 'timm'
+                else:
+                    extractor_name = 'CLIP'
 
                 with torch.no_grad():
                     for images, labels in dataloader:
                         images = images.to(self.device)
                         if self.feature_extractor_type == 'cnn':
                             features = self.cnn_extractor(images)
+                        elif self.feature_extractor_type == 'timm':
+                            features = self.timm_extractor(images)
                         else:
                             features = self.clip_model.encode_image(images)
                         features_list.append(features.cpu().numpy())
@@ -445,6 +570,24 @@ class GGEURServer(Server):
 
         logger.info(f"Server: Received local statistics from client {client_id}")
 
+        # Infer embedding dimension from client-reported value (preferred) or from means later
+        client_embedding_dim = content.get('embedding_dim', None) if isinstance(content, dict) else None
+        if client_embedding_dim is not None:
+            try:
+                client_embedding_dim = int(client_embedding_dim)
+            except Exception:
+                client_embedding_dim = None
+
+        if client_embedding_dim:
+            if self.inferred_embedding_dim is None:
+                self.inferred_embedding_dim = client_embedding_dim
+                logger.info(f"Server: Inferred embedding_dim={self.inferred_embedding_dim} from client {client_id}")
+            elif int(self.inferred_embedding_dim) != int(client_embedding_dim):
+                raise ValueError(
+                    f"Embedding dim mismatch across clients: "
+                    f"server_inferred={self.inferred_embedding_dim}, client_{client_id}={client_embedding_dim}"
+                )
+
         # Store statistics
         self.local_statistics_buffer[client_id] = {
             'means': content['means'],
@@ -480,6 +623,10 @@ class GGEURServer(Server):
                 if self.use_cnn_distillation or self.use_feature_alignment:
                     self._build_global_cnn(num_classes)
 
+                # Initialize global prompt ctx if PromptFL enabled
+                if self.use_promptfl:
+                    self._init_global_prompt(num_classes)
+
             # Broadcast global covariances to all clients
             self._broadcast_global_covariances(other_prototypes)
 
@@ -494,7 +641,10 @@ class GGEURServer(Server):
 
         # When all clients are ready, start training
         if len(self.augmentation_ready_clients) >= self._client_num:
-            logger.info("Server: All clients ready, starting FedAvg training...")
+            if self.use_fedopt:
+                logger.info("Server: All clients ready, starting FedOpt training...")
+            else:
+                logger.info("Server: All clients ready, starting FedAvg training...")
             self.state = 1  # Move to round 1
             self._start_training_round()
 
@@ -523,6 +673,12 @@ class GGEURServer(Server):
                 model_para = copy.deepcopy(self.global_mlp.state_dict())
             else:
                 model_para = None
+
+        # Attach global prompt ctx if PromptFL enabled
+        if self.use_promptfl and self.global_prompt_ctx is not None:
+            if not isinstance(model_para, dict):
+                model_para = {'mlp': model_para}
+            model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
         # Broadcast to all clients
         for client_id in range(1, self._client_num + 1):
@@ -596,8 +752,33 @@ class GGEURServer(Server):
     def _build_classifier_from_state_dict(self, state_dict):
         """Build classifier model from saved state dict for evaluation"""
         num_classes = self._cfg.model.num_classes
-        input_dim = self.ggeur_cfg.embedding_dim
+        input_dim = None
         hidden_dim = self.ggeur_cfg.mlp_hidden_dim
+
+        # Infer input dim from state dict when possible (more robust than cfg.ggeur.embedding_dim)
+        try:
+            # Linear classifier
+            if 'weight' in state_dict and hasattr(state_dict['weight'], 'shape'):
+                input_dim = int(state_dict['weight'].shape[1])
+            else:
+                # Sequential: pick the smallest numeric prefix layer's weight
+                candidates = []
+                for k, v in state_dict.items():
+                    if not hasattr(v, 'shape'):
+                        continue
+                    if len(v.shape) != 2:
+                        continue
+                    m = re.match(r'^(\\d+)\\.weight$', str(k))
+                    if m:
+                        candidates.append((int(m.group(1)), int(v.shape[1])))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    input_dim = candidates[0][1]
+        except Exception:
+            input_dim = None
+
+        if input_dim is None:
+            input_dim = self._get_embedding_dim()
 
         if hidden_dim > 0:
             classifier = nn.Sequential(
@@ -630,7 +811,7 @@ class GGEURServer(Server):
         for client_stats in self.local_statistics_buffer.values():
             all_classes.update(client_stats['means'].keys())
 
-        embedding_dim = self.ggeur_cfg.embedding_dim
+        embedding_dim = self._get_embedding_dim()
 
         for class_idx in all_classes:
             class_idx = int(class_idx)
@@ -678,7 +859,7 @@ class GGEURServer(Server):
         """Compute global prototypes (weighted average of local means) for each class"""
         logger.info("Server: Computing global prototypes...")
 
-        embedding_dim = self.ggeur_cfg.embedding_dim
+        embedding_dim = self._get_embedding_dim()
 
         # Collect all class indices
         all_classes = set()
@@ -780,8 +961,14 @@ class GGEURServer(Server):
             self._perform_fedavg(round_idx)
 
     def _perform_fedavg(self, round_idx):
-        """Perform FedAvg aggregation for MLP (and optionally CNN)"""
-        logger.info(f"Server: Performing FedAvg aggregation for round {round_idx}")
+        """Perform aggregation for MLP (and optionally CNN).
+
+        - Default: FedAvg weighted averaging
+        - If cfg.fedopt.use: FedOpt server-side update for the global MLP
+        """
+        logger.info(
+            f"Server: Performing {'FedOpt' if self.use_fedopt else 'FedAvg'} aggregation for round {round_idx}"
+        )
 
         # Collect all model parameters
         all_params = self.msg_buffer['train'][round_idx]
@@ -821,12 +1008,15 @@ class GGEURServer(Server):
                     total_samples
                 )
 
-                # Update global MLP
+                # Update global MLP (FedAvg or FedOpt)
                 if mlp_aggregated and self.global_mlp is not None:
                     try:
-                        self.global_mlp.load_state_dict(mlp_aggregated)
+                        if self.use_fedopt:
+                            self._apply_fedopt_update(mlp_aggregated)
+                        else:
+                            self.global_mlp.load_state_dict(mlp_aggregated)
                     except Exception as e:
-                        logger.debug(f"Server: Could not load MLP params: {e}")
+                        logger.debug(f"Server: Could not update MLP params: {e}")
 
                 # Update global CNN
                 if cnn_aggregated and self.global_cnn is not None:
@@ -840,7 +1030,10 @@ class GGEURServer(Server):
 
                 if mlp_aggregated and self.global_mlp is not None:
                     try:
-                        self.global_mlp.load_state_dict(mlp_aggregated)
+                        if self.use_fedopt:
+                            self._apply_fedopt_update(mlp_aggregated)
+                        else:
+                            self.global_mlp.load_state_dict(mlp_aggregated)
                     except Exception as e:
                         logger.debug(f"Server: Could not load MLP params: {e}")
 
@@ -849,6 +1042,14 @@ class GGEURServer(Server):
         if test_results:
             acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
             logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+
+        # Aggregate and evaluate PromptFL if enabled
+        if self.use_promptfl:
+            self._aggregate_prompt(valid_params, total_samples)
+            prompt_results = self._evaluate_prompt_on_test_sets()
+            if prompt_results:
+                acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in prompt_results.items()])
+                logger.info(f"Server: Round {round_idx} Prompt Test Accuracy - {acc_str}")
 
         # Evaluate CNN on test sets (using original images) if enabled
         # Include separated training Phase 2
@@ -872,6 +1073,44 @@ class GGEURServer(Server):
             self._start_training_round()
         else:
             self._finish()
+
+    def _apply_fedopt_update(self, averaged_state_dict):
+        """
+        Apply FedOpt server-side update based on the averaged client model.
+
+        FedOpt uses the pseudo-gradient:
+            g = w_t - w_bar
+        and performs an optimizer step on the server model parameters.
+        """
+        if self.global_mlp is None:
+            return
+        self._init_fedopt_if_needed()
+        if self.fedopt_optimizer is None:
+            # Fallback to FedAvg if optimizer is not available
+            self.global_mlp.load_state_dict(averaged_state_dict)
+            return
+
+        with torch.no_grad():
+            current_state = self.global_mlp.state_dict()
+            grads = {}
+            for key, cur in current_state.items():
+                if key not in averaged_state_dict:
+                    continue
+                avg = averaged_state_dict[key]
+                if not isinstance(avg, torch.Tensor):
+                    avg = torch.tensor(avg)
+                if avg.device != cur.device:
+                    avg = avg.to(cur.device)
+                grads[key] = (cur.detach() - avg.detach()).type_as(cur)
+
+        self.fedopt_optimizer.zero_grad()
+        for name, p in self.global_mlp.named_parameters():
+            if name in grads:
+                p.grad = grads[name]
+        self.fedopt_optimizer.step()
+
+        if self.fedopt_annealing and self.fedopt_scheduler is not None:
+            self.fedopt_scheduler.step()
 
     def _perform_separated_fedavg(self, valid_params, total_samples, round_idx):
         """Perform FedAvg for separated training mode"""
@@ -1120,6 +1359,15 @@ class GGEURServer(Server):
 
             logger.info(f"CNN Best Average Accuracy: {self.best_cnn_avg_accuracy:.4f}")
 
+        # Print PromptFL final results
+        if self.use_promptfl and self.prompt_test_accuracies_history:
+            logger.info("-"*60)
+            logger.info("PromptFL Final Test Results:")
+            for domain, acc_list in self.prompt_test_accuracies_history.items():
+                if acc_list:
+                    logger.info(f"  {domain}: final={acc_list[-1]:.4f}, best={max(acc_list):.4f}")
+            logger.info(f"Prompt Best Average Accuracy: {self.best_prompt_avg_accuracy:.4f}")
+
         logger.info("="*60)
 
         for client_id in range(1, self._client_num + 1):
@@ -1134,3 +1382,135 @@ class GGEURServer(Server):
             )
 
         self._monitor.finish_fl()
+
+    # ==================== PromptFL Methods ====================
+
+    def _init_global_prompt(self, num_classes):
+        """Initialize global prompt ctx with zeros (clients will randomize locally)."""
+        n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
+        ctx_dim = self._get_embedding_dim()
+        self.global_prompt_ctx = torch.zeros(n_ctx, ctx_dim, device=self.device)
+        logger.info(f"Server: Initialized global prompt ctx [{n_ctx}, {ctx_dim}]")
+
+    def _aggregate_prompt(self, valid_params, total_samples):
+        """Aggregate prompt ctx vectors from clients using weighted average."""
+        prompt_params = []
+        for s, p in valid_params:
+            if isinstance(p, dict) and p.get('prompt') is not None:
+                prompt_params.append((s, p['prompt']))
+
+        if not prompt_params:
+            return
+
+        aggregated = self._aggregate_model_params(prompt_params, total_samples)
+        if aggregated and 'ctx' in aggregated:
+            self.global_prompt_ctx = aggregated['ctx'].to(self.device)
+            logger.info(f"Server: Aggregated prompt ctx from {len(prompt_params)} clients")
+
+    def _evaluate_prompt_on_test_sets(self):
+        """Evaluate global prompt on test sets using CLIP image features."""
+        if self.global_prompt_ctx is None:
+            return {}
+
+        # Load test features if not ready
+        if not self.test_data_loaded:
+            self._load_test_data_and_features()
+        if not self.test_features:
+            return {}
+
+        # Build or update eval CustomCLIP (HuggingFace-based)
+        if self.prompt_learner_eval is None:
+            from federatedscope.contrib.model.ggeur_prompt import CustomCLIP
+            from transformers import CLIPModel, CLIPProcessor
+
+            n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
+            num_classes = self._cfg.model.num_classes
+            hf_model_id = getattr(self.ggeur_cfg, 'hf_clip_model_id', 'openai/clip-vit-base-patch16')
+            model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
+            if model_path and os.path.isdir(model_path):
+                hf_model_id = model_path
+
+            # Get class names
+            cfg_names = getattr(self.ggeur_cfg, 'prompt_class_names', [])
+            if cfg_names:
+                class_names = list(cfg_names)
+            else:
+                data_type = self._cfg.data.type.lower()
+                try:
+                    if 'office' in data_type and 'home' in data_type:
+                        from federatedscope.cv.dataset.office_home import OfficeHome
+                        class_names = list(OfficeHome.CLASSES)
+                    elif 'pacs' in data_type:
+                        from federatedscope.cv.dataset.pacs import PACS
+                        class_names = list(PACS.CLASSES)
+                    elif 'office' in data_type and 'caltech' in data_type:
+                        from federatedscope.cv.dataset.office_caltech import OfficeCaltech10
+                        class_names = list(OfficeCaltech10.CLASSES)
+                    else:
+                        class_names = [f"class {i}" for i in range(num_classes)]
+                except Exception:
+                    class_names = [f"class {i}" for i in range(num_classes)]
+
+            template = getattr(self.ggeur_cfg, 'prompt_template', 'a photo of a {}')
+
+            try:
+                hf_clip = CLIPModel.from_pretrained(hf_model_id)
+                processor = CLIPProcessor.from_pretrained(hf_model_id)
+            except Exception as e:
+                logger.error(f"Server: Failed to load HF CLIP for prompt eval: {e}")
+                return {}
+
+            custom_clip = CustomCLIP(
+                clip_model=hf_clip,
+                processor=processor,
+                classnames=class_names,
+                n_ctx=n_ctx,
+                template=template,
+                device=self.device,
+            )
+            # Store only the components needed for eval
+            self.prompt_learner_eval = custom_clip.prompt_learner
+            self.text_encoder_eval = custom_clip.text_encoder
+            self._eval_hf_clip = custom_clip.clip_model
+
+        # Load current global ctx
+        self.prompt_learner_eval.ctx.data = self.global_prompt_ctx.to(self.device)
+
+        results = {}
+        self.prompt_learner_eval.eval()
+
+        with torch.no_grad():
+            prompt_embeds, attn_mask = self.prompt_learner_eval()
+            text_feats = self.text_encoder_eval(prompt_embeds, attn_mask, self._eval_hf_clip)
+            text_feats = F.normalize(text_feats, p=2, dim=1)
+            logit_scale = self._eval_hf_clip.logit_scale.exp()
+
+            for domain, features in self.test_features.items():
+                labels = self.test_labels[domain]
+
+                feat_tensor = torch.from_numpy(features).float().to(self.device)
+                label_tensor = torch.from_numpy(labels).long().to(self.device)
+
+                img_feats = F.normalize(feat_tensor, p=2, dim=1)
+                logits = logit_scale * img_feats @ text_feats.T
+                _, predicted = torch.max(logits, 1)
+
+                accuracy = (predicted == label_tensor).float().mean().item()
+                results[domain] = accuracy
+
+                if domain not in self.prompt_test_accuracies_history:
+                    self.prompt_test_accuracies_history[domain] = []
+                self.prompt_test_accuracies_history[domain].append(accuracy)
+
+        if results:
+            avg_accuracy = sum(results.values()) / len(results)
+            results['average'] = avg_accuracy
+
+            if 'average' not in self.prompt_test_accuracies_history:
+                self.prompt_test_accuracies_history['average'] = []
+            self.prompt_test_accuracies_history['average'].append(avg_accuracy)
+
+            if avg_accuracy > self.best_prompt_avg_accuracy:
+                self.best_prompt_avg_accuracy = avg_accuracy
+
+        return results

@@ -1,5 +1,5 @@
 """
-Plot comparison of GGEUR_Clip vs FedAvg experiment results.
+Plot comparison of Our_method vs FedAvg experiment results.
 Extracts per-round average test accuracy from log files and plots comparison curves.
 """
 
@@ -7,6 +7,8 @@ import re
 import os
 import matplotlib.pyplot as plt
 import numpy as np
+
+OUR_METHOD_LABEL = "Our_method"
 
 def parse_log_file(log_path):
     """
@@ -60,7 +62,7 @@ def plot_comparison(exp_dir, output_path=None):
         name = os.path.basename(log_path).replace('_exp_print.log', '')
         # Extract method name (ggeur or fedavg)
         if 'ggeur' in name.lower():
-            label = 'GGEUR_Clip'
+            label = OUR_METHOD_LABEL
         elif 'fedavg' in name.lower():
             label = 'FedAvg'
         else:
@@ -80,8 +82,8 @@ def plot_comparison(exp_dir, output_path=None):
     axes = axes.flatten()
 
     domains = ['Art', 'Clipart', 'Product', 'Real_World', 'average']
-    colors = {'GGEUR_Clip': '#2196F3', 'FedAvg': '#FF5722'}
-    markers = {'GGEUR_Clip': 'o', 'FedAvg': 's'}
+    colors = {OUR_METHOD_LABEL: '#2196F3', 'FedAvg': '#FF5722'}
+    markers = {OUR_METHOD_LABEL: 'o', 'FedAvg': 's'}
 
     for idx, domain in enumerate(domains):
         ax = axes[idx]
@@ -135,7 +137,7 @@ def plot_comparison(exp_dir, output_path=None):
                 fontfamily='monospace',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-    plt.suptitle('GGEUR_Clip vs FedAvg - Office-Home LDS (α=0.1)', fontsize=14, fontweight='bold')
+    plt.suptitle(f'{OUR_METHOD_LABEL} vs FedAvg - Office-Home LDS (α=0.1)', fontsize=14, fontweight='bold')
     plt.tight_layout()
 
     # Save figure
@@ -164,7 +166,7 @@ def plot_average_only(exp_dir, output_path=None):
     for log_path in log_files:
         name = os.path.basename(log_path).replace('_exp_print.log', '')
         if 'ggeur' in name.lower():
-            label = 'GGEUR_Clip'
+            label = OUR_METHOD_LABEL
         elif 'fedavg' in name.lower():
             label = 'FedAvg'
         else:
@@ -177,8 +179,8 @@ def plot_average_only(exp_dir, output_path=None):
     # Create single plot
     plt.figure(figsize=(10, 6))
 
-    colors = {'GGEUR_Clip': '#2196F3', 'FedAvg': '#FF5722'}
-    markers = {'GGEUR_Clip': 'o', 'FedAvg': 's'}
+    colors = {OUR_METHOD_LABEL: '#2196F3', 'FedAvg': '#FF5722'}
+    markers = {OUR_METHOD_LABEL: 'o', 'FedAvg': 's'}
 
     for method, results in all_results.items():
         rounds = sorted(results.keys())
@@ -200,7 +202,7 @@ def plot_average_only(exp_dir, output_path=None):
 
     plt.xlabel('Round', fontsize=12)
     plt.ylabel('Average Accuracy (%)', fontsize=12)
-    plt.title('GGEUR_Clip vs FedAvg - Office-Home LDS (α=0.1)\nAverage Test Accuracy per Round',
+    plt.title(f'{OUR_METHOD_LABEL} vs FedAvg - Office-Home LDS (α=0.1)\nAverage Test Accuracy per Round',
               fontsize=14, fontweight='bold')
     plt.legend(loc='lower right', fontsize=11)
     plt.grid(True, alpha=0.3)
@@ -217,10 +219,10 @@ def plot_average_only(exp_dir, output_path=None):
 
 
 if __name__ == '__main__':
-    exp_dir = r'/exp/GGEUR_Clip'
+    exp_dir = r'exp/GGEUR_Clip'
 
     print("=" * 50)
-    print("Plotting GGEUR_Clip vs FedAvg Comparison")
+    print(f"Plotting {OUR_METHOD_LABEL} vs FedAvg Comparison")
     print("=" * 50)
 
     # Plot detailed comparison (all domains)

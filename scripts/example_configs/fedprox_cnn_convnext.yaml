@@ -1,0 +1,102 @@
+# FedProx Baseline with CNN Feature Extractor (ConvNeXt-Base)
+#
+# This configuration uses FedProx method for comparison with GGEUR.
+# FedProx adds a proximal term to handle system and statistical heterogeneity.
+#
+# Key Differences from FedAvg:
+# - Adds proximal term: L_prox = (mu/2) * ||w - w_global||^2
+# - Better handles non-IID data and partial participation
+#
+# Reference: Li et al. "Federated Optimization in Heterogeneous Networks" (MLSys 2020)
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 1
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'fedprox'
+  mode: 'standalone'
+  client_num: 60
+  total_round_num: 100
+  sample_client_num: 0
+
+# ========== FedProx Settings ==========
+fedprox:
+  use: True
+  mu: 0.01  # Proximal term weight (typical values: 0.001, 0.01, 0.1)
+
+# ========== Data Settings ==========
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+
+# ========== GGEUR_Clip Specific Settings (Disabled for FedProx baseline) ==========
+ggeur:
+  use: False
+
+  # ===== Feature Extractor Mode =====
+  feature_extractor: 'cnn'
+
+  # ===== CNN Feature Extractor Settings =====
+  cnn_backbone: 'convnext_base'
+  cnn_pretrained: True
+  freeze_backbone: True
+
+  # ===== Feature Dimension =====
+  embedding_dim: 1024
+
+  # ===== Feature Caching =====
+  use_feature_cache: False
+  feature_cache_dir: ''
+
+  # ===== Feature Augmentation (Disabled for baseline) =====
+  num_generated_per_sample: 0
+  num_generated_per_prototype: 0
+  target_size_per_class: 0
+
+  # ===== MLP Classifier =====
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  # ===== Multi-domain Settings =====
+  use_cross_client_prototypes: True
+
+  # ===== Training Settings =====
+  statistics_round: 0
+
+  # ===== FedProto Settings (Disabled for FedProx baseline) =====
+  use_fedproto: False
+
+  # ===== LDS Settings =====
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+  # ===== Disable other CNN modes =====
+  use_cnn_distillation: False
+  use_feature_alignment: False
+  use_separated_training: False
+
+# ========== Output Settings ==========
+outdir: 'exp/fedprox_cnn_convnext'
+expname: 'fedprox_cnn_officehome'

@@ -1,0 +1,110 @@
+# FedProto + GGEUR with CNN Feature Extractor (ConvNeXt-Base)
+#
+# This configuration combines:
+# - GGEUR's Gaussian feature augmentation
+# - FedProto's prototype-based regularization
+#
+# Key Features:
+# 1. Extract features using pretrained ConvNeXt-Base
+# 2. Generate augmented features using Gaussian distribution (GGEUR)
+# 3. Train MLP with prototype distance loss (FedProto)
+# 4. Aggregate both model parameters and prototypes
+#
+# Reference:
+# - GGEUR: Gaussian Geometry-guided Feature Expansion with Unified Representation
+# - FedProto: Federated Prototype Learning across Heterogeneous Clients
+
+# ========== Basic Settings ==========
+use_gpu: True
+device: 1
+seed: 42
+verbose: 1
+
+# ========== Federated Learning Settings ==========
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 60
+  total_round_num: 100
+  sample_client_num: 0
+
+# ========== Data Settings ==========
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+# ========== Model Settings ==========
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+# ========== Training Settings ==========
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+
+# ========== GGEUR + FedProto Settings ==========
+ggeur:
+  use: True
+
+  # ===== Feature Extractor Mode =====
+  feature_extractor: 'cnn'
+
+  # ===== CNN Feature Extractor Settings =====
+  cnn_backbone: 'convnext_base'
+  cnn_pretrained: True
+  freeze_backbone: True
+
+  # ===== Feature Dimension =====
+  embedding_dim: 1024
+
+  # ===== Feature Caching =====
+  use_feature_cache: False
+  feature_cache_dir: ''
+
+  # ===== GGEUR Feature Augmentation =====
+  # Generate augmented samples using Gaussian distribution
+  num_generated_per_sample: 50
+  num_generated_per_prototype: 50
+  target_size_per_class: 0
+
+  # ===== MLP Classifier =====
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  # ===== Multi-domain Settings =====
+  use_cross_client_prototypes: True
+
+  # ===== Training Settings =====
+  statistics_round: 0
+
+  # ===== FedProto Integration =====
+  # Enable FedProto-style prototype regularization
+  use_fedproto: True
+  # Weight for prototype loss: L = CE + proto_weight * proto_loss
+  proto_weight: 1.0
+  # Distance metric: 'cosine' or 'euclidean'
+  proto_distance: 'cosine'
+  # Temperature for cosine distance
+  proto_temperature: 0.1
+
+  # ===== LDS Settings =====
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+  # ===== Disable CNN modes =====
+  use_cnn_distillation: False
+  use_feature_alignment: False
+  use_separated_training: False
+
+# ========== Output Settings ==========
+outdir: 'exp/fedproto_ggeur_convnext'
+expname: 'fedproto_ggeur_officehome'

@@ -1,0 +1,99 @@
+# GGEUR (timm): GFNet-Tiny (pretrained, frozen) + MLP + FedAvg (With GGEUR data generation)
+#
+# This config adds a third feature extractor category besides CNN / CLIP-ViT:
+# - Feature extractor: timm backbone (GFNet by default)
+# - Backbone frozen, only trains the downstream MLP head
+# - Optional GGEUR Gaussian feature generation in embedding space
+#
+# Run:
+#   python federatedscope/main.py --cfg scripts/example_configs/ggeur_baseline_timm/officehome_lds_timm_ggeur_fedavg.yaml
+#
+# Note: Requires `timm` installed:
+#   pip install timm
+#
+# If your environment cannot reach HuggingFace to download pretrained weights,
+# either set `ggeur.timm_checkpoint_path` to a local weights file, or set
+# `ggeur.timm_pretrained: False`. You can also try increasing HF timeouts:
+#   HF_HUB_ETAG_TIMEOUT=60 HF_HUB_DOWNLOAD_TIMEOUT=600
+
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 60
+  total_round_num: 100
+  sample_client_num: 0
+
+data:
+  type: 'office-home'  #domainnet
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+
+ggeur:
+  use: True
+
+  # Feature extractor (timm)
+  feature_extractor: 'timm'
+  # Pick a timm model id that exists in your environment.
+  # If your timm includes GFNet, you can use e.g. 'gfnet_tiny_patch4_224'.
+  timm_model: 'mixer_b16_224'
+  timm_pretrained: True
+  # If your environment cannot access HuggingFace, download the weights file
+  # in advance and set this to the local path (then no online download occurs).
+  # Example: '/root/models/mixer_b16_224.safetensors'
+  timm_checkpoint_path: ''
+  timm_in_chans: 3
+  timm_global_pool: 'avg'
+  freeze_backbone: True
+
+  # Feature caching (optional)
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # Enable GGEUR augmentation (memory-safe defaults)
+  num_generated_per_sample: 0
+  num_generated_per_prototype: 8
+  target_size_per_class: 200
+
+  # MLP head (a bit stronger than linear)
+  mlp_hidden_dim: 256
+  mlp_dropout: 0.2
+
+  # Multi-domain
+  use_cross_client_prototypes: True
+  statistics_round: 0
+
+  # FedProto off (pure FedAvg)
+  use_fedproto: False
+
+  # LDS split
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+  # Keep other modes off
+  use_cnn_distillation: False
+
+  use_feature_alignment: False
+  use_separated_training: False
+
+outdir: 'exp/ggeur_baselines'
+expname: 'officehome_lds/timm/ggeur/fedavg'

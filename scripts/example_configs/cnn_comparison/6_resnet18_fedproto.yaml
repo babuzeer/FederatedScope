@@ -1,0 +1,80 @@
+# Config 6: ResNet18 + FedProto (No Pretrain)
+#
+# End-to-end training with ResNet18 from scratch + FedProto
+# - Model: ResNet18 (randomly initialized)
+# - Aggregation: FedProto (prototype-based learning)
+# - No GGEUR augmentation
+
+use_gpu: True
+device: 1
+seed: 42
+verbose: 1
+
+federate:
+  mode: 'standalone'
+  client_num: 60
+  total_round_num: 100
+  sample_client_num: 60
+  share_local_model: True
+  online_aggr: False
+  make_global_eval: False
+
+data:
+  type: 'office-home'
+  root: 'OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  shuffle: True
+  num_workers: 0
+
+model:
+  type: 'resnet18'
+  num_classes: 65
+  out_channels: 512
+
+trainer:
+  type: 'fedproto_trainer'
+
+train:
+  local_update_steps: 10
+  optimizer:
+    type: 'SGD'
+    lr: 0.01
+    momentum: 0.9
+    weight_decay: 0.0005
+  batch_or_epoch: batch
+
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+  split: ['test']
+  best_res_update_round_wise_key: test_avg_loss
+
+criterion:
+  type: 'CrossEntropyLoss'
+
+# FedProto settings
+fedproto:
+  use: True
+  proto_weight: 1.0
+  embedding_dim: 512
+  use_projector: True
+  projector_hidden_dim: 256
+  distance_metric: 'cosine'
+  temperature: 0.1
+  aggregation_method: 'weighted_mean'
+  local_proto_epochs: 1
+  normalize_prototypes: True
+  freeze_backbone: False
+
+# LDS settings (for data partitioning only)
+ggeur:
+  use: False
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+outdir: 'exp/cnn_comparison/resnet18_fedproto'
+expname: 'resnet18_fedproto'
