@@ -13,6 +13,8 @@ Handles:
 import os
 import logging
 import copy
+import hashlib
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,6 +51,23 @@ class AugmentedFeatureDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.features[idx], self.labels[idx]
+
+
+class LocalTextDataset(Dataset):
+    """Raw text dataset used for token-level CerP poisoning."""
+
+    def __init__(self, texts, labels, sample_ids=None):
+        self.texts = list(texts)
+        self.labels = [int(label) for label in labels]
+        self.sample_ids = list(sample_ids) if sample_ids is not None else None
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        if self.sample_ids is None:
+            return self.texts[idx], int(self.labels[idx])
+        return self.texts[idx], int(self.labels[idx]), self.sample_ids[idx]
 
 
 class AugmentedImageDataset(Dataset):
@@ -154,6 +173,8 @@ class GGEURClient(Client):
         # Local features and labels
         self.local_features = {}  # {class_idx: features array}
         self.local_labels = {}
+        self.local_feature_ids = []
+        self.local_domain = None
 
         # Local statistics
         self.local_means = {}  # {class_idx: mean vector}
@@ -197,6 +218,59 @@ class GGEURClient(Client):
         self.full_model = None  # Combined CNN + classifier for fine-tuning
         self.original_image_loader = None
 
+        # ===== CerP (Feature-space Backdoor Attack) =====
+        attack_cfg = getattr(config, 'attack', None)
+        attack_method = str(getattr(attack_cfg, 'attack_method', '')).lower()
+        self.use_cerp = attack_method == 'cerp'
+        self.cerp_cfg = getattr(attack_cfg, 'cerp', None)
+        self.cerp_attacker_ids = self._parse_attacker_ids(
+            getattr(attack_cfg, 'attacker_id', -1))
+        self.is_cerp_attacker = self.use_cerp and self.ID in self.cerp_attacker_ids
+        self.cerp_target_label = int(getattr(attack_cfg, 'target_label_ind', -1))
+        self.cerp_poison_ratio = float(getattr(attack_cfg, 'poison_ratio', 0.0))
+        self.cerp_start_round = int(
+            getattr(self.cerp_cfg, 'start_round', 1)) if self.cerp_cfg is not None else 1
+        self.cerp_trigger_lr = float(
+            getattr(self.cerp_cfg, 'trigger_lr', 0.1)) if self.cerp_cfg is not None else 0.1
+        self.cerp_trigger_steps = int(
+            getattr(self.cerp_cfg, 'trigger_steps', 1)) if self.cerp_cfg is not None else 1
+        self.cerp_trigger_tune_batches = int(
+            getattr(self.cerp_cfg, 'trigger_tune_batches', 4)
+        ) if self.cerp_cfg is not None else 4
+        self.cerp_trigger_max_norm = float(
+            getattr(self.cerp_cfg, 'trigger_max_norm', 1.0)
+        ) if self.cerp_cfg is not None else 1.0
+        self.cerp_lambda_model = float(
+            getattr(self.cerp_cfg, 'lambda_model', 1e-4)
+        ) if self.cerp_cfg is not None else 1e-4
+        self.cerp_lambda_similarity = float(
+            getattr(self.cerp_cfg, 'lambda_similarity', 1e-4)
+        ) if self.cerp_cfg is not None else 1e-4
+        self.cerp_lambda_trigger_reg = float(
+            getattr(self.cerp_cfg, 'lambda_trigger_reg', 1e-3)
+        ) if self.cerp_cfg is not None else 1e-3
+        self.cerp_trigger_space = str(
+            getattr(self.cerp_cfg, 'trigger_space', 'feature')
+        ).lower() if self.cerp_cfg is not None else 'feature'
+        self.cerp_trigger_text = str(
+            getattr(self.cerp_cfg, 'trigger_text', 'cf mn bb tq')
+        ) if self.cerp_cfg is not None else 'cf mn bb tq'
+        self.cerp_text_batch_size = int(
+            getattr(self.cerp_cfg, 'text_batch_size',
+                    getattr(self._cfg.dataloader, 'batch_size', 32))
+        ) if self.cerp_cfg is not None else int(
+            getattr(self._cfg.dataloader, 'batch_size', 32))
+        self.cerp_active = False
+        self.cerp_shared_trigger = None
+        self.cerp_initial_trigger = None
+        self.cerp_other_attacker_models = {}
+        self.cerp_last_trigger = None
+        self.cerp_trigger_token_ids = None
+        self.local_train_texts = []
+        self.local_train_labels = []
+        self.local_train_sample_ids = []
+        self.cerp_text_loader = None
+
         # ===== Legacy modes (for backward compatibility) =====
         self.use_cnn_distillation = getattr(self.ggeur_cfg, 'use_cnn_distillation', False)
         self.use_feature_alignment = getattr(self.ggeur_cfg, 'use_feature_alignment', False)
@@ -205,6 +279,483 @@ class GGEURClient(Client):
         self.training_phase = 'classifier'
         self.pretrained_classifier = None
         self.cnn_backbone = None
+
+    @staticmethod
+    def _parse_attacker_ids(attacker_id_cfg):
+        if isinstance(attacker_id_cfg, int):
+            return [] if attacker_id_cfg < 0 else [int(attacker_id_cfg)]
+        if isinstance(attacker_id_cfg, (list, tuple)):
+            parsed = []
+            for item in attacker_id_cfg:
+                try:
+                    item_int = int(item)
+                except Exception:
+                    continue
+                if item_int >= 0:
+                    parsed.append(item_int)
+            return parsed
+        return []
+
+    def _set_cerp_state(self, payload):
+        self.cerp_active = False
+        self.cerp_shared_trigger = None
+        self.cerp_initial_trigger = None
+        self.cerp_other_attacker_models = {}
+
+        if not self.use_cerp or not isinstance(payload, dict):
+            return
+
+        self.cerp_active = bool(payload.get('active', False) and self.is_cerp_attacker)
+
+        shared_trigger = payload.get('shared_trigger', None)
+        if shared_trigger is not None:
+            self.cerp_shared_trigger = torch.tensor(
+                shared_trigger, device=self.device, dtype=torch.float32)
+
+        initial_trigger = payload.get('initial_trigger', None)
+        if initial_trigger is not None:
+            self.cerp_initial_trigger = torch.tensor(
+                initial_trigger, device=self.device, dtype=torch.float32)
+
+        other_models = payload.get('other_attacker_models', None)
+        if isinstance(other_models, dict):
+            self.cerp_other_attacker_models = other_models
+
+    def _is_cerp_attack_round(self):
+        return bool(
+            self.use_cerp and self.is_cerp_attacker and self.cerp_active and
+            self.state >= self.cerp_start_round and self.cerp_target_label >= 0
+        )
+
+    def _use_cerp_token_trigger(self):
+        if self.feature_extractor_type != 'bert':
+            return False
+        return self.cerp_trigger_space in {
+            'token', 'text', 'prompt', 'soft_prompt', 'auto'
+        }
+
+    def _resolve_cerp_trigger_token_ids(self):
+        if not self._use_cerp_token_trigger():
+            return None
+        if self.cerp_trigger_token_ids is not None:
+            return self.cerp_trigger_token_ids
+
+        self._load_bert_model()
+        trigger_text = str(self.cerp_trigger_text or '').strip()
+        if not trigger_text:
+            trigger_text = 'cf mn bb tq'
+
+        token_ids = self.bert_tokenizer.encode(
+            trigger_text, add_special_tokens=False)
+        if not token_ids:
+            fallback_text = self.bert_tokenizer.unk_token or '[UNK]'
+            token_ids = self.bert_tokenizer.encode(
+                fallback_text, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(
+                f'Client {self.ID}: failed to tokenize CerP trigger text '
+                f'`{trigger_text}`.')
+
+        self.cerp_trigger_token_ids = torch.tensor(
+            token_ids, dtype=torch.long, device=self.device)
+        return self.cerp_trigger_token_ids
+
+    def _encode_texts_with_bert_trigger(self, texts, trigger_delta=None):
+        if not texts:
+            return torch.empty(
+                (0, int(getattr(self.ggeur_cfg, 'embedding_dim', 0))),
+                device=self.device, dtype=torch.float32)
+
+        self._load_bert_model()
+
+        prompt_token_ids = None
+        prompt_len = 0
+        if self._use_cerp_token_trigger():
+            prompt_token_ids = self._resolve_cerp_trigger_token_ids()
+            prompt_len = int(prompt_token_ids.numel())
+
+        max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+        effective_max_len = max_len
+        if prompt_len > 0:
+            effective_max_len = max(2, max_len - prompt_len)
+
+        encoded = self.bert_tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=effective_max_len,
+            return_tensors='pt'
+        )
+        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+        if prompt_len > 0:
+            input_ids = encoded.pop('input_ids')
+            embed_layer = self.bert_model.get_input_embeddings()
+            token_embeds = embed_layer(input_ids)
+
+            batch_size = int(token_embeds.shape[0])
+            prompt_ids = prompt_token_ids.unsqueeze(0).expand(batch_size, -1)
+            prompt_embeds = embed_layer(prompt_ids)
+
+            if trigger_delta is not None:
+                delta = trigger_delta.to(self.device)
+                if delta.dim() != 2 or delta.shape[0] != prompt_len:
+                    raise ValueError(
+                        f'Client {self.ID}: invalid CerP token trigger shape '
+                        f'{tuple(delta.shape)}, expected ({prompt_len}, H).')
+                prompt_embeds = prompt_embeds + \
+                    delta.unsqueeze(0).expand(batch_size, -1, -1)
+
+            token_embeds = torch.cat(
+                [token_embeds[:, :1, :], prompt_embeds, token_embeds[:, 1:, :]],
+                dim=1
+            )
+
+            attention_mask = encoded.get('attention_mask', None)
+            if attention_mask is not None:
+                prompt_mask = torch.ones(
+                    (batch_size, prompt_len),
+                    dtype=attention_mask.dtype,
+                    device=self.device
+                )
+                encoded['attention_mask'] = torch.cat(
+                    [attention_mask[:, :1], prompt_mask, attention_mask[:, 1:]],
+                    dim=1
+                )
+
+            token_type_ids = encoded.get('token_type_ids', None)
+            if token_type_ids is not None:
+                prompt_types = torch.zeros(
+                    (batch_size, prompt_len),
+                    dtype=token_type_ids.dtype,
+                    device=self.device
+                )
+                encoded['token_type_ids'] = torch.cat(
+                    [token_type_ids[:, :1], prompt_types, token_type_ids[:, 1:]],
+                    dim=1
+                )
+
+            outputs = self.bert_model(inputs_embeds=token_embeds, **encoded)
+        else:
+            outputs = self.bert_model(**encoded)
+
+        hidden = outputs.last_hidden_state
+        pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+        if pooling == 'mean':
+            attn = encoded.get('attention_mask', None)
+            if attn is None:
+                emb = hidden.mean(dim=1)
+            else:
+                mask = attn.unsqueeze(-1).float()
+                emb = (hidden * mask).sum(dim=1) / \
+                    mask.sum(dim=1).clamp(min=1e-6)
+        else:
+            emb = hidden[:, 0, :]
+        return emb
+
+    def _rebuild_cerp_text_loader(self):
+        self.cerp_text_loader = None
+        if not self._use_cerp_token_trigger():
+            return
+        if not self.local_train_texts:
+            return
+
+        dataset = LocalTextDataset(
+            self.local_train_texts,
+            self.local_train_labels,
+            self.local_train_sample_ids
+        )
+        batch_size = max(int(self.cerp_text_batch_size), 1)
+        self.cerp_text_loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True)
+
+    def _next_cerp_text_batch(self, iterator):
+        if self.cerp_text_loader is None:
+            return None, iterator
+        if iterator is None:
+            iterator = iter(self.cerp_text_loader)
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            iterator = iter(self.cerp_text_loader)
+            batch = next(iterator)
+        return batch, iterator
+
+    def _build_cerp_poisoned_text_batch(self, texts, labels, trigger):
+        if trigger is None or self.cerp_target_label < 0:
+            return None, None, 0
+
+        label_tensor = torch.as_tensor(labels, dtype=torch.long)
+        candidate_indices = torch.nonzero(
+            label_tensor != int(self.cerp_target_label), as_tuple=False
+        ).view(-1)
+        if candidate_indices.numel() == 0:
+            return None, None, 0
+
+        poison_ratio = float(self.cerp_poison_ratio)
+        if poison_ratio <= 0:
+            return None, None, 0
+
+        batch_size = int(label_tensor.shape[0])
+        if poison_ratio < 1.0:
+            poison_count = max(1, int(round(batch_size * poison_ratio)))
+        else:
+            poison_count = int(poison_ratio)
+        poison_count = min(poison_count, int(candidate_indices.numel()))
+        if poison_count <= 0:
+            return None, None, 0
+
+        perm = torch.randperm(candidate_indices.numel())[:poison_count]
+        selected = candidate_indices[perm].tolist()
+        poison_texts = [str(texts[idx]) for idx in selected]
+        poison_features = self._encode_texts_with_bert_trigger(
+            poison_texts, trigger_delta=trigger)
+        poison_labels = torch.full(
+            (poison_count,),
+            fill_value=int(self.cerp_target_label),
+            dtype=torch.long,
+            device=self.device
+        )
+        return poison_features, poison_labels, poison_count
+
+    def _project_cerp_trigger(self, trigger):
+        if trigger is None:
+            return trigger
+
+        base = self.cerp_initial_trigger
+        if base is None:
+            base = torch.zeros_like(trigger)
+
+        max_norm = float(self.cerp_trigger_max_norm)
+        if max_norm <= 0:
+            return trigger
+
+        delta = trigger - base
+        delta_norm = torch.norm(delta, p=2)
+        if delta_norm > max_norm:
+            delta = delta * (max_norm / (delta_norm + 1e-12))
+            trigger = base + delta
+        return trigger
+
+    def _build_cerp_poisoned_batch(self, features, labels, trigger):
+        poison_mask = torch.zeros(
+            labels.shape[0], device=labels.device, dtype=torch.bool)
+        if trigger is None or self.cerp_target_label < 0:
+            return features, labels, poison_mask
+
+        candidate_indices = torch.nonzero(
+            labels != int(self.cerp_target_label), as_tuple=False).view(-1)
+        if candidate_indices.numel() == 0:
+            return features, labels, poison_mask
+
+        poison_ratio = float(self.cerp_poison_ratio)
+        if poison_ratio <= 0:
+            return features, labels, poison_mask
+
+        if poison_ratio < 1.0:
+            poison_count = max(1, int(round(features.size(0) * poison_ratio)))
+        else:
+            poison_count = int(poison_ratio)
+        poison_count = min(poison_count, int(candidate_indices.numel()))
+
+        if poison_count <= 0:
+            return features, labels, poison_mask
+
+        selected = candidate_indices[torch.randperm(
+            candidate_indices.numel(), device=features.device)[:poison_count]]
+
+        poisoned_features = features.clone()
+        poisoned_labels = labels.clone()
+        poisoned_features[selected] = poisoned_features[selected] + \
+            trigger.unsqueeze(0)
+        poisoned_labels[selected] = int(self.cerp_target_label)
+        poison_mask[selected] = True
+        return poisoned_features, poisoned_labels, poison_mask
+
+    def _train_cerp_benign_reference(self, global_state_dict):
+        if self.augmented_loader is None or self.mlp_classifier is None:
+            return {}
+
+        benign_model = copy.deepcopy(self.mlp_classifier).to(self.device)
+        benign_model.load_state_dict(global_state_dict)
+        benign_model.train()
+
+        optimizer = torch.optim.Adam(
+            benign_model.parameters(), lr=self._cfg.train.optimizer.lr)
+        criterion = nn.CrossEntropyLoss()
+        local_epochs = max(int(self._cfg.train.local_update_steps), 1)
+
+        for _ in range(local_epochs):
+            for features, labels in self.augmented_loader:
+                features = features.to(self.device)
+                labels = labels.to(self.device)
+
+                optimizer.zero_grad()
+                outputs = benign_model(features)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+        return {
+            name: tensor.detach().clone()
+            for name, tensor in benign_model.state_dict().items()
+        }
+
+    def _tune_cerp_trigger(self, global_state_dict):
+        if not self._is_cerp_attack_round() or self.augmented_loader is None:
+            return None
+        if self.cerp_shared_trigger is None:
+            return None
+
+        temp_model = copy.deepcopy(self.mlp_classifier).to(self.device)
+        temp_model.load_state_dict(global_state_dict)
+        # cuDNN RNN/LSTM only supports backward in training mode. We freeze the
+        # temporary model parameters and optimize the trigger only.
+        temp_model.train()
+        if hasattr(temp_model, 'dropout'):
+            temp_model.dropout.eval()
+        for param in temp_model.parameters():
+            param.requires_grad_(False)
+
+        trigger = self.cerp_shared_trigger.detach().clone().to(self.device)
+        trigger.requires_grad_(True)
+
+        optimizer = torch.optim.SGD([trigger], lr=self.cerp_trigger_lr)
+        criterion = nn.CrossEntropyLoss()
+        use_token_trigger = self._use_cerp_token_trigger() and \
+            self.cerp_text_loader is not None
+
+        for _ in range(max(int(self.cerp_trigger_steps), 0)):
+            tuned_batches = 0
+            if use_token_trigger:
+                text_iter = iter(self.cerp_text_loader)
+                while tuned_batches < max(int(self.cerp_trigger_tune_batches), 1):
+                    try:
+                        batch = next(text_iter)
+                    except StopIteration:
+                        text_iter = iter(self.cerp_text_loader)
+                        batch = next(text_iter)
+
+                    texts, labels = batch[0], batch[1]
+                    poison_features, poison_labels, poison_count = \
+                        self._build_cerp_poisoned_text_batch(
+                            texts, labels, trigger)
+                    if poison_count <= 0 or poison_features is None:
+                        tuned_batches += 1
+                        continue
+
+                    optimizer.zero_grad()
+                    outputs = temp_model(poison_features)
+
+                    reg_loss = torch.zeros((), device=self.device)
+                    if self.cerp_initial_trigger is not None:
+                        reg_loss = (trigger - self.cerp_initial_trigger).pow(2).mean()
+
+                    loss = criterion(outputs, poison_labels) + \
+                        self.cerp_lambda_trigger_reg * reg_loss
+                    loss.backward()
+                    optimizer.step()
+
+                    with torch.no_grad():
+                        trigger.copy_(self._project_cerp_trigger(trigger))
+
+                    tuned_batches += 1
+            else:
+                for features, labels in self.augmented_loader:
+                    if tuned_batches >= max(int(self.cerp_trigger_tune_batches), 1):
+                        break
+
+                    features = features.to(self.device)
+                    labels = labels.to(self.device)
+                    poisoned_features, _, poison_mask = \
+                        self._build_cerp_poisoned_batch(features, labels, trigger)
+                    if not poison_mask.any():
+                        continue
+
+                    optimizer.zero_grad()
+                    outputs = temp_model(poisoned_features[poison_mask])
+                    target = torch.full(
+                        (int(poison_mask.sum().item()), ),
+                        fill_value=int(self.cerp_target_label),
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+
+                    reg_loss = torch.zeros((), device=self.device)
+                    if self.cerp_initial_trigger is not None:
+                        reg_loss = (trigger - self.cerp_initial_trigger).pow(2).mean()
+
+                    loss = criterion(outputs, target) + \
+                        self.cerp_lambda_trigger_reg * reg_loss
+                    loss.backward()
+                    optimizer.step()
+
+                    with torch.no_grad():
+                        trigger.copy_(self._project_cerp_trigger(trigger))
+
+                    tuned_batches += 1
+
+        return trigger.detach()
+
+    def _cerp_model_distance(self, reference_state):
+        if not reference_state:
+            return None
+
+        distance = torch.zeros((), device=self.device)
+        for name, param in self.mlp_classifier.named_parameters():
+            ref = reference_state.get(name, None)
+            if ref is None:
+                continue
+            if not isinstance(ref, torch.Tensor):
+                ref = torch.tensor(ref, device=self.device, dtype=param.dtype)
+            else:
+                ref = ref.to(self.device, dtype=param.dtype)
+            distance = distance + (param - ref).pow(2).sum()
+
+        return torch.sqrt(distance + 1e-12)
+
+    def _cerp_similarity_penalty(self):
+        if not self.cerp_other_attacker_models:
+            return None
+
+        current_state = self.mlp_classifier.state_dict()
+        current_parts = []
+        for tensor in current_state.values():
+            if isinstance(tensor, torch.Tensor):
+                current_parts.append(tensor.detach().reshape(-1).float())
+        if not current_parts:
+            return None
+
+        current_vec = torch.cat(current_parts, dim=0)
+        if torch.norm(current_vec, p=2) <= 0:
+            return None
+
+        similarities = []
+        for other_state in self.cerp_other_attacker_models.values():
+            other_parts = []
+            for name, tensor in current_state.items():
+                if name not in other_state:
+                    continue
+                other_tensor = other_state[name]
+                if not isinstance(other_tensor, torch.Tensor):
+                    other_tensor = torch.tensor(
+                        other_tensor, device=self.device, dtype=torch.float32)
+                else:
+                    other_tensor = other_tensor.to(
+                        self.device, dtype=torch.float32)
+                other_parts.append(other_tensor.reshape(-1))
+
+            if not other_parts:
+                continue
+
+            other_vec = torch.cat(other_parts, dim=0)
+            similarities.append(
+                F.cosine_similarity(current_vec, other_vec, dim=0))
+
+        if not similarities:
+            return None
+
+        return torch.stack(similarities).mean()
 
     def _register_default_handlers(self):
         """Register message handlers"""
@@ -291,6 +842,8 @@ class GGEURClient(Client):
                 cfg = AutoConfig.from_pretrained(model_path, local_files_only=local_only)
                 model = AutoModel.from_config(cfg)
             model = model.to(self.device)
+            for param in model.parameters():
+                param.requires_grad_(False)
             model.eval()
             _SHARED_BERT_EXTRACTORS[cache_key] = (tokenizer, model)
             self.bert_tokenizer, self.bert_model = tokenizer, model
@@ -418,6 +971,134 @@ class GGEURClient(Client):
         except Exception as e:
             logger.warning(f"Client {self.ID}: Failed to save cache: {e}")
 
+    @staticmethod
+    def _update_cache_hasher_with_array(hasher, array):
+        arr = np.ascontiguousarray(np.asarray(array))
+        hasher.update(str(arr.shape).encode('utf-8'))
+        hasher.update(str(arr.dtype).encode('utf-8'))
+        hasher.update(arr.tobytes())
+
+    def _get_augmentation_cache_dir(self):
+        cache_dir = getattr(self.ggeur_cfg, 'augmentation_cache_dir', '')
+        if not cache_dir:
+            cache_dir = os.path.join(
+                os.path.dirname(self._cfg.data.root),
+                'ggeur_augmentation_cache'
+            )
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _build_augmentation_cache_key(self):
+        if not getattr(self.ggeur_cfg, 'use_augmentation_cache', True):
+            return None
+
+        hasher = hashlib.md5()
+        meta = {
+            'client_id': int(self.ID),
+            'data_type': str(getattr(self._cfg.data, 'type', 'unknown')),
+            'feature_extractor': str(self.feature_extractor_type),
+            'embedding_dim': int(getattr(self.ggeur_cfg, 'embedding_dim', 0)),
+            'num_generated_per_sample': int(
+                getattr(self.ggeur_cfg, 'num_generated_per_sample', 0)),
+            'num_generated_per_prototype': int(
+                getattr(self.ggeur_cfg, 'num_generated_per_prototype', 0)),
+            'target_size_per_class': int(
+                getattr(self.ggeur_cfg, 'target_size_per_class', 0)),
+            'use_cross_client_prototypes': bool(
+                getattr(self.ggeur_cfg, 'use_cross_client_prototypes', True)),
+            'seed': int(getattr(self._cfg, 'seed', 0)),
+            'bert_model_path': str(
+                getattr(self.ggeur_cfg, 'bert_model_path', '')),
+            'bert_pooling': str(
+                getattr(self.ggeur_cfg, 'bert_pooling', 'cls')),
+            'cnn_backbone': str(
+                getattr(self.ggeur_cfg, 'cnn_backbone', '')),
+            'clip_model': str(
+                getattr(self.ggeur_cfg, 'clip_model', '')),
+            'clip_pretrained': str(
+                getattr(self.ggeur_cfg, 'clip_pretrained', '')),
+        }
+        hasher.update(json.dumps(meta, sort_keys=True).encode('utf-8'))
+
+        for sample_id in self.local_feature_ids:
+            hasher.update(str(sample_id).encode('utf-8'))
+            hasher.update(b'\0')
+
+        if self.global_cov_matrices:
+            for class_idx in sorted(self.global_cov_matrices.keys()):
+                hasher.update(f'cov:{int(class_idx)}'.encode('utf-8'))
+                self._update_cache_hasher_with_array(
+                    hasher, self.global_cov_matrices[class_idx])
+
+        if self.other_prototypes:
+            for class_idx in sorted(self.other_prototypes.keys()):
+                hasher.update(f'proto:{int(class_idx)}'.encode('utf-8'))
+                for prototype in self.other_prototypes[class_idx]:
+                    self._update_cache_hasher_with_array(hasher, prototype)
+
+        return hasher.hexdigest()
+
+    def _get_augmentation_cache_path(self):
+        cache_key = self._build_augmentation_cache_key()
+        if not cache_key:
+            return None
+
+        cache_dir = self._get_augmentation_cache_dir()
+        dataset_name = str(getattr(self._cfg.data, 'type', 'data')).lower()
+        domain = str(self.local_domain or f'client{self.ID}')
+        domain = domain.replace('/', '_').replace('\\', '_').replace(' ', '_')
+        filename = (
+            f'{dataset_name}_{domain}_client{int(self.ID)}_'
+            f'aug_{cache_key}.npz'
+        )
+        return os.path.join(cache_dir, filename)
+
+    def _load_augmentation_cache(self, cache_path):
+        if cache_path is None or not os.path.exists(cache_path):
+            return None, None
+
+        try:
+            data = np.load(cache_path)
+            if 'features' not in data or 'labels' not in data:
+                return None, None
+            features = np.asarray(data['features'], dtype=np.float32)
+            labels = np.asarray(data['labels'], dtype=np.int64)
+            logger.info(
+                f"Client {self.ID}: Loaded cached augmented data "
+                f"{features.shape} from {cache_path}")
+            return features, labels
+        except Exception as e:
+            logger.warning(
+                f"Client {self.ID}: Failed to load augmentation cache: {e}")
+            return None, None
+
+    def _save_augmentation_cache(self, cache_path, features, labels):
+        if cache_path is None or features is None or labels is None:
+            return
+
+        try:
+            np.savez(
+                cache_path,
+                features=np.asarray(features, dtype=np.float32),
+                labels=np.asarray(labels, dtype=np.int64)
+            )
+            logger.info(
+                f"Client {self.ID}: Saved augmentation cache to {cache_path}")
+        except Exception as e:
+            logger.warning(
+                f"Client {self.ID}: Failed to save augmentation cache: {e}")
+
+    def _set_augmented_dataset(self, features, labels):
+        self.augmented_features = np.asarray(features, dtype=np.float32)
+        self.augmented_labels = np.asarray(labels, dtype=np.int64)
+        dataset = AugmentedFeatureDataset(
+            self.augmented_features, self.augmented_labels)
+        self.augmented_loader = DataLoader(
+            dataset,
+            batch_size=self._cfg.dataloader.batch_size,
+            shuffle=True
+        )
+
     def _extract_bert_features(self, base_dataset, subset_indices, cache_path):
         """
         Extract sentence-level BERT embeddings from a text dataset.
@@ -445,6 +1126,10 @@ class GGEURClient(Client):
 
         self.local_features = {}
         self.local_labels = {}
+        self.local_feature_ids = []
+        self.local_train_texts = []
+        self.local_train_labels = []
+        self.local_train_sample_ids = []
 
         for base_idx in indices:
             # Stable sample id for cache lookup
@@ -453,13 +1138,13 @@ class GGEURClient(Client):
             else:
                 sample_id = f"{getattr(base_dataset, 'domain', 'text')}:{base_idx}"
 
-            # Label (prefer `.targets`)
-            if hasattr(base_dataset, 'targets'):
-                label = int(base_dataset.targets[base_idx])
-                text = None
-            else:
-                text, label = base_dataset[base_idx]
-                label = int(label)
+            text, label = base_dataset[base_idx]
+            text = str(text)
+            label = int(label)
+            self.local_feature_ids.append(sample_id)
+            self.local_train_texts.append(text)
+            self.local_train_labels.append(label)
+            self.local_train_sample_ids.append(sample_id)
 
             if sample_id in feature_cache:
                 feat = feature_cache[sample_id]
@@ -536,6 +1221,8 @@ class GGEURClient(Client):
         for label in list(self.local_features.keys()):
             self.local_features[label] = np.array(self.local_features[label])
 
+        self._rebuild_cerp_text_loader()
+
     def _extract_features(self):
         """
         Extract features from local data using either CLIP or CNN.
@@ -573,6 +1260,8 @@ class GGEURClient(Client):
             subset_indices = None
             domain = getattr(dataset, 'domain', None)
 
+        self.local_domain = domain
+
         cache_path = self._get_feature_cache_path(domain)
 
         # Text (BERT) feature extraction path
@@ -591,6 +1280,7 @@ class GGEURClient(Client):
 
         self.local_features = {}
         self.local_labels = {}
+        self.local_feature_ids = []
 
         if has_paths:
             # Dataset with image paths - can use caching
@@ -611,6 +1301,7 @@ class GGEURClient(Client):
 
                 img_path = base_dataset.data[base_idx]
                 label = base_dataset.targets[base_idx]
+                self.local_feature_ids.append(str(img_path))
 
                 if img_path in feature_cache:
                     # Use cached feature
@@ -682,6 +1373,7 @@ class GGEURClient(Client):
             self._load_feature_extractor()
 
             dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+            running_idx = 0
             with torch.no_grad():
                 for batch in dataloader:
                     if len(batch) >= 2:
@@ -704,6 +1396,9 @@ class GGEURClient(Client):
                     labels = labels.cpu().numpy()
 
                     for feat, label in zip(features, labels):
+                        self.local_feature_ids.append(
+                            f"{getattr(dataset, 'domain', 'data')}:{running_idx}")
+                        running_idx += 1
                         label = int(label)
                         if label not in self.local_features:
                             self.local_features[label] = []
@@ -892,9 +1587,16 @@ class GGEURClient(Client):
         num_per_sample = self.ggeur_cfg.num_generated_per_sample
         num_per_prototype = self.ggeur_cfg.num_generated_per_prototype
         use_cross_client = self.ggeur_cfg.use_cross_client_prototypes
+        cache_path = self._get_augmentation_cache_path()
 
         # Check if augmentation is disabled (baseline mode)
         no_augmentation = (num_per_sample == 0 and num_per_prototype == 0) or not use_cross_client
+
+        cached_features, cached_labels = self._load_augmentation_cache(cache_path)
+        if cached_features is not None and cached_labels is not None:
+            self._set_augmented_dataset(cached_features, cached_labels)
+            self.augmentation_done = True
+            return
 
         if no_augmentation:
             logger.info(f"Client {self.ID}: No augmentation mode - using original features only")
@@ -910,7 +1612,7 @@ class GGEURClient(Client):
             all_classes.update(self.global_cov_matrices.keys())
         if not no_augmentation and self.other_prototypes:
             all_classes.update(self.other_prototypes.keys())
-
+        all_classes = sorted(int(class_idx) for class_idx in all_classes)
         total_classes = len(all_classes)
 
         # 获取特征维度用于日志
@@ -980,16 +1682,12 @@ class GGEURClient(Client):
         logger.info(f"Client {self.ID}: Augmentation complete, building dataset...")
 
         if all_features:
-            self.augmented_features = np.vstack(all_features)
-            self.augmented_labels = np.concatenate(all_labels)
-
-            # Create data loader
-            dataset = AugmentedFeatureDataset(self.augmented_features, self.augmented_labels)
-            self.augmented_loader = DataLoader(
-                dataset,
-                batch_size=self._cfg.dataloader.batch_size,
-                shuffle=True
+            self._set_augmented_dataset(
+                np.vstack(all_features),
+                np.concatenate(all_labels)
             )
+            self._save_augmentation_cache(
+                cache_path, self.augmented_features, self.augmented_labels)
 
             if no_augmentation:
                 logger.info(f"Client {self.ID}: Original data - {self.augmented_features.shape[0]} samples, "
@@ -1111,6 +1809,11 @@ class GGEURClient(Client):
 
         if content is not None:
             if isinstance(content, dict):
+                if self.use_cerp and 'cerp' in content:
+                    self._set_cerp_state(content.get('cerp'))
+                elif self.use_cerp:
+                    self._set_cerp_state(None)
+
                 # FedProto: receive global prototypes from server (if provided)
                 if self.use_fedproto and 'fedproto_global_prototypes' in content:
                     self._set_fedproto_global_prototypes(content.get('fedproto_global_prototypes'))
@@ -1121,6 +1824,10 @@ class GGEURClient(Client):
                 else:
                     # Backward compatibility: content is just MLP parameters
                     mlp_para = content
+            elif self.use_cerp:
+                self._set_cerp_state(None)
+        elif self.use_cerp:
+            self._set_cerp_state(None)
 
         # Update MLP with global model parameters
         if mlp_para is not None and self.mlp_classifier is not None:
@@ -1196,6 +1903,17 @@ class GGEURClient(Client):
 
             combined_para['fedproto_local_prototypes'] = copy.deepcopy(self.fedproto_local_prototypes)
             combined_para['fedproto_local_counts'] = copy.deepcopy(self.fedproto_local_counts)
+
+        if self.use_cerp and not self.use_separated_training:
+            if not isinstance(combined_para, dict):
+                combined_para = {'mlp': combined_para}
+            elif 'mlp' not in combined_para:
+                combined_para = {'mlp': combined_para}
+
+        if self._is_cerp_attack_round() and self.cerp_last_trigger is not None:
+            if not isinstance(combined_para, dict):
+                combined_para = {'mlp': combined_para}
+            combined_para['cerp_trigger'] = self.cerp_last_trigger.detach().cpu().numpy().astype(np.float32)
 
         # Send model parameters
         self.comm_manager.send(
@@ -1640,34 +2358,92 @@ class GGEURClient(Client):
         self.fedproto_local_prototypes = {}
         self.fedproto_local_counts = {}
 
+        cerp_distance_total = 0.0
+        cerp_similarity_total = 0.0
+        cerp_trigger_reg_total = 0.0
+        cerp_batches = 0
+        self.cerp_last_trigger = None
+
+        cerp_attack_round = self._is_cerp_attack_round()
+        use_token_trigger = bool(
+            cerp_attack_round and self._use_cerp_token_trigger() and
+            self.cerp_text_loader is not None
+        )
+        benign_reference_state = {}
+        if cerp_attack_round:
+            global_state_dict = copy.deepcopy(self.mlp_classifier.state_dict())
+            benign_reference_state = self._train_cerp_benign_reference(
+                global_state_dict)
+            self.cerp_last_trigger = self._tune_cerp_trigger(global_state_dict)
+            if self.cerp_last_trigger is None and self.cerp_shared_trigger is not None:
+                self.cerp_last_trigger = self.cerp_shared_trigger.detach().clone()
+            if self.cerp_last_trigger is not None:
+                self.cerp_last_trigger = self._project_cerp_trigger(
+                    self.cerp_last_trigger.detach())
+
+        cerp_text_iter = iter(self.cerp_text_loader) \
+            if use_token_trigger else None
         for epoch in range(local_epochs):
             for features, labels in self.augmented_loader:
                 features = features.to(self.device)
                 labels = labels.to(self.device)
+
+                batch_features = features
+                batch_labels = labels
+                poison_mask = None
+                poison_count = 0
+                if cerp_attack_round and self.cerp_last_trigger is not None:
+                    if use_token_trigger:
+                        text_batch, cerp_text_iter = self._next_cerp_text_batch(
+                            cerp_text_iter)
+                        if text_batch is not None:
+                            poison_features, poison_labels, poison_count = \
+                                self._build_cerp_poisoned_text_batch(
+                                    text_batch[0], text_batch[1],
+                                    self.cerp_last_trigger)
+                            if poison_count > 0 and poison_features is not None:
+                                batch_features = torch.cat(
+                                    [batch_features, poison_features], dim=0)
+                                batch_labels = torch.cat(
+                                    [batch_labels, poison_labels], dim=0)
+                                poison_mask = torch.zeros(
+                                    batch_labels.shape[0],
+                                    device=self.device,
+                                    dtype=torch.bool
+                                )
+                                poison_mask[-poison_count:] = True
+                    else:
+                        batch_features, batch_labels, poison_mask = \
+                            self._build_cerp_poisoned_batch(
+                                features, labels, self.cerp_last_trigger)
+                        poison_count = int(poison_mask.sum().item()) \
+                            if poison_mask is not None else 0
 
                 optimizer.zero_grad()
 
                 embeddings = None
                 if self.use_fedproto:
                     try:
-                        outputs, embeddings = self.mlp_classifier(features, return_features=True)
+                        outputs, embeddings = self.mlp_classifier(
+                            batch_features, return_features=True)
                     except TypeError:
-                        outputs = self.mlp_classifier(features)
+                        outputs = self.mlp_classifier(batch_features)
                         embeddings = None
                 else:
-                    outputs = self.mlp_classifier(features)
+                    outputs = self.mlp_classifier(batch_features)
 
-                ce_loss = criterion(outputs, labels)
+                ce_loss = criterion(outputs, batch_labels)
                 loss = ce_loss
 
                 proto_loss = None
                 if self.use_fedproto and embeddings is not None and self.fedproto_global_prototypes:
                     # Build prototype targets for the batch labels
                     proto_targets = torch.zeros_like(embeddings)
-                    valid_mask = torch.zeros(labels.shape[0], device=self.device, dtype=torch.bool)
+                    valid_mask = torch.zeros(
+                        batch_labels.shape[0], device=self.device, dtype=torch.bool)
 
                     for class_idx, proto in self.fedproto_global_prototypes.items():
-                        mask = labels == int(class_idx)
+                        mask = batch_labels == int(class_idx)
                         if mask.any():
                             proto_targets[mask] = proto
                             valid_mask |= mask
@@ -1689,6 +2465,25 @@ class GGEURClient(Client):
 
                         loss = ce_loss + self.fedproto_proto_weight * proto_loss
 
+                cerp_distance = None
+                cerp_similarity = None
+                cerp_trigger_reg = None
+                if cerp_attack_round:
+                    cerp_distance = self._cerp_model_distance(
+                        benign_reference_state)
+                    if cerp_distance is not None:
+                        loss = loss + self.cerp_lambda_model * cerp_distance
+
+                    cerp_similarity = self._cerp_similarity_penalty()
+                    if cerp_similarity is not None:
+                        loss = loss + self.cerp_lambda_similarity * cerp_similarity
+
+                    if self.cerp_last_trigger is not None and \
+                            self.cerp_initial_trigger is not None:
+                        cerp_trigger_reg = (
+                            self.cerp_last_trigger - self.cerp_initial_trigger
+                        ).pow(2).mean()
+
                 prox_reg = None
                 if use_fedprox and global_param_snapshot is not None:
                     prox_term = torch.zeros((), device=self.device)
@@ -1704,24 +2499,46 @@ class GGEURClient(Client):
                 loss.backward()
                 optimizer.step()
 
-                batch_size = int(features.size(0))
+                batch_size = int(batch_labels.size(0))
                 total_loss += loss.item() * batch_size
                 total_ce_loss += ce_loss.item() * batch_size
                 if proto_loss is not None:
                     total_proto_loss += proto_loss.item() * batch_size
+                if cerp_distance is not None:
+                    cerp_distance_total += cerp_distance.item() * batch_size
+                if cerp_similarity is not None:
+                    cerp_similarity_total += cerp_similarity.item() * batch_size
+                if cerp_trigger_reg is not None:
+                    cerp_trigger_reg_total += cerp_trigger_reg.item() * batch_size
+                if cerp_attack_round and poison_count > 0:
+                    cerp_batches += poison_count
                 if prox_reg is not None:
                     total_prox_loss += prox_reg.item() * batch_size
                 _, predicted = torch.max(outputs, 1)
-                total_correct += (predicted == labels).sum().item()
+                total_correct += (predicted == batch_labels).sum().item()
                 total_samples += batch_size
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         avg_ce_loss = total_ce_loss / total_samples if total_samples > 0 else 0
         avg_proto_loss = total_proto_loss / total_samples if total_samples > 0 else 0
         avg_prox_loss = total_prox_loss / total_samples if total_samples > 0 else 0
+        avg_cerp_distance = cerp_distance_total / cerp_batches \
+            if cerp_batches > 0 else 0
+        avg_cerp_similarity = cerp_similarity_total / cerp_batches \
+            if cerp_batches > 0 else 0
+        avg_cerp_trigger_reg = cerp_trigger_reg_total / cerp_batches \
+            if cerp_batches > 0 else 0
         accuracy = total_correct / total_samples if total_samples > 0 else 0
 
-        if self.use_fedproto or use_fedprox:
+        if cerp_attack_round:
+            logger.info(
+                f"Client {self.ID}: CerP train loss={avg_loss:.4f} "
+                f"(ce={avg_ce_loss:.4f}, dist={avg_cerp_distance:.4f}, "
+                f"sim={avg_cerp_similarity:.4f}, trig={avg_cerp_trigger_reg:.4f}, "
+                f"proto={avg_proto_loss:.4f}, prox={avg_prox_loss:.4f}), "
+                f"accuracy={accuracy:.4f}"
+            )
+        elif self.use_fedproto or use_fedprox:
             logger.info(
                 f"Client {self.ID}: Train loss={avg_loss:.4f} (ce={avg_ce_loss:.4f}, "
                 f"proto={avg_proto_loss:.4f}, prox={avg_prox_loss:.4f}), "
@@ -1745,6 +2562,10 @@ class GGEURClient(Client):
             'train_acc': accuracy,
             'train_total': total_samples
         }
+        if cerp_attack_round:
+            results['train_cerp_distance_loss'] = avg_cerp_distance
+            results['train_cerp_similarity_loss'] = avg_cerp_similarity
+            results['train_cerp_trigger_reg'] = avg_cerp_trigger_reg
         if self.use_fedproto:
             results['train_proto_loss'] = avg_proto_loss
         if use_fedprox:

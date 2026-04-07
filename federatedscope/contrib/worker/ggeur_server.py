@@ -21,6 +21,10 @@ from torch.utils.data import DataLoader
 
 from federatedscope.core.message import Message
 from federatedscope.core.workers import Server
+from federatedscope.contrib.data.ggeur_backdoor import \
+    build_poison_test_dataset, get_active_backdoor_attacker_ids, \
+    is_ggeur_backdoor_attack, parse_attacker_ids, \
+    validate_ggeur_backdoor_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,50 @@ class GGEURServer(Server):
         self.use_fedproto = bool(getattr(self.ggeur_cfg, 'use_fedproto', False))
         self.fedproto_global_prototypes = {}  # {class_idx: torch.Tensor}
 
+        # ===== CerP (Feature-space Backdoor Attack) =====
+        attack_method = str(getattr(getattr(config, 'attack', None),
+                                    'attack_method', '')).lower()
+        self.use_backdoor = is_ggeur_backdoor_attack(config)
+        self.backdoor_attacker_ids = parse_attacker_ids(
+            getattr(getattr(config, 'attack', None), 'attacker_id', -1))
+        self.backdoor_target_label = int(
+            getattr(getattr(config, 'attack', None), 'target_label_ind', -1))
+        self.backdoor_trigger_type = str(
+            getattr(getattr(config, 'attack', None), 'trigger_type',
+                    'gridTrigger'))
+        self.backdoor_poison_test_features = {}
+        self.backdoor_poison_test_labels = {}
+        if self.use_backdoor:
+            validate_ggeur_backdoor_config(config)
+
+        self.use_cerp = attack_method == 'cerp'
+        self.cerp_cfg = getattr(getattr(config, 'attack', None), 'cerp', None)
+        self.cerp_attacker_ids = self._parse_attacker_ids(
+            getattr(getattr(config, 'attack', None), 'attacker_id', -1))
+        self.cerp_target_label = int(
+            getattr(getattr(config, 'attack', None), 'target_label_ind', -1))
+        self.cerp_start_round = int(
+            getattr(self.cerp_cfg, 'start_round', 1)) if self.cerp_cfg is not None else 1
+        self.cerp_trigger_init_scale = float(
+            getattr(self.cerp_cfg, 'trigger_init_scale', 0.02)
+        ) if self.cerp_cfg is not None else 0.02
+        self.cerp_trigger_space = str(
+            getattr(self.cerp_cfg, 'trigger_space', 'feature')
+        ).lower() if self.cerp_cfg is not None else 'feature'
+        self.cerp_trigger_text = str(
+            getattr(self.cerp_cfg, 'trigger_text', 'cf mn bb tq')
+        ) if self.cerp_cfg is not None else 'cf mn bb tq'
+        self.cerp_force_attacker_participation = bool(
+            getattr(self.cerp_cfg, 'force_attacker_participation', False)
+        ) if self.cerp_cfg is not None else False
+        self.cerp_eval_poison = bool(
+            getattr(self.cerp_cfg, 'eval_poison', True)
+        ) if self.cerp_cfg is not None else True
+        self.cerp_initial_trigger = None
+        self.cerp_shared_trigger = None
+        self.cerp_prev_attacker_models = {}
+        self.current_training_clients = list(range(1, self._client_num + 1))
+
         # MLP model for aggregation
         self.global_mlp = None
 
@@ -88,6 +136,7 @@ class GGEURServer(Server):
         # Test data for evaluation
         self.test_features = {}  # {domain_name: features array}
         self.test_labels = {}    # {domain_name: labels array}
+        self.test_texts = {}     # {domain_name: raw texts}
         self.test_data_loaded = False
 
         # CLIP model for test feature extraction
@@ -129,6 +178,332 @@ class GGEURServer(Server):
         self.training_phase = 'classifier'
         # Store pretrained classifier for Phase 2
         self.pretrained_classifier = None
+
+    @staticmethod
+    def _parse_attacker_ids(attacker_id_cfg):
+        if isinstance(attacker_id_cfg, int):
+            return [] if attacker_id_cfg < 0 else [int(attacker_id_cfg)]
+        if isinstance(attacker_id_cfg, (list, tuple)):
+            parsed = []
+            for item in attacker_id_cfg:
+                try:
+                    item_int = int(item)
+                except Exception:
+                    continue
+                if item_int >= 0:
+                    parsed.append(item_int)
+            return parsed
+        return []
+
+    def _use_cerp_token_trigger(self):
+        if self.feature_extractor_type != 'bert':
+            return False
+        return self.cerp_trigger_space in {
+            'token', 'text', 'prompt', 'soft_prompt', 'auto'
+        }
+
+    def _resolve_cerp_trigger_token_ids(self):
+        if not self._use_cerp_token_trigger():
+            return None
+        if hasattr(self, '_cerp_trigger_token_ids') and \
+                self._cerp_trigger_token_ids is not None:
+            return self._cerp_trigger_token_ids
+
+        self._load_bert_model()
+        trigger_text = str(self.cerp_trigger_text or '').strip()
+        if not trigger_text:
+            trigger_text = 'cf mn bb tq'
+
+        token_ids = self.bert_tokenizer.encode(
+            trigger_text, add_special_tokens=False)
+        if not token_ids:
+            fallback_text = self.bert_tokenizer.unk_token or '[UNK]'
+            token_ids = self.bert_tokenizer.encode(
+                fallback_text, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(
+                f'Server: failed to tokenize CerP trigger text '
+                f'`{trigger_text}`.')
+
+        self._cerp_trigger_token_ids = torch.tensor(
+            token_ids, dtype=torch.long, device=self.device)
+        return self._cerp_trigger_token_ids
+
+    def _encode_texts_with_bert_trigger(self, texts, trigger_delta=None):
+        if not texts:
+            return torch.empty(
+                (0, int(getattr(self.ggeur_cfg, 'embedding_dim', 0))),
+                device=self.device, dtype=torch.float32)
+
+        self._load_bert_model()
+
+        prompt_token_ids = None
+        prompt_len = 0
+        if self._use_cerp_token_trigger():
+            prompt_token_ids = self._resolve_cerp_trigger_token_ids()
+            prompt_len = int(prompt_token_ids.numel())
+
+        max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+        effective_max_len = max_len
+        if prompt_len > 0:
+            effective_max_len = max(2, max_len - prompt_len)
+
+        encoded = self.bert_tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=effective_max_len,
+            return_tensors='pt'
+        )
+        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+
+        if prompt_len > 0:
+            input_ids = encoded.pop('input_ids')
+            embed_layer = self.bert_model.get_input_embeddings()
+            token_embeds = embed_layer(input_ids)
+
+            batch_size = int(token_embeds.shape[0])
+            prompt_ids = prompt_token_ids.unsqueeze(0).expand(batch_size, -1)
+            prompt_embeds = embed_layer(prompt_ids)
+
+            if trigger_delta is not None:
+                delta = trigger_delta.to(self.device)
+                if delta.dim() != 2 or delta.shape[0] != prompt_len:
+                    raise ValueError(
+                        f'Server: invalid CerP token trigger shape '
+                        f'{tuple(delta.shape)}, expected ({prompt_len}, H).')
+                prompt_embeds = prompt_embeds + \
+                    delta.unsqueeze(0).expand(batch_size, -1, -1)
+
+            token_embeds = torch.cat(
+                [token_embeds[:, :1, :], prompt_embeds, token_embeds[:, 1:, :]],
+                dim=1
+            )
+
+            attention_mask = encoded.get('attention_mask', None)
+            if attention_mask is not None:
+                prompt_mask = torch.ones(
+                    (batch_size, prompt_len),
+                    dtype=attention_mask.dtype,
+                    device=self.device
+                )
+                encoded['attention_mask'] = torch.cat(
+                    [attention_mask[:, :1], prompt_mask, attention_mask[:, 1:]],
+                    dim=1
+                )
+
+            token_type_ids = encoded.get('token_type_ids', None)
+            if token_type_ids is not None:
+                prompt_types = torch.zeros(
+                    (batch_size, prompt_len),
+                    dtype=token_type_ids.dtype,
+                    device=self.device
+                )
+                encoded['token_type_ids'] = torch.cat(
+                    [token_type_ids[:, :1], prompt_types, token_type_ids[:, 1:]],
+                    dim=1
+                )
+
+            outputs = self.bert_model(inputs_embeds=token_embeds, **encoded)
+        else:
+            outputs = self.bert_model(**encoded)
+
+        hidden = outputs.last_hidden_state
+        pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+        if pooling == 'mean':
+            attn = encoded.get('attention_mask', None)
+            if attn is None:
+                emb = hidden.mean(dim=1)
+            else:
+                mask = attn.unsqueeze(-1).float()
+                emb = (hidden * mask).sum(dim=1) / \
+                    mask.sum(dim=1).clamp(min=1e-6)
+        else:
+            emb = hidden[:, 0, :]
+        return emb
+
+    def _maybe_init_cerp_trigger(self):
+        if not self.use_cerp:
+            return
+        if self.cerp_initial_trigger is not None and \
+                self.cerp_shared_trigger is not None:
+            return
+
+        rng = np.random.RandomState(int(getattr(self._cfg, 'seed', 0)) + 2026)
+        if self._use_cerp_token_trigger():
+            self._load_bert_model()
+            trigger_token_ids = self._resolve_cerp_trigger_token_ids()
+            hidden_size = int(
+                getattr(getattr(self.bert_model, 'config', None),
+                        'hidden_size', 0)
+            )
+            if hidden_size <= 0:
+                hidden_size = int(getattr(self.ggeur_cfg, 'embedding_dim', 0))
+            if hidden_size <= 0:
+                return
+            init_shape = (int(trigger_token_ids.numel()), hidden_size)
+        else:
+            embedding_dim = int(getattr(self.ggeur_cfg, 'embedding_dim', 0))
+            if embedding_dim <= 0:
+                return
+            init_shape = (embedding_dim, )
+
+        init_trigger = rng.normal(
+            loc=0.0,
+            scale=self.cerp_trigger_init_scale,
+            size=init_shape).astype(np.float32)
+        self.cerp_initial_trigger = init_trigger
+        self.cerp_shared_trigger = init_trigger.copy()
+
+    def _build_cerp_payload(self, client_id):
+        if not self.use_cerp:
+            return {'enabled': False}
+
+        self._maybe_init_cerp_trigger()
+        active = bool(
+            client_id in self.cerp_attacker_ids and
+            self.state >= self.cerp_start_round and
+            self.cerp_target_label >= 0
+        )
+
+        other_models = {}
+        if active and self.cerp_prev_attacker_models:
+            for other_id, model_state in self.cerp_prev_attacker_models.items():
+                if int(other_id) == int(client_id):
+                    continue
+                other_models[int(other_id)] = copy.deepcopy(model_state)
+
+        return {
+            'enabled': True,
+            'active': active,
+            'target_label': self.cerp_target_label,
+            'shared_trigger': copy.deepcopy(self.cerp_shared_trigger),
+            'initial_trigger': copy.deepcopy(self.cerp_initial_trigger),
+            'other_attacker_models': other_models,
+        }
+
+    def _get_available_training_clients(self):
+        unseen_clients = set(self.unseen_clients_id or [])
+        return [
+            client_id for client_id in range(1, self._client_num + 1)
+            if client_id not in unseen_clients
+        ]
+
+    def _select_training_clients(self):
+        available_clients = self._get_available_training_clients()
+        if not available_clients:
+            return []
+
+        sample_client_num = int(getattr(self, 'sample_client_num',
+                                        len(available_clients)))
+        if sample_client_num <= 0:
+            return available_clients
+
+        if self.use_backdoor and self.backdoor_attacker_ids:
+            active_attackers = [
+                client_id for client_id in
+                get_active_backdoor_attacker_ids(self._cfg, self.state)
+                if client_id in available_clients
+            ]
+            benign_pool = [
+                client_id for client_id in available_clients
+                if client_id not in self.backdoor_attacker_ids
+            ]
+
+            if active_attackers:
+                forced_clients = active_attackers[:min(len(active_attackers),
+                                                       sample_client_num)]
+                remaining_num = sample_client_num - len(forced_clients)
+                sampled_clients = list(forced_clients)
+
+                if remaining_num > 0 and benign_pool:
+                    if remaining_num >= len(benign_pool):
+                        sampled_clients.extend(benign_pool)
+                    else:
+                        sampled_clients.extend(
+                            np.random.choice(benign_pool,
+                                             size=remaining_num,
+                                             replace=False).tolist())
+                np.random.shuffle(sampled_clients)
+                return sampled_clients
+
+            if not benign_pool:
+                return []
+            if sample_client_num >= len(benign_pool):
+                return benign_pool
+            return np.random.choice(benign_pool,
+                                    size=sample_client_num,
+                                    replace=False).tolist()
+
+        if sample_client_num >= len(available_clients):
+            return available_clients
+
+        force_attackers = bool(
+            self.use_cerp and self.cerp_force_attacker_participation and
+            self.state >= self.cerp_start_round and self.cerp_target_label >= 0)
+
+        if not force_attackers:
+            return np.random.choice(available_clients,
+                                    size=sample_client_num,
+                                    replace=False).tolist()
+
+        forced_clients = [
+            client_id for client_id in self.cerp_attacker_ids
+            if client_id in available_clients
+        ]
+        forced_clients = forced_clients[:min(len(forced_clients),
+                                             sample_client_num)]
+        remaining_num = sample_client_num - len(forced_clients)
+        remaining_pool = [
+            client_id for client_id in available_clients
+            if client_id not in forced_clients
+        ]
+
+        sampled_clients = list(forced_clients)
+        if remaining_num > 0 and remaining_pool:
+            sampled_clients.extend(
+                np.random.choice(remaining_pool,
+                                 size=remaining_num,
+                                 replace=False).tolist())
+        np.random.shuffle(sampled_clients)
+        return sampled_clients
+
+    @staticmethod
+    def _extract_mlp_state_from_payload(model_para):
+        if isinstance(model_para, dict) and 'mlp' in model_para:
+            return model_para.get('mlp')
+        return model_para
+
+    def _update_cerp_states(self, valid_msgs):
+        if not self.use_cerp:
+            return
+
+        attacker_models = {}
+        trigger_list = []
+
+        for _, model_para, sender in valid_msgs:
+            if int(sender) not in self.cerp_attacker_ids:
+                continue
+
+            state_dict = self._extract_mlp_state_from_payload(model_para)
+            if state_dict is not None:
+                attacker_models[int(sender)] = copy.deepcopy(state_dict)
+
+            if isinstance(model_para, dict):
+                trigger = model_para.get('cerp_trigger', None)
+                if trigger is not None:
+                    try:
+                        trigger_arr = np.asarray(trigger, dtype=np.float32)
+                    except Exception:
+                        trigger_arr = None
+                    if trigger_arr is not None and trigger_arr.ndim >= 1:
+                        trigger_list.append(trigger_arr)
+
+        if trigger_list:
+            self.cerp_shared_trigger = np.mean(
+                np.stack(trigger_list, axis=0), axis=0).astype(np.float32)
+        if attacker_models:
+            self.cerp_prev_attacker_models = attacker_models
 
     def _maybe_init_fedopt_for_mlp(self):
         if not self.use_fedopt or self.global_mlp is None:
@@ -390,6 +765,8 @@ class GGEURServer(Server):
                 cfg = AutoConfig.from_pretrained(model_path, local_files_only=local_only)
                 model = AutoModel.from_config(cfg)
             model = model.to(self.device)
+            for param in model.parameters():
+                param.requires_grad_(False)
             model.eval()
             _SHARED_BERT_EXTRACTORS[cache_key] = (tokenizer, model)
             self.bert_tokenizer, self.bert_model = tokenizer, model
@@ -407,7 +784,7 @@ class GGEURServer(Server):
         else:
             self._load_clip_model()
 
-    def _get_test_cache_path(self, domain):
+    def _get_test_cache_path(self, domain, split_tag='test'):
         """Get cache path for test features"""
         cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
         if not cache_dir:
@@ -487,7 +864,10 @@ class GGEURServer(Server):
 
         # Include split params in filename to ensure cache invalidation when params change
         split_str = f"split{int(splits[0]*100)}_{int(splits[1]*100)}_{int(100-splits[0]*100-splits[1]*100)}_seed{seed}"
-        cache_filename = f"{dataset_name}_{domain}_test_{prefix}_{model_str}_{split_str}.npz"
+        split_tag = str(split_tag).replace('/', '_').replace('\\', '_')
+        cache_filename = (
+            f"{dataset_name}_{domain}_{split_tag}_{prefix}_{model_str}_"
+            f"{split_str}.npz")
 
         return os.path.join(cache_dir, cache_filename)
 
@@ -519,6 +899,125 @@ class GGEURServer(Server):
         else:
             cache_filename = f"cpsd_{domain_str}_test_bert_{model_name}_maxlen{max_len}_{pooling}_{mode_str}_cfgseed{cfg_seed}_max{max_test}_seed{seed}.npz"
         return os.path.join(cache_dir, cache_filename)
+
+    def _extract_vision_dataset_features(self, dataset, batch_size=32):
+        self._load_feature_extractor()
+
+        features_list = []
+        labels_list = []
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        with torch.no_grad():
+            for batch in dataloader:
+                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                    continue
+                images, labels = batch[0], batch[1]
+                images = images.to(self.device)
+                if self.feature_extractor_type == 'cnn':
+                    features = self.cnn_extractor(images)
+                else:
+                    features = self.clip_model.encode_image(images)
+                features_list.append(features.detach().cpu().numpy())
+                labels_list.append(labels.detach().cpu().numpy())
+
+        if not features_list:
+            return None, None
+        return (np.vstack(features_list).astype(np.float32),
+                np.concatenate(labels_list).astype(np.int64))
+
+    def _extract_text_dataset_features(self, dataset, batch_size=None):
+        self._load_bert_model()
+
+        pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
+        max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
+        if batch_size is None:
+            batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+        batch_size = max(int(batch_size), 1)
+
+        features_list = []
+        labels_list = []
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        with torch.no_grad():
+            for batch in dataloader:
+                if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                    continue
+                texts, labels = batch[0], batch[1]
+                encoded = self.bert_tokenizer(
+                    list(texts),
+                    padding=True,
+                    truncation=True,
+                    max_length=max_len,
+                    return_tensors='pt'
+                )
+                encoded = {k: v.to(self.device) for k, v in encoded.items()}
+                outputs = self.bert_model(**encoded)
+                hidden = outputs.last_hidden_state
+
+                if pooling == 'mean':
+                    attn = encoded.get('attention_mask', None)
+                    if attn is None:
+                        emb = hidden.mean(dim=1)
+                    else:
+                        mask = attn.unsqueeze(-1).float()
+                        emb = (hidden * mask).sum(dim=1) / \
+                            mask.sum(dim=1).clamp(min=1e-6)
+                else:
+                    emb = hidden[:, 0, :]
+
+                features_list.append(emb.detach().cpu().numpy())
+                labels_list.append(labels.detach().cpu().numpy())
+
+        if not features_list:
+            return None, None
+        return (np.vstack(features_list).astype(np.float32),
+                np.concatenate(labels_list).astype(np.int64))
+
+    def _load_backdoor_test_features_for_domain(self, domain, test_dataset):
+        if not self.use_backdoor or test_dataset is None:
+            return
+
+        split_tag = (
+            f"poison_{self.backdoor_trigger_type}_target"
+            f"{self.backdoor_target_label}")
+        cache_path = self._get_test_cache_path(domain, split_tag=split_tag)
+
+        if os.path.exists(cache_path):
+            try:
+                data = np.load(cache_path)
+                self.backdoor_poison_test_features[domain] = data['features']
+                self.backdoor_poison_test_labels[domain] = data['labels']
+                logger.info(
+                    f"Server: Loaded "
+                    f"{len(self.backdoor_poison_test_labels[domain])} "
+                    f"cached poisoned test features for {domain}")
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Server: Failed to load poisoned cache for {domain}: "
+                    f"{e}")
+
+        poison_dataset = build_poison_test_dataset(test_dataset, self._cfg)
+        if poison_dataset is None or len(poison_dataset) == 0:
+            logger.warning(
+                f"Server: No valid poisoned test samples for domain {domain}")
+            return
+
+        if self.feature_extractor_type == 'bert':
+            features, labels = self._extract_text_dataset_features(
+                poison_dataset)
+        else:
+            features, labels = self._extract_vision_dataset_features(
+                poison_dataset)
+        if features is None or labels is None:
+            return
+
+        self.backdoor_poison_test_features[domain] = features
+        self.backdoor_poison_test_labels[domain] = labels
+        np.savez(cache_path, features=features, labels=labels)
+        logger.info(
+            f"Server: Extracted and cached {len(labels)} poisoned test "
+            f"features for {domain}")
 
     def _load_test_data_and_features(self):
         """Load test data from all domains and extract CLIP features"""
@@ -643,9 +1142,11 @@ class GGEURServer(Server):
 
             default_domains = ['books', 'dvd', 'electronics', 'kitchen']
             domains = [d for d in default_domains if os.path.isdir(os.path.join(data_root, d))]
+            need_raw_text = bool(self.use_cerp and self._use_cerp_token_trigger())
 
             for domain in domains:
                 cache_path = self._get_test_cache_path(domain)
+                loaded_from_cache = False
 
                 if os.path.exists(cache_path):
                     try:
@@ -653,7 +1154,9 @@ class GGEURServer(Server):
                         self.test_features[domain] = data['features']
                         self.test_labels[domain] = data['labels']
                         logger.info(f"Server: Loaded {len(self.test_labels[domain])} cached MDSent test features for {domain}")
-                        continue
+                        loaded_from_cache = True
+                        if not need_raw_text and not self.use_backdoor:
+                            continue
                     except Exception as e:
                         logger.warning(f"Server: Failed to load cache for {domain}: {e}")
 
@@ -673,47 +1176,33 @@ class GGEURServer(Server):
                     logger.warning(f"Server: No test data for domain {domain}")
                     continue
 
-                self._load_bert_model()
-                pooling = str(getattr(self.ggeur_cfg, 'bert_pooling', 'cls')).lower()
-                max_len = int(getattr(self.ggeur_cfg, 'bert_max_length', 128))
-                batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
-                if batch_size <= 0:
-                    batch_size = 32
+                if need_raw_text:
+                    self.test_texts[domain] = [str(text) for text in test_dataset.texts]
+                    self.test_labels[domain] = np.asarray(
+                        test_dataset.targets, dtype=np.int64)
 
-                features_list = []
-                labels_list = []
+                if loaded_from_cache:
+                    if self.use_backdoor:
+                        self._load_backdoor_test_features_for_domain(
+                            domain, test_dataset)
+                    continue
 
-                dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-                with torch.no_grad():
-                    for texts, labels in dataloader:
-                        encoded = self.bert_tokenizer(
-                            list(texts),
-                            padding=True,
-                            truncation=True,
-                            max_length=max_len,
-                            return_tensors='pt'
-                        )
-                        encoded = {k: v.to(self.device) for k, v in encoded.items()}
-                        outputs = self.bert_model(**encoded)
-                        hidden = outputs.last_hidden_state
-                        if pooling == 'mean':
-                            attn = encoded.get('attention_mask', None)
-                            if attn is None:
-                                emb = hidden.mean(dim=1)
-                            else:
-                                mask = attn.unsqueeze(-1).float()
-                                emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
-                        else:
-                            emb = hidden[:, 0, :]
-
-                        features_list.append(emb.detach().cpu().numpy())
-                        labels_list.append(labels.detach().cpu().numpy())
-
-                self.test_features[domain] = np.vstack(features_list).astype(np.float32)
-                self.test_labels[domain] = np.concatenate(labels_list).astype(np.int64)
+                features, labels = self._extract_text_dataset_features(
+                    test_dataset)
+                if features is None or labels is None:
+                    logger.warning(
+                        f"Server: Failed to extract MDSent test features for "
+                        f"{domain}")
+                    continue
+                self.test_features[domain] = features
+                self.test_labels[domain] = labels
 
                 np.savez(cache_path, features=self.test_features[domain], labels=self.test_labels[domain])
                 logger.info(f"Server: Extracted and cached {len(self.test_labels[domain])} MDSent test features for {domain}")
+
+                if self.use_backdoor:
+                    self._load_backdoor_test_features_for_domain(
+                        domain, test_dataset)
 
             self.test_data_loaded = True
             logger.info(f"Server: Loaded MDSent test data for {len(self.test_features)} domains")
@@ -739,6 +1228,7 @@ class GGEURServer(Server):
         # Load test data for each domain
         for domain in domains:
             cache_path = self._get_test_cache_path(domain)
+            test_dataset = None
 
             # Try to load from cache first
             if os.path.exists(cache_path):
@@ -746,8 +1236,9 @@ class GGEURServer(Server):
                     data = np.load(cache_path)
                     self.test_features[domain] = data['features']
                     self.test_labels[domain] = data['labels']
-                    logger.info(f"Server: Loaded {len(self.test_labels[domain])} cached test features for {domain}")
-                    continue
+                    logger.info(
+                        f"Server: Loaded {len(self.test_labels[domain])} "
+                        f"cached test features for {domain}")
                 except Exception as e:
                     logger.warning(f"Server: Failed to load cache for {domain}: {e}")
 
@@ -778,34 +1269,24 @@ class GGEURServer(Server):
                 # Log the split info for verification
                 logger.info(f"Server: {domain} test set has {len(test_dataset)} samples")
 
-                # Extract features using appropriate extractor (CLIP or CNN)
-                self._load_feature_extractor()
-                features_list = []
-                labels_list = []
+                if domain not in self.test_features:
+                    features, labels = self._extract_vision_dataset_features(
+                        test_dataset)
+                    if features is None or labels is None:
+                        continue
+                    self.test_features[domain] = features
+                    self.test_labels[domain] = labels
 
-                dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+                    np.savez(cache_path, features=features, labels=labels)
 
-                extractor_name = 'CNN' if self.feature_extractor_type == 'cnn' else 'CLIP'
+                    logger.info(
+                        f"Server: Extracted and cached "
+                        f"{len(self.test_labels[domain])} test features for "
+                        f"{domain}")
 
-                with torch.no_grad():
-                    for images, labels in dataloader:
-                        images = images.to(self.device)
-                        if self.feature_extractor_type == 'cnn':
-                            features = self.cnn_extractor(images)
-                        else:
-                            features = self.clip_model.encode_image(images)
-                        features_list.append(features.cpu().numpy())
-                        labels_list.append(labels.numpy())
-
-                self.test_features[domain] = np.vstack(features_list)
-                self.test_labels[domain] = np.concatenate(labels_list)
-
-                # Save to cache
-                np.savez(cache_path,
-                        features=self.test_features[domain],
-                        labels=self.test_labels[domain])
-
-                logger.info(f"Server: Extracted and cached {len(self.test_labels[domain])} test features for {domain}")
+                if self.use_backdoor:
+                    self._load_backdoor_test_features_for_domain(
+                        domain, test_dataset)
 
             except Exception as e:
                 logger.warning(f"Server: Failed to load test data for {domain}: {e}")
@@ -867,6 +1348,120 @@ class GGEURServer(Server):
 
         return results
 
+    def _evaluate_poisoned_test_sets(self):
+        """Evaluate attack success rate for CerP or image-space backdoors."""
+        if self.global_mlp is None:
+            return {}
+
+        if self.use_backdoor:
+            if not self.test_data_loaded:
+                self._load_test_data_and_features()
+            if not self.backdoor_poison_test_features:
+                return {}
+
+            self.global_mlp.eval()
+            results = {}
+
+            with torch.no_grad():
+                for domain, features in self.backdoor_poison_test_features.items():
+                    labels = self.backdoor_poison_test_labels.get(domain, None)
+                    if labels is None or len(labels) == 0:
+                        continue
+
+                    features_tensor = torch.from_numpy(features).float().to(
+                        self.device)
+                    labels_tensor = torch.from_numpy(labels).long().to(
+                        self.device)
+                    outputs = self.global_mlp(features_tensor)
+                    predicted = torch.argmax(outputs, dim=1)
+                    asr = (predicted == labels_tensor).float().mean().item()
+                    results[domain] = asr
+
+            if results:
+                results['average'] = sum(results.values()) / len(results)
+            return results
+
+        if not self.use_cerp or not self.cerp_eval_poison:
+            return {}
+        if self.cerp_shared_trigger is None or self.cerp_target_label < 0:
+            return {}
+
+        if not self.test_data_loaded:
+            self._load_test_data_and_features()
+        if self._use_cerp_token_trigger():
+            if not self.test_texts:
+                return {}
+        elif not self.test_features:
+            return {}
+
+        trigger = torch.tensor(
+            self.cerp_shared_trigger, device=self.device, dtype=torch.float32)
+        self.global_mlp.eval()
+        results = {}
+        batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+        if batch_size <= 0:
+            batch_size = 32
+
+        with torch.no_grad():
+            if self._use_cerp_token_trigger():
+                for domain, texts in self.test_texts.items():
+                    labels = self.test_labels.get(domain, None)
+                    if labels is None or len(labels) == 0:
+                        continue
+
+                    mask = labels != self.cerp_target_label
+                    if not np.any(mask):
+                        continue
+
+                    poison_texts = [
+                        str(texts[idx]) for idx, keep in enumerate(mask) if keep
+                    ]
+                    if not poison_texts:
+                        continue
+
+                    poison_predictions = []
+                    for start in range(0, len(poison_texts), batch_size):
+                        batch_texts = poison_texts[start:start + batch_size]
+                        poison_features = self._encode_texts_with_bert_trigger(
+                            batch_texts, trigger_delta=trigger)
+                        outputs = self.global_mlp(poison_features)
+                        poison_predictions.append(
+                            torch.argmax(outputs, dim=1).detach().cpu())
+
+                    if not poison_predictions:
+                        continue
+
+                    predicted = torch.cat(poison_predictions, dim=0)
+                    target_tensor = torch.full_like(
+                        predicted, fill_value=int(self.cerp_target_label))
+                    asr = (predicted == target_tensor).float().mean().item()
+                    results[domain] = asr
+            else:
+                for domain, features in self.test_features.items():
+                    labels = self.test_labels[domain]
+                    if labels is None or len(labels) == 0:
+                        continue
+
+                    mask = labels != self.cerp_target_label
+                    if not np.any(mask):
+                        continue
+
+                    poison_features = torch.from_numpy(
+                        features[mask]).float().to(self.device)
+                    poison_features = poison_features + trigger.unsqueeze(0)
+
+                    outputs = self.global_mlp(poison_features)
+                    predicted = torch.argmax(outputs, dim=1)
+                    target_tensor = torch.full_like(
+                        predicted, fill_value=int(self.cerp_target_label))
+                    asr = (predicted == target_tensor).float().mean().item()
+                    results[domain] = asr
+
+        if results:
+            results['average'] = sum(results.values()) / len(results)
+
+        return results
+
     def callback_for_local_statistics(self, message: Message):
         """Handle receiving local statistics from a client"""
         client_id = message.sender
@@ -908,6 +1503,8 @@ class GGEURServer(Server):
                 # Build global CNN if using CNN mode
                 if self.use_cnn_distillation or self.use_feature_alignment:
                     self._build_global_cnn(num_classes)
+                if self.use_cerp:
+                    self._maybe_init_cerp_trigger()
 
             # Broadcast global covariances to all clients
             self._broadcast_global_covariances(other_prototypes)
@@ -965,15 +1562,42 @@ class GGEURServer(Server):
                     'fedproto_global_prototypes': proto_payload,
                 }
 
-        # Broadcast to all clients
-        for client_id in range(1, self._client_num + 1):
+        receiver = self._select_training_clients()
+        if not receiver:
+            logger.warning("Server: No available clients selected for training")
+            return
+        self.current_training_clients = list(receiver)
+
+        active_attacker_ids = set(self.cerp_attacker_ids)
+        active_attacker_ids.update(self.backdoor_attacker_ids)
+        selected_attackers = [
+            client_id for client_id in receiver
+            if client_id in active_attacker_ids
+        ]
+        logger.info(
+            f"Server: Round {self.state} selected clients "
+            f"({len(receiver)}/{self._client_num}), attackers={selected_attackers}"
+        )
+
+        for client_id in receiver:
+            payload = copy.deepcopy(model_para)
+            if self.use_cerp:
+                cerp_payload = self._build_cerp_payload(client_id)
+                if isinstance(payload, dict):
+                    payload['cerp'] = cerp_payload
+                else:
+                    payload = {
+                        'mlp': payload,
+                        'cerp': cerp_payload,
+                    }
+
             self.comm_manager.send(
                 Message(
                     msg_type='model_para',
                     sender=self.ID,
                     receiver=[client_id],
                     state=self.state,
-                    content=model_para
+                    content=payload
                 )
             )
 
@@ -1211,13 +1835,22 @@ class GGEURServer(Server):
         if round_idx not in self.msg_buffer['train']:
             self.msg_buffer['train'][round_idx] = []
 
+        expected_clients = set(getattr(self, 'current_training_clients', []))
+        if expected_clients and sender not in expected_clients:
+            logger.warning(
+                f"Server: Ignoring unexpected model from client {sender} "
+                f"in round {round_idx}"
+            )
+            return
+
         self.msg_buffer['train'][round_idx].append((sample_size, model_para, sender))
 
+        expected_num = len(expected_clients) if expected_clients else self._client_num
         logger.info(f"Server: Received model from client {sender} for round {round_idx} "
-                    f"({len(self.msg_buffer['train'][round_idx])}/{self._client_num})")
+                    f"({len(self.msg_buffer['train'][round_idx])}/{expected_num})")
 
-        # Check if all clients have responded
-        if len(self.msg_buffer['train'][round_idx]) >= self._client_num:
+        # Check if the selected clients have responded
+        if len(self.msg_buffer['train'][round_idx]) >= expected_num:
             self._perform_fedavg(round_idx)
 
     def _perform_fedavg(self, round_idx):
@@ -1229,7 +1862,9 @@ class GGEURServer(Server):
 
         try:
             # Filter out empty updates
-            valid_params = [(s, p) for s, p, _ in all_params if s > 0 and p is not None]
+            valid_msgs = [(s, p, sender) for s, p, sender in all_params
+                          if s > 0 and p is not None]
+            valid_params = [(s, p) for s, p, _ in valid_msgs]
 
             if not valid_params:
                 logger.warning("Server: No valid model parameters received")
@@ -1299,12 +1934,23 @@ class GGEURServer(Server):
             # FedProto: aggregate global prototypes from clients
             if self.use_fedproto:
                 self._aggregate_fedproto_prototypes(valid_params)
+            if self.use_cerp:
+                self._update_cerp_states(valid_msgs)
 
             # Evaluate MLP on test sets (using CLIP features)
             test_results = self._evaluate_on_test_sets()
             if test_results:
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
                 logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+
+            poison_results = self._evaluate_poisoned_test_sets()
+            if poison_results:
+                asr_str = ', '.join(
+                    [f"{k}: {v:.4f}" for k, v in poison_results.items()])
+                attack_name = 'CerP' if self.use_cerp else 'Backdoor'
+                logger.info(
+                    f"Server: Round {round_idx} {attack_name} Poison ASR - "
+                    f"{asr_str}")
 
             # Evaluate CNN on test sets (using original images) if enabled
             # Include separated training Phase 2

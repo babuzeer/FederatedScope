@@ -1,0 +1,88 @@
+# GGEUR + CerP on Multi-Domain Sentiment (RNN, paper-aligned sampling debug)
+
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 120
+  total_round_num: 200
+  sample_client_num: 20
+
+data:
+  type: 'mdsent'
+  root: 'data/sentiment'
+  splits: [0.8, 0, 0.2]
+  dirichlet_alpha: 0.01
+  args:
+    - include_unlabeled: True
+      balance_test: True
+      seed: 42
+      use_cache: True
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+model:
+  type: 'ggeur_rnn'
+  num_classes: 4
+  in_channels: 768
+  hidden: 256
+  layer: 1
+  dropout: 0.1
+
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 1e-3
+
+ggeur:
+  use: True
+  feature_extractor: 'bert'
+  bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
+  bert_tokenizer_path: ''
+  bert_max_length: 128
+  bert_pooling: 'cls'
+  bert_batch_size: 32
+  bert_local_files_only: True
+  bert_use_pretrained_weights: True
+  embedding_dim: 768
+  use_feature_cache: True
+  feature_cache_dir: ''
+  num_generated_per_sample: 200
+  num_generated_per_prototype: 200
+  target_size_per_class: 200
+  use_cross_client_prototypes: True
+  statistics_round: 0
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+attack:
+  attack_method: 'cerp'
+  attacker_id: [1, 2, 3, 4]
+  target_label_ind: 3
+  poison_ratio: 0.3
+  label_type: 'dirty'
+  cerp:
+    start_round: 10
+    trigger_lr: 0.05
+    trigger_steps: 8
+    trigger_tune_batches: 32
+    trigger_init_scale: 0.02
+    trigger_max_norm: 1.0
+    trigger_space: 'token'
+    trigger_text: 'cf mn bb tq'
+    text_batch_size: 32
+    lambda_model: 1e-4
+    lambda_similarity: 1e-4
+    lambda_trigger_reg: 1e-3
+    force_attacker_participation: True
+    eval_poison: True
+
+outdir: 'exp/ggeur_rnn_sentiment'
+expname: 'ggeur_mdsent_rating4_rnn_cerp_paper'

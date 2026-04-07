@@ -13,6 +13,9 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 from federatedscope.register import register_data
+from federatedscope.contrib.data.ggeur_backdoor import \
+    is_ggeur_backdoor_attack, validate_ggeur_backdoor_config, \
+    wrap_attacker_train_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +217,9 @@ def _load_pacs_ggeur_data(config, client_cfgs=None):
 
     # Check if LDS is enabled
     use_lds = getattr(config.ggeur, 'use_lds', False) if hasattr(config, 'ggeur') else False
+    use_backdoor = is_ggeur_backdoor_attack(config)
+    if use_backdoor:
+        validate_ggeur_backdoor_config(config)
 
     # Get configured client number
     configured_client_num = config.federate.client_num
@@ -281,9 +287,11 @@ def _load_pacs_ggeur_data(config, client_cfgs=None):
 
             # Create data loaders for each client in this domain
             for i, train_subset in enumerate(train_subsets):
+                wrapped_train_subset = wrap_attacker_train_dataset(
+                    train_subset, config, client_id)
                 data_dict[client_id] = {
                     'train': DataLoader(
-                        train_subset,
+                        wrapped_train_subset,
                         batch_size=batch_size,
                         shuffle=True,
                         num_workers=num_workers,
@@ -303,8 +311,12 @@ def _load_pacs_ggeur_data(config, client_cfgs=None):
                     )
                 }
 
-                train_size = len(train_subset)
-                logger.info(f"  Client {client_id} ({domain}): train={train_size}")
+                train_size = len(wrapped_train_subset)
+                attack_tag = ' backdoor_attacker' \
+                    if wrapped_train_subset is not train_subset else ''
+                logger.info(
+                    f"  Client {client_id} ({domain}): train={train_size}"
+                    f"{attack_tag}")
                 client_id += 1
 
         except Exception as e:
@@ -345,6 +357,9 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
 
     # Check if LDS is enabled
     use_lds = getattr(config.ggeur, 'use_lds', False) if hasattr(config, 'ggeur') else False
+    use_backdoor = is_ggeur_backdoor_attack(config)
+    if use_backdoor:
+        validate_ggeur_backdoor_config(config)
 
     # Get configured client number
     configured_client_num = config.federate.client_num
@@ -425,12 +440,14 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
 
             # Create data loaders for each client in this domain
             for i, train_subset in enumerate(train_subsets):
-                train_size = len(train_subset)
+                wrapped_train_subset = wrap_attacker_train_dataset(
+                    train_subset, config, client_id)
+                train_size = len(wrapped_train_subset)
                 total_train_samples += train_size
 
                 data_dict[client_id] = {
                     'train': DataLoader(
-                        train_subset,
+                        wrapped_train_subset,
                         batch_size=batch_size,
                         shuffle=True,
                         num_workers=num_workers,
@@ -450,7 +467,11 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
                     )
                 }
 
-                logger.info(f"  Client {client_id} ({domain}): train={train_size}")
+                attack_tag = ' backdoor_attacker' \
+                    if wrapped_train_subset is not train_subset else ''
+                logger.info(
+                    f"  Client {client_id} ({domain}): train={train_size}"
+                    f"{attack_tag}")
                 client_id += 1
 
         except Exception as e:

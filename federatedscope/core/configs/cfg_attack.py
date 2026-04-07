@@ -27,6 +27,8 @@ def extend_attack_cfg(cfg):
     # dirty, clean_label, dirty-label attack is all2one attack.
     cfg.attack.edge_num = 100
     cfg.attack.poison_ratio = 0.5
+    cfg.attack.text_trigger = ''
+    cfg.attack.text_trigger_position = ''
     cfg.attack.scale_poisoning = False
     cfg.attack.scale_para = 1.0
     cfg.attack.pgd_poisoning = False
@@ -54,6 +56,23 @@ def extend_attack_cfg(cfg):
     cfg.attack.inject_round = 0
     cfg.attack.mia_simulate_in_round = 20
     cfg.attack.mia_is_simulate_in = False
+
+    # for CerP (feature-space backdoor attack for GGEUR-style pipelines)
+    cfg.attack.cerp = CN()
+    cfg.attack.cerp.start_round = 1
+    cfg.attack.cerp.trigger_lr = 0.1
+    cfg.attack.cerp.trigger_steps = 1
+    cfg.attack.cerp.trigger_tune_batches = 4
+    cfg.attack.cerp.trigger_init_scale = 0.02
+    cfg.attack.cerp.trigger_max_norm = 1.0
+    cfg.attack.cerp.trigger_space = 'feature'
+    cfg.attack.cerp.trigger_text = 'cf mn bb tq'
+    cfg.attack.cerp.text_batch_size = 32
+    cfg.attack.cerp.lambda_model = 1e-4
+    cfg.attack.cerp.lambda_similarity = 1e-4
+    cfg.attack.cerp.lambda_trigger_reg = 1e-3
+    cfg.attack.cerp.force_attacker_participation = False
+    cfg.attack.cerp.eval_poison = True
 
     # --------------- register corresponding check function ----------
     cfg.register_cfg_check_fun(assert_attack_cfg)

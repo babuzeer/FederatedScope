@@ -24,6 +24,34 @@ from torchvision import transforms
 logger = logging.getLogger(__name__)
 
 
+def _candidate_roots(root):
+    root = osp.expanduser(str(root))
+    candidates = [root]
+
+    if not osp.isabs(root):
+        cwd = os.getcwd()
+        candidates.append(osp.join(cwd, root))
+        root_parts = osp.normpath(root).split(os.sep)
+        if not root_parts or root_parts[0].lower() != 'data':
+            candidates.append(osp.join(cwd, 'data', root))
+
+    ordered = []
+    seen = set()
+    for candidate in candidates:
+        candidate = osp.normpath(candidate)
+        if candidate not in seen:
+            ordered.append(candidate)
+            seen.add(candidate)
+
+        nested = osp.join(candidate, osp.basename(candidate))
+        nested = osp.normpath(nested)
+        if nested not in seen:
+            ordered.append(nested)
+            seen.add(nested)
+
+    return ordered
+
+
 class OfficeHome(Dataset):
     """
     Office-Home Dataset
@@ -87,21 +115,38 @@ class OfficeHome(Dataset):
 
     def _load_data(self):
         """Load images and labels from the specified domain"""
-        # Handle both 'Real_World' and 'Real World' directory names
-        domain_name = self.domain.replace('_', ' ') if 'Real' in self.domain else self.domain
-        domain_dir = osp.join(self.root, domain_name)
+        domain_aliases = []
+        domain_name = self.domain.replace('_', ' ') if 'Real' in self.domain \
+            else self.domain
+        domain_aliases.append(domain_name)
+        underscore_name = self.domain.replace(' ', '_')
+        if underscore_name not in domain_aliases:
+            domain_aliases.append(underscore_name)
 
-        # Try with underscore version if space version doesn't exist
-        if not osp.exists(domain_dir):
-            domain_name = self.domain.replace(' ', '_')
-            domain_dir = osp.join(self.root, domain_name)
+        tried_dirs = []
+        domain_dir = None
+        resolved_root = None
+        for root_candidate in _candidate_roots(self.root):
+            for candidate_domain in domain_aliases:
+                candidate_dir = osp.join(root_candidate, candidate_domain)
+                tried_dirs.append(candidate_dir)
+                if osp.exists(candidate_dir):
+                    domain_dir = candidate_dir
+                    resolved_root = root_candidate
+                    break
+            if domain_dir is not None:
+                break
 
-        if not osp.exists(domain_dir):
+        if domain_dir is None:
+            tried_str = '\n'.join([f'  - {item}' for item in tried_dirs])
             raise FileNotFoundError(
-                f"Domain directory not found: {domain_dir}\n"
+                f"Domain directory not found for `{self.domain}`.\n"
+                f"Configured root: {self.root}\n"
+                f"Tried:\n{tried_str}\n"
                 f"Please download Office-Home dataset first.\n"
                 f"Expected domains: {self.DOMAINS}"
             )
+        self.root = resolved_root
 
         all_images = []
         all_labels = []

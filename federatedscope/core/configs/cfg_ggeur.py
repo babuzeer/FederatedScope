@@ -50,6 +50,10 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.feature_cache_dir = ''
     # Whether to use cached features if available
     cfg.ggeur.use_feature_cache = True
+    # Directory to cache generated augmented features (empty = auto)
+    cfg.ggeur.augmentation_cache_dir = ''
+    # Whether to reuse cached augmentation results if available
+    cfg.ggeur.use_augmentation_cache = True
 
     # ========== BERT Feature Extractor Settings (Text) ==========
     # Local path to pretrained BERT model/tokenizer (feature extractor ONLY)

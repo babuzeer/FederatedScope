@@ -37,6 +37,10 @@ from typing import Dict, List, Optional, Tuple
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from federatedscope.register import register_data
+from federatedscope.contrib.data.ggeur_backdoor import \
+    is_ggeur_backdoor_attack, parse_attacker_ids, \
+    validate_ggeur_backdoor_config, \
+    wrap_attacker_train_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +395,12 @@ def load_mdsent_data(config, client_cfgs=None):
 
     data_root = config.data.root
     args = _get_mdsent_args(config)
+    use_backdoor = is_ggeur_backdoor_attack(config)
+    attacker_ids = set()
+    if use_backdoor:
+        validate_ggeur_backdoor_config(config)
+        attacker_ids = set(parse_attacker_ids(
+            getattr(config.attack, 'attacker_id', -1)))
 
     # Default domains for the dataset
     default_domains = ["books", "dvd", "electronics", "kitchen"]
@@ -467,6 +477,10 @@ def load_mdsent_data(config, client_cfgs=None):
 
         for local_idx_list in client_splits:
             train_subset = Subset(train_dataset, local_idx_list)
+            if use_backdoor:
+                train_subset = wrap_attacker_train_dataset(train_subset,
+                                                          config,
+                                                          client_id)
             data_dict[client_id] = {
                 "train": DataLoader(
                     train_subset,
@@ -488,8 +502,13 @@ def load_mdsent_data(config, client_cfgs=None):
                     num_workers=num_workers,
                 ),
             }
+            attack_tag = ' backdoor_attacker' if int(client_id) in attacker_ids \
+                else ''
             logger.info(
-                f"  Client {client_id} ({domain}): train={len(train_subset)}, val={len(val_dataset) if val_dataset else 0}, test={len(test_dataset)}"
+                f"  Client {client_id} ({domain}{attack_tag}): "
+                f"train={len(train_subset)}, "
+                f"val={len(val_dataset) if val_dataset else 0}, "
+                f"test={len(test_dataset)}"
             )
             client_id += 1
 
