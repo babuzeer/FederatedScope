@@ -65,6 +65,10 @@ class BaseRunner(object):
         self.gpu_manager = GPUManager(gpu_available=self.cfg.use_gpu,
                                       specified_device=self.cfg.device)
 
+        # CPU offload defaults (will be properly set in StandaloneRunner._set_up)
+        self._offload_enabled = False
+        self._gpu_resident_clients = set()
+
         self.unseen_clients_id = []
         self.feat_engr_wrapper_client, self.feat_engr_wrapper_server = \
             get_feat_engr_wrapper(config)
@@ -365,6 +369,84 @@ class StandaloneRunner(BaseRunner):
                 trainer_representative, 'print_trainer_meta_info'):
             trainer_representative.print_trainer_meta_info()
 
+        # ---- Shared backbone injection for convnext_*_head models ----------
+        # When model.type ends with '_head', each client only holds a tiny
+        # ClassifierHead. We build ONE SharedBackbone here and inject it into
+        # every client trainer's ctx so ConvNeXtTrainer can use it.
+        model_type = self.cfg.model.type.lower()
+        if (self.cfg.backend == 'torch'
+                and model_type.startswith('convnext')
+                and model_type.endswith('_head')):
+            self._setup_shared_backbone()
+
+        # CPU offload: track which clients are currently on GPU
+        # When shared backbone is active, only ClassifierHead moves; backbone
+        # stays on GPU independently.
+        self._gpu_resident_clients = set(self.client.keys())
+        self._offload_enabled = (
+            self.cfg.backend == 'torch'
+            and getattr(self.cfg.model, 'freeze_backbone', False)
+            and not model_type.endswith('_head')  # head mode handles memory differently
+            and self.cfg.federate.sample_client_num < self.cfg.federate.client_num
+        )
+        if self._offload_enabled:
+            logger.info(
+                f'[CPU Offload] Enabled: freeze_backbone=True, '
+                f'sample_client_num={self.cfg.federate.sample_client_num} '
+                f'< client_num={self.cfg.federate.client_num}. '
+                f'Idle client models will be offloaded to CPU.'
+            )
+
+    def _setup_shared_backbone(self):
+        """
+        Build ONE SharedBackbone and inject it into every client trainer ctx.
+        Called when model.type is 'convnext_*_head'.
+        """
+        try:
+            import torch
+            from federatedscope.contrib.model.convnext import SharedBackbone
+        except ImportError as e:
+            logger.warning(f'[SharedBackbone] Cannot import: {e}')
+            return
+
+        model_type = self.cfg.model.type.lower()
+        # 'convnext_base_head' -> 'convnext_base'
+        backbone_name = model_type.replace('_head', '')
+        pretrained = getattr(self.cfg.model, 'pretrained', True)
+
+        # Build / reuse the singleton backbone
+        backbone = SharedBackbone.get_or_create(backbone_name, pretrained)
+
+        # Move backbone to the GPU device used by clients
+        device = self._server_device
+        backbone.to_device(device)
+        self._shared_backbone = backbone
+
+        # Inject into every client trainer's ctx
+        injected = 0
+        for client_id, client in self.client.items():
+            if client.trainer is not None and hasattr(client.trainer, 'ctx'):
+                client.trainer.ctx.shared_backbone = backbone
+                injected += 1
+
+        logger.info(
+            f'[SharedBackbone] {backbone_name} (pretrained={pretrained}) '
+            f'on {device}. Injected into {injected}/{len(self.client)} '
+            f'client trainers. '
+            f'Backbone params: '
+            f'{sum(p.numel() for p in backbone.parameters()):,} (frozen, shared). '
+            f'Each client head: '
+            f'~{sum(p.numel() for p in self.client[1].trainer.ctx.model.parameters()):,} params.'
+        )
+
+        # Also inject backbone reference into server for FedMIA gradient computation
+        if hasattr(self.server, 'trainer') and self.server.trainer is not None \
+                and hasattr(self.server.trainer, 'ctx'):
+            self.server.trainer.ctx.shared_backbone = backbone
+        # For FedMIA server that doesn't use a trainer ctx, store directly
+        self.server._shared_backbone = backbone
+        logger.info('[SharedBackbone] Reference injected into server.')
+
     def _get_server_args(self, resource_info=None, client_resource_info=None):
         if self.server_id in self.data:
             server_data = self.data[self.server_id]
@@ -413,6 +495,8 @@ class StandaloneRunner(BaseRunner):
         """
         if rcv != -1:
             # simulate broadcast one-by-one
+            if self._offload_enabled:
+                self._ensure_client_on_gpu(rcv)
             self.client[rcv].msg_handlers[msg.msg_type](msg)
             return
 
@@ -420,14 +504,57 @@ class StandaloneRunner(BaseRunner):
         download_bytes, upload_bytes = msg.count_bytes()
         if not isinstance(receiver, list):
             receiver = [receiver]
+
+        # When server broadcasts to selected clients, offload all others first
+        if self._offload_enabled and msg.sender == 0 and msg.msg_type == 'model_para':
+            active_clients = set(r for r in receiver if r != 0)
+            self._offload_idle_clients(active_clients)
+
         for each_receiver in receiver:
             if each_receiver == 0:
                 self.server.msg_handlers[msg.msg_type](msg)
                 self.server._monitor.track_download_bytes(download_bytes)
             else:
+                if self._offload_enabled:
+                    self._ensure_client_on_gpu(each_receiver)
                 self.client[each_receiver].msg_handlers[msg.msg_type](msg)
                 self.client[each_receiver]._monitor.track_download_bytes(
                     download_bytes)
+
+    def _offload_client_to_cpu(self, client_id):
+        """Move client model to CPU to free GPU memory."""
+        if client_id not in self._gpu_resident_clients:
+            return
+        client = self.client[client_id]
+        if client.trainer is not None and hasattr(client.trainer, 'ctx'):
+            try:
+                import torch
+                client.trainer.ctx.model.to('cpu')
+                torch.cuda.empty_cache()
+                self._gpu_resident_clients.discard(client_id)
+                logger.debug(f'[CPU Offload] Client {client_id} offloaded to CPU')
+            except Exception as e:
+                logger.debug(f'[CPU Offload] Failed to offload client {client_id}: {e}')
+
+    def _ensure_client_on_gpu(self, client_id):
+        """Move client model back to GPU before use."""
+        if client_id in self._gpu_resident_clients:
+            return
+        client = self.client[client_id]
+        if client.trainer is not None and hasattr(client.trainer, 'ctx'):
+            try:
+                device = client.device
+                client.trainer.ctx.model.to(device)
+                self._gpu_resident_clients.add(client_id)
+                logger.debug(f'[CPU Offload] Client {client_id} loaded to {device}')
+            except Exception as e:
+                logger.debug(f'[CPU Offload] Failed to load client {client_id}: {e}')
+
+    def _offload_idle_clients(self, active_client_ids):
+        """Offload all clients not in active_client_ids to CPU."""
+        idle_clients = self._gpu_resident_clients - active_client_ids
+        for client_id in idle_clients:
+            self._offload_client_to_cpu(client_id)
 
     def _run_simulation_online(self):
         """

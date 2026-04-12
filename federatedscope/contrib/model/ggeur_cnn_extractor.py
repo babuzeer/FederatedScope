@@ -313,7 +313,7 @@ class GGEURCNNClassifier(nn.Module):
     def load_classifier_weights(self, state_dict):
         """Load pretrained classifier weights (from GGEUR_Clip Phase 1)"""
         try:
-            self.classifier.load_state_dict(state_dict)
+            self.classifier.load_state_dict(state_dict, strict=False)
             logger.info("GGEURCNNClassifier: Loaded classifier weights")
         except Exception as e:
             logger.error(f"Failed to load classifier weights: {e}")

@@ -443,7 +443,25 @@ class GeneralTorchTrainer(Trainer):
 
         if os.path.exists(path):
             ckpt = torch.load(path, map_location=self.ctx.device)
-            self.ctx.model.load_state_dict(ckpt['model'])
+            try:
+                self.ctx.model.load_state_dict(ckpt['model'], strict=True)
+            except RuntimeError as e:
+                missing_keys, unexpected_keys = self.ctx.model.load_state_dict(
+                    ckpt['model'], strict=False)
+                bn_buffers = [
+                    'running_mean', 'running_var', 'num_batches_tracked'
+                ]
+                really_missing = [
+                    k for k in missing_keys
+                    if not any(bn in k for bn in bn_buffers)
+                ]
+                if len(unexpected_keys) == 0 and len(really_missing) == 0:
+                    logger.warning(
+                        f"Model loaded from {path} with strict=False. "
+                        f"Missing BN buffers (likely due to aggregation): {missing_keys}"
+                    )
+                else:
+                    raise e
             return ckpt['cur_round']
         else:
             raise ValueError("The file {} does NOT exist".format(path))

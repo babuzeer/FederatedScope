@@ -1,0 +1,59 @@
+# ============================================================
+# Offline-Feature FL Training Config
+# ============================================================
+# Prerequisites:
+#   python extract_features.py \
+#       --output_dir data/cifar100_features/ \
+#       --client_num 10 --alpha 0.5 --split lda
+#
+# Then run FL training (no ConvNeXt loaded at all):
+#   conda run -n federatedscope python federatedscope/main.py \
+#       --cfg scripts/convnext_offline_features.yaml
+# ============================================================
+
+use_gpu: True
+device: 0
+seed: 12345
+
+federate:
+  mode: standalone
+  total_round_num: 300
+  client_num: 10
+  sample_client_num: 3
+  make_global_eval: True
+
+# ---- Offline features: no image loading, no backbone ----
+data:
+  type: 'cifar100_features'
+  root: 'data/cifar100_features/'   # produced by extract_features.py
+
+dataloader:
+  batch_size: 256       # can use large batches — features fit easily in RAM
+  num_workers: 0
+  shuffle: True
+
+# ---- MLP only, feature_dim must match backbone used in extraction ----
+model:
+  type: mlp_head
+  feature_dim: 1024     # convnext_base output dim
+  num_classes: 100
+  hidden_dim: 256       # set 0 for single linear layer
+  dropout: 0.1
+
+train:
+  local_update_steps: 1
+  batch_or_epoch: epoch
+  optimizer:
+    lr: 0.01
+    weight_decay: 0.0
+
+criterion:
+  type: CrossEntropyLoss
+
+trainer:
+  type: general         # standard GeneralTorchTrainer — backbone not needed
+
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+  best_res_update_round_wise_key: 'test_loss'

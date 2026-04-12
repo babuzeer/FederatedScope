@@ -126,8 +126,11 @@ def get_data_info(dataset_name):
     if dataset_name.lower() == 'femnist':
 
         return [1, 28, 28], 36, False
+    elif 'cifar10' in dataset_name.lower() or 'cifar100' in dataset_name.lower():
+        num_class = 100 if 'cifar100' in dataset_name.lower() else 10
+        return [3, 32, 32], num_class, False
     else:
-        ValueError(
+        raise ValueError(
             'Please provide the data info of {}: data_feature_dim, num_class'.
             format(dataset_name))
 

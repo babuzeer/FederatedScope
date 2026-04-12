@@ -971,7 +971,7 @@ class GGEURClient(Client):
         # Update MLP with global model parameters
         if mlp_para is not None and self.mlp_classifier is not None:
             try:
-                self.mlp_classifier.load_state_dict(mlp_para)
+                self.mlp_classifier.load_state_dict(mlp_para, strict=False)
             except Exception as e:
                 logger.debug(f"Client {self.ID}: Could not load MLP state dict: {e}")
 
@@ -985,7 +985,7 @@ class GGEURClient(Client):
         # Update CNN with global model parameters (for both distillation and feature alignment)
         if (self.use_cnn_distillation or self.use_feature_alignment) and cnn_para is not None and self.cnn_model is not None:
             try:
-                self.cnn_model.load_state_dict(cnn_para)
+                self.cnn_model.load_state_dict(cnn_para, strict=False)
             except Exception as e:
                 logger.debug(f"Client {self.ID}: Could not load CNN state dict: {e}")
 
@@ -1088,7 +1088,7 @@ class GGEURClient(Client):
             classifier_para = content.get('classifier') if isinstance(content, dict) else content
             if classifier_para is not None and self.mlp_classifier is not None:
                 try:
-                    self.mlp_classifier.load_state_dict(classifier_para)
+                    self.mlp_classifier.load_state_dict(classifier_para, strict=False)
                 except Exception as e:
                     logger.debug(f"Client {self.ID}: Could not load classifier: {e}")
 
@@ -1127,7 +1127,7 @@ class GGEURClient(Client):
             # Load CNN backbone parameters
             if cnn_backbone_para is not None and self.cnn_backbone is not None:
                 try:
-                    self.cnn_backbone.load_state_dict(cnn_backbone_para)
+                    self.cnn_backbone.load_state_dict(cnn_backbone_para, strict=False)
                 except Exception as e:
                     logger.debug(f"Client {self.ID}: Could not load CNN backbone: {e}")
 
@@ -1174,7 +1174,7 @@ class GGEURClient(Client):
 
         # Load pretrained weights
         try:
-            self.pretrained_classifier.load_state_dict(classifier_para)
+            self.pretrained_classifier.load_state_dict(classifier_para, strict=False)
             logger.info(f"Client {self.ID}: Loaded pretrained classifier")
         except Exception as e:
             logger.warning(f"Client {self.ID}: Could not load pretrained classifier: {e}")

@@ -286,10 +286,15 @@ def preact_resnet(model_config):
 
 
 def resnet(model_config):
+    # Get num_classes from config, default to 10
+    num_classes = getattr(model_config, 'out_channels', 10)
     if '18' in model_config.type:
-        net = ResNet18()
+        net = ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
     elif '50' in model_config.type:
-        net = ResNet50()
+        net = ResNet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
+    else:
+        # Default to ResNet18
+        net = ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
     return net
 
 

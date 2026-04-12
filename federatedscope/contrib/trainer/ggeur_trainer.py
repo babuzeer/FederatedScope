@@ -242,7 +242,7 @@ class GGEURTrainer(GeneralTorchTrainer):
         """Update model with parameters"""
         if self.mlp_classifier is not None and model_para:
             try:
-                self.mlp_classifier.load_state_dict(model_para)
+                self.mlp_classifier.load_state_dict(model_para, strict=strict)
             except Exception as e:
                 logger.debug(f"GGEURTrainer: Could not load model params: {e}")
 

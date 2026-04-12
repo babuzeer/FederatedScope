@@ -1,0 +1,49 @@
+use_gpu: True
+device: 0
+seed: 12345
+
+federate:
+  mode: standalone
+  total_round_num: 300
+  client_num: 10
+  sample_client_num: 3
+  make_global_eval: True
+
+data:
+  type: 'cifar100_features'
+  root: 'data/cifar100_features/'
+
+dataloader:
+  batch_size: 256
+  num_workers: 0
+  shuffle: True
+
+model:
+  type: mlp_head
+  feature_dim: 1024
+  num_classes: 100
+  hidden_dim: 256
+  dropout: 0.1
+
+train:
+  local_update_steps: 1
+  batch_or_epoch: epoch
+  optimizer:
+    lr: 0.01
+    weight_decay: 0.0
+
+criterion:
+  type: CrossEntropyLoss
+
+trainer:
+  type: general
+
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+  best_res_update_round_wise_key: 'test_loss'
+
+attack:
+  attack_method: fedmia
+  fedmia_target_client_id: 1
+  fedmia_variant: FedMIA-I

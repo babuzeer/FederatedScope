@@ -165,6 +165,10 @@ def get_server_cls(cfg):
         from federatedscope.attack.worker_as_attacker.server_attacker import\
             PassivePIAServer
         return PassivePIAServer
+    elif cfg.attack.attack_method.lower() in ['fedmia']:
+        from federatedscope.attack.worker_as_attacker.fedmia_server import \
+            FedMIAServer
+        return FedMIAServer
 
     elif cfg.attack.attack_method.lower() in ['backdoor']:
         from federatedscope.attack.worker_as_attacker.server_attacker \

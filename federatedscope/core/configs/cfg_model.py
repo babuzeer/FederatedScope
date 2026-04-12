@@ -29,6 +29,12 @@ def extend_model_cfg(cfg):
     cfg.model.distribution_hidden = []
     cfg.model.distribution_temperature = 1.0
 
+    # ConvNeXt/ResNet with MLP classifier
+    cfg.model.pretrained = True  # Use pretrained backbone weights
+    cfg.model.hidden_dim = 0  # MLP hidden dim (0 for linear classifier)
+    cfg.model.freeze_backbone = False  # Freeze backbone during training
+    cfg.model.feature_dim = 1024  # Input feature dim for mlp_head (offline features)
+
     # For tree-based model
     cfg.model.lambda_ = 0.1
     cfg.model.gamma = 0

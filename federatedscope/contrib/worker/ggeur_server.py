@@ -793,7 +793,7 @@ class GGEURServer(Server):
         classifier = classifier.to(self.device)
 
         try:
-            classifier.load_state_dict(state_dict)
+            classifier.load_state_dict(state_dict, strict=False)
             logger.debug(f"Server: Classifier loaded successfully, keys: {list(state_dict.keys())}")
         except Exception as e:
             logger.error(f"Server: Failed to load classifier state dict: {e}")
@@ -1014,14 +1014,14 @@ class GGEURServer(Server):
                         if self.use_fedopt:
                             self._apply_fedopt_update(mlp_aggregated)
                         else:
-                            self.global_mlp.load_state_dict(mlp_aggregated)
+                            self.global_mlp.load_state_dict(mlp_aggregated, strict=False)
                     except Exception as e:
                         logger.debug(f"Server: Could not update MLP params: {e}")
 
                 # Update global CNN
                 if cnn_aggregated and self.global_cnn is not None:
                     try:
-                        self.global_cnn.load_state_dict(cnn_aggregated)
+                        self.global_cnn.load_state_dict(cnn_aggregated, strict=False)
                     except Exception as e:
                         logger.debug(f"Server: Could not load CNN params: {e}")
             else:
@@ -1033,7 +1033,7 @@ class GGEURServer(Server):
                         if self.use_fedopt:
                             self._apply_fedopt_update(mlp_aggregated)
                         else:
-                            self.global_mlp.load_state_dict(mlp_aggregated)
+                            self.global_mlp.load_state_dict(mlp_aggregated, strict=False)
                     except Exception as e:
                         logger.debug(f"Server: Could not load MLP params: {e}")
 
@@ -1087,7 +1087,7 @@ class GGEURServer(Server):
         self._init_fedopt_if_needed()
         if self.fedopt_optimizer is None:
             # Fallback to FedAvg if optimizer is not available
-            self.global_mlp.load_state_dict(averaged_state_dict)
+            self.global_mlp.load_state_dict(averaged_state_dict, strict=False)
             return
 
         with torch.no_grad():
@@ -1128,7 +1128,7 @@ class GGEURServer(Server):
 
             if classifier_aggregated and self.global_mlp is not None:
                 try:
-                    self.global_mlp.load_state_dict(classifier_aggregated)
+                    self.global_mlp.load_state_dict(classifier_aggregated, strict=False)
                     logger.info(f"Server: Phase 1 - Aggregated classifier from {len(valid_params)} clients")
                 except Exception as e:
                     logger.debug(f"Server: Could not load classifier params: {e}")
@@ -1143,7 +1143,7 @@ class GGEURServer(Server):
 
                 if cnn_aggregated and self.global_cnn is not None:
                     try:
-                        self.global_cnn.load_state_dict(cnn_aggregated)
+                        self.global_cnn.load_state_dict(cnn_aggregated, strict=False)
                         logger.info(f"Server: Phase 2 - Aggregated CNN backbone from {len(valid_params)} clients")
                     except Exception as e:
                         logger.debug(f"Server: Could not load CNN backbone params: {e}")

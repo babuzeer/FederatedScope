@@ -1,0 +1,43 @@
+use_gpu: True
+device: 1
+seed: 12345
+federate:
+  mode: standalone
+  total_round_num: 300
+  client_num: 10
+  sample_client_num: 3
+  make_global_eval: True
+data:
+  root: data/
+  type: 'CIFAR100@torchvision'
+  splits: [0.8, 0.1, 0.1]
+  num_workers: 0
+  transform: [['Resize', {'size': 224}], ['ToTensor'], ['Normalize', {'mean': [0.485, 0.456, 0.406], 'std': [0.229, 0.224, 0.225]}]]
+  args: [{'download': True}]
+  splitter: 'lda'
+  splitter_args: [{'alpha': 0.5}]
+dataloader:
+  batch_size: 16
+model:
+  type: convnext_base_head
+  num_classes: 100
+  pretrained: True
+  hidden_dim: 256
+  dropout: 0.1
+train:
+  local_update_steps: 1
+  batch_or_epoch: epoch
+  optimizer:
+    lr: 0.01
+    weight_decay: 0.0
+criterion:
+  type: CrossEntropyLoss
+trainer:
+  type: convnext_trainer
+eval:
+  freq: 5
+  metrics: ['acc', 'correct']
+attack:
+  attack_method: fedmia
+  fedmia_target_client_id: 1
+  fedmia_variant: "FedMIA-I"

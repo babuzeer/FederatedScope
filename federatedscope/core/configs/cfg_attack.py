@@ -55,6 +55,13 @@ def extend_attack_cfg(cfg):
     cfg.attack.mia_simulate_in_round = 20
     cfg.attack.mia_is_simulate_in = False
 
+    # for FedMIA attack
+    cfg.attack.target_client_id = -1
+    cfg.attack.query_samples = ''
+    cfg.attack.variant = 'MDM'
+    cfg.attack.fedmia_target_client_id = 1
+    cfg.attack.fedmia_variant = 'FedMIA-I'
+
     # --------------- register corresponding check function ----------
     cfg.register_cfg_check_fun(assert_attack_cfg)
 

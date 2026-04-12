@@ -297,6 +297,8 @@ def build_ggeur_cnn_feature_align(model_config):
 
 def call_ggeur_cnn_feature_align(model_config, local_data):
     """Factory function for GGEUR_Clip CNN with feature alignment."""
+    if model_config.type.lower() != 'ggeur_cnn_feature_align':
+        return None
     return build_ggeur_cnn_feature_align(model_config)
 
 
@@ -442,6 +444,8 @@ def build_ggeur_cnn_backbone(model_config):
 
 def call_ggeur_cnn_backbone(model_config, local_data):
     """Factory function for GGEUR_Clip CNN backbone."""
+    if model_config.type.lower() != 'ggeur_cnn_backbone':
+        return None
     return build_ggeur_cnn_backbone(model_config)
 
 
