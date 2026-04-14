@@ -1,24 +1,23 @@
-import torch
-import torch.nn as nn
-from typing import Tuple, List, cast
-from transformers import CLIPProcessor, CLIPModel
-from transformers.modeling_attn_mask_utils import (
-    _create_4d_causal_attention_mask,
-    _prepare_4d_attention_mask,
-)
+"""
+ggeur_prompt.py - open_clip based PromptFL implementation
 
-from transformers.modeling_outputs import BaseModelOutput
-
-
-import logging
-# logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+Uses open_clip (ViT-B-16 etc.) directly, no HuggingFace CLIPModel needed.
+The only requirement is the same .bin checkpoint used by GGEUR feature extraction.
+"""
 
 import re
+import copy
+import logging
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def to_display_name(name: str) -> str:
-    """Convert class name to display format by replacing underscores with spaces."""
     name = name.replace("_", " ")
     name = re.sub(r"\s+", " ", name).strip()
     return name
@@ -26,301 +25,208 @@ def to_display_name(name: str) -> str:
 
 class PromptLearner(nn.Module):
     """
-    Learnable prompt module for CLIP text encoder.
-    
-    This module creates learnable context tokens that are inserted between
-    the prefix (BOS token) and suffix (class name + EOS) of the text prompt.
-    Only the context tokens (self.ctx) are trainable, while prefix and suffix
-    embeddings are frozen.
+    Learnable soft prompt for open_clip text encoder.
+
+    Prompt structure: [BOS] [ctx x n_ctx] [class tokens] [EOS] [PAD...]
+    Only self.ctx is trainable; token embeddings for class names are frozen buffers.
     """
-    # Declare buffer types to avoid type checker treating them as Optional[Tensor]
-    token_prefix: torch.Tensor
-    token_suffix: torch.Tensor
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
+
+    token_prefix: torch.Tensor   # (K, 1, d)       - BOS embedding
+    token_suffix: torch.Tensor   # (K, *, d)        - class tokens + EOS + PAD
+    tokenized_prompts: torch.Tensor  # (K, context_length) - full token ids for mask
 
     def __init__(
         self,
-        clip_model: CLIPModel,
-        processor: CLIPProcessor,
+        clip_model,           # open_clip model instance
+        tokenizer,            # open_clip tokenizer
         classnames: List[str],
-        n_ctx: int = 32,
+        n_ctx: int = 16,
         template: str = "a photo of a {}",
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
-        # self.clip_model = clip_model
-        self.processor = processor
-        self.classnames = classnames
-        self.n_cls: int = len(classnames)
-        self.n_ctx: int = n_ctx
+        self.n_cls = len(classnames)
+        self.n_ctx = n_ctx
         self.device = device
-        
-        # Get text embedding dimension from CLIP model config
-        d: int = int(clip_model.text_model.config.hidden_size)
-        
-        # Initialize learnable context tokens with small random values
+        self.context_length = clip_model.context_length  # typically 77
+
+        # embedding dimension from token_embedding weight
+        d = clip_model.token_embedding.embedding_dim
+
+        # learnable context vectors
         self.ctx = nn.Parameter(torch.randn(n_ctx, d, device=device) * 0.02)
 
-        logger.info(f"PromptLearner initialized: n_cls={self.n_cls}, n_ctx={n_ctx}, hidden_size={d}, device={device}")
+        # tokenize "a photo of a {classname}" for each class
+        display_names = [to_display_name(c) for c in classnames]
+        texts = [template.format(c) for c in display_names]
+        tokenized = tokenizer(texts).to(device)  # (K, context_length)
 
-        # Step 1: Construct full text for each class (used to get suffix token ids and EOS position)
-        display_class_names = [to_display_name(name) for name in classnames]
-        texts = [template.format(name) for name in display_class_names]
-        tok = processor(text=texts, padding=True, truncation=True, return_tensors="pt")  # type: ignore
-
-        input_ids_local = cast(torch.Tensor, tok["input_ids"])  # (K, L)
-        attention_mask_local = cast(torch.Tensor, tok["attention_mask"])  # (K, L)
-
-        logger.debug(f"Tokenized input_ids shape: {input_ids_local.shape}, attention_mask shape: {attention_mask_local.shape}")
-
-        # Step 2: Convert fixed tokens to embeddings using CLIP's token embedding layer
         with torch.no_grad():
-            token_emb: torch.Tensor = clip_model.text_model.embeddings.token_embedding(
-                input_ids_local.to(device=device)
-            )  # (K, L, d)
+            token_emb = clip_model.token_embedding(tokenized)  # (K, L, d)
 
-        # Step 3: Extract prefix - only take the first token (BOS/start token)
-        token_prefix: torch.Tensor = token_emb[:, :1, :]  # (K, 1, d)
+        # prefix = BOS token only (position 0)
+        token_prefix = token_emb[:, :1, :]       # (K, 1, d)
+        # suffix = everything after BOS (class tokens + EOS + padding)
+        token_suffix = token_emb[:, 1:, :]       # (K, L-1, d)
 
-        # Step 4: Extract suffix - all tokens after the first (includes class name and EOS)
-        token_suffix: torch.Tensor = token_emb[:, 1:, :]  # (K, L-1, d)
-        
+        self.register_buffer("token_prefix", token_prefix)
+        self.register_buffer("token_suffix", token_suffix)
+        self.register_buffer("tokenized_prompts", tokenized)
 
-        logger.debug(f"token_prefix shape: {token_prefix.shape}, token_suffix shape: {token_suffix.shape}")
-
-        # Register fixed embeddings as buffers (non-trainable, moved to specified device)
-        self.register_buffer("token_prefix", token_prefix.to(device))
-        self.register_buffer("token_suffix", token_suffix.to(device))
-        self.register_buffer("attention_mask", attention_mask_local.to(device))
+        logger.info(f"PromptLearner: n_cls={self.n_cls}, n_ctx={n_ctx}, d={d}, "
+                    f"context_length={self.context_length}")
 
     def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Construct prompt embeddings by concatenating prefix, learnable context, and suffix.
-        
         Returns:
-            prompt_embeds: (K, 1+n_ctx+L-1, d) - Full prompt embeddings for all classes
-            attn_mask: (K, 1+n_ctx+L-1) - Corresponding attention mask
+            prompts:  (K, context_length, d)  - full prompt embeddings
+            eot_pos:  (K,)                    - position of EOT token per class
         """
-        K: int = self.n_cls
-        
-        # Expand learnable context to all classes: (n_ctx, d) -> (K, n_ctx, d)
-        ctx = self.ctx.unsqueeze(0).expand(K, -1, -1)
-        
-        # Concatenate: [BOS] + [learnable context] + [class name + EOS]
-        prompt_embeds = torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
-        
-        # Build attention mask: insert ones for the learnable context positions
-        suffix_mask = self.attention_mask[:, 1:]  # (K, L-1) - mask for suffix tokens
-        ctx_mask = torch.ones(
-            K,
-            self.n_ctx,
-            device=self.device,
-            dtype=suffix_mask.dtype,
-        )  # (K, n_ctx) - all ones for learnable context
-        prefix_mask = torch.ones(
-            K,
-            1,
-            device=self.device,
-            dtype=suffix_mask.dtype,
-        )  # (K, 1) - one for BOS token
+        K = self.n_cls
+        ctx = self.ctx.unsqueeze(0).expand(K, -1, -1)  # (K, n_ctx, d)
 
-        # Concatenate masks in same order as embeddings
-        attn_mask = torch.cat(
-            [
-                prefix_mask,
-                ctx_mask,
-                suffix_mask,
-            ],
-            dim=1,
-        )  # (K, 1+n_ctx+L-1)
-        
-        logger.debug(f"PromptLearner forward: prompt_embeds shape={prompt_embeds.shape}, attn_mask shape={attn_mask.shape}")
-        return prompt_embeds, attn_mask
-    
+        # [BOS] + [ctx] + [class + EOS + PAD]
+        # total length must equal context_length (77)
+        # suffix already has length (context_length - 1), so after inserting n_ctx
+        # context tokens we need to trim the suffix accordingly
+        suffix = self.token_suffix[:, :self.context_length - 1 - self.n_ctx, :]
+        prompts = torch.cat([self.token_prefix, ctx, suffix], dim=1)  # (K, L, d)
+
+        # EOT position: last non-zero token in original tokenized_prompts, shifted
+        # by n_ctx because ctx tokens are inserted at position 1, pushing everything right.
+        # open_clip uses 0 as padding; EOT is the highest token id (49407) in each row.
+        eot_pos = self.tokenized_prompts.argmax(dim=-1) + self.n_ctx  # (K,)
+
+        return prompts, eot_pos
+
 
 class TextEncoder(nn.Module):
     """
-    Text encoder wrapper that processes prompt embeddings through CLIP's text transformer.
-    
-    Takes pre-constructed prompt embeddings (from PromptLearner) and produces
-    text features aligned with image features in CLIP's joint embedding space.
+    Wraps open_clip's text transformer to encode prompt embeddings.
+    Mirrors what open_clip.CLIP.encode_text() does, but accepts pre-built embeddings.
     """
-    
-    def __init__(
-        self, device: torch.device = torch.device("cpu")
-    ):
+
+    def __init__(self, device: torch.device = torch.device("cpu")):
         super().__init__()
-        # self.text_model = clip_model.text_model
-        # self.text_projection = clip_model.text_projection
         self.device = device
-        logger.info(f"TextEncoder initialized: device={device}")
 
     def forward(
         self,
-        prompt_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        clip_model: CLIPModel,
+        prompts: torch.Tensor,    # (K, L, d)
+        eot_pos: torch.Tensor,    # (K,)
+        clip_model,               # open_clip model
     ) -> torch.Tensor:
-        """
-        Encode prompt embeddings to text features.
-        
-        Args:
-            prompt_embeds: (K, Lp, d) - Prompt embeddings for K classes
-            attention_mask: (K, Lp) - Attention mask for valid positions
-            
-        Returns:
-            text_embeds: (K, projection_dim) - Text features in CLIP's joint space
-        """
-        K, Lp, _ = prompt_embeds.shape
-        position_ids = torch.arange(Lp, device=prompt_embeds.device).unsqueeze(0)
+        """Returns L2-unnormalized text features of shape (K, embed_dim)."""
+        K, L, d = prompts.shape
 
-        # Step 1: Add positional embeddings to prompt embeddings
-        pos_emb = clip_model.text_model.embeddings.position_embedding(position_ids)  # (1, Lp, d)
-        inputs_embeds = prompt_embeds + pos_emb  # (K, Lp, d)
-        
-        # Create causal attention mask for autoregressive text modeling
-        causal_attention_mask = _create_4d_causal_attention_mask(
-            input_shape=(K, Lp),
-            dtype=prompt_embeds.dtype,
-            device=prompt_embeds.device,
-        )
+        # positional embedding
+        x = prompts + clip_model.positional_embedding[:L]  # (K, L, d)
 
-        # Prepare 4D attention mask if not using flash attention
-        attn_mask_4d = None
-        if attention_mask is not None and not getattr(clip_model.text_model, "_use_flash_attention_2", False):
-            attn_mask_4d = _prepare_4d_attention_mask(attention_mask, prompt_embeds.dtype)
+        x = x.permute(1, 0, 2)                    # (L, K, d) - transformer expects seq-first
+        # Pass causal attn_mask to match open_clip's encode_text behavior
+        attn_mask = None
+        if hasattr(clip_model, 'attn_mask') and clip_model.attn_mask is not None:
+            attn_mask = clip_model.attn_mask[:L, :L].to(x.device)
+        x = clip_model.transformer(x, attn_mask=attn_mask)  # (L, K, d)
+        x = x.permute(1, 0, 2)                    # (K, L, d)
+        x = clip_model.ln_final(x)                # (K, L, d)
 
-        # Step 2: Pass through transformer encoder
-        out: BaseModelOutput = clip_model.text_model.encoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn_mask_4d,
-            causal_attention_mask=causal_attention_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-        )
+        # Clamp eot_pos to valid range to avoid out-of-bounds indexing
+        eot_pos = eot_pos.clamp(max=L - 1)
+        # take features at EOT token position
+        x = x[torch.arange(K, device=self.device), eot_pos]  # (K, d)
 
-        last_hidden = out.last_hidden_state  # (K, Lp, d)
-        assert last_hidden is not None
-
-        K = last_hidden.size(0)
-
-        # Step 3: Apply final layer normalization
-        last_hidden = clip_model.text_model.final_layer_norm(last_hidden)
-
-        # Step 4: Extract EOS token hidden state as pooled output
-        # EOS position is the last valid token (sum of attention mask - 1)
-        eos_pos = attention_mask.sum(dim=-1) - 1  # (K,)
-        pooled = last_hidden[torch.arange(K, device=self.device), eos_pos]  # (K, d)
-
-        # Step 5: Project to CLIP's joint embedding space
-        text_embeds = clip_model.text_projection(pooled)  # (K, projection_dim)
-        
-        logger.debug(f"TextEncoder forward: input shape=({K}, {Lp}), text_embeds shape={text_embeds.shape}")
-        return text_embeds
+        # project to joint embedding space
+        x = x @ clip_model.text_projection        # (K, embed_dim)
+        return x
 
 
 class CustomCLIP(nn.Module):
     """
-    Custom CLIP model with learnable text prompts for few-shot/zero-shot classification.
-    
-    This model freezes the original CLIP weights and only trains the learnable
-    context tokens in the prompt, enabling efficient adaptation to new tasks.
-    
-    Architecture:
-        - Frozen CLIP image encoder: Extracts image features
-        - PromptLearner: Generates learnable prompt embeddings
-        - TextEncoder: Encodes prompts to text features
-        - Classification: Cosine similarity between image and text features
+    open_clip based CustomCLIP for PromptFL.
+
+    CLIP backbone is fully frozen. Only PromptLearner.ctx is trainable.
+    forward() accepts pre-extracted image features (not raw images),
+    matching GGEUR's workflow where features are cached.
     """
-    
+
     def __init__(
         self,
-        clip_model: CLIPModel,
-        processor: CLIPProcessor,
-        classnames: list,
-        n_ctx=32,
+        clip_model,
+        tokenizer,
+        classnames: List[str],
+        n_ctx: int = 16,
         template: str = "a photo of a {}",
-        device=torch.device("cpu"),
+        device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
-        
-        # Move CLIP model to device and freeze all parameters
-        self.clip_model = clip_model.to(device)  # type: ignore
+
+        self.clip_model = clip_model.to(device)
         for p in self.clip_model.parameters():
             p.requires_grad = False
         self.clip_model.eval()
 
         self.classnames = classnames
-        # self.n_cls: int = len(classnames)
-        self.n_ctx: int = n_ctx
+        self.n_ctx = n_ctx
         self.template = template
-        self.processor = processor
         self.device = device
-        
-        # Initialize learnable prompt module
+
         self.prompt_learner = PromptLearner(
             clip_model=self.clip_model,
-            processor=self.processor,
-            classnames=self.classnames,
-            n_ctx=self.n_ctx,
-            template=self.template,
-            device=self.device,
+            tokenizer=tokenizer,
+            classnames=classnames,
+            n_ctx=n_ctx,
+            template=template,
+            device=device,
         )
-        
-        # Initialize text encoder wrapper
-        self.text_encoder = TextEncoder(device=self.device)
-        
-        logger.info(f"CustomCLIP initialized: n_classes={len(classnames)}, n_ctx={n_ctx}, device={device}")
-        logger.info(f"CustomCLIP classnames: {classnames}")
+        self.text_encoder = TextEncoder(device=device)
 
-    def forward(self, pixel_values: torch.Tensor):
+        logger.info(f"CustomCLIP (open_clip): {len(classnames)} classes, n_ctx={n_ctx}")
+
+    def get_text_features(self) -> torch.Tensor:
+        """Returns L2-normalized text features (K, embed_dim)."""
+        prompts, eot_pos = self.prompt_learner()
+        text_feats = self.text_encoder(prompts, eot_pos, self.clip_model)
+        return F.normalize(text_feats, dim=-1)
+
+    def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for image classification.
-        
         Args:
-            pixel_values: (B, C, H, W) - Batch of input images
-            
+            image_features: (B, embed_dim) - pre-extracted, NOT necessarily normalized
         Returns:
-            logits: (B, K) - Classification logits for K classes
+            logits: (B, K)
         """
-        pixel_values = pixel_values.to(self.device)
-        
-        # Extract image features using frozen CLIP image encoder
-        image_features = self.clip_model.get_image_features(pixel_values=pixel_values)  # type: ignore
-        # L2 normalize image features
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-        # Generate text features from learnable prompts
-        prompt_embeds, attn_mask = self.prompt_learner()
-        text_features = self.text_encoder(prompt_embeds, attn_mask, self.clip_model)  # (K, projection_dim)
-        # L2 normalize text features
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-        # Compute cosine similarity scaled by learned temperature
+        img_feats = F.normalize(image_features.to(self.device), dim=-1)
+        text_feats = self.get_text_features()                    # (K, embed_dim)
         logit_scale = self.clip_model.logit_scale.exp()
-        logits = logit_scale * image_features @ text_features.t()  # (B, K)
-        
-        logger.debug(f"CustomCLIP forward: batch_size={pixel_values.shape[0]}, logits shape={logits.shape}, logit_scale={logit_scale.item():.4f}")
-        return logits
-    
+        return logit_scale * img_feats @ text_feats.t()
 
     @torch.no_grad()
     def clone_prompt_only(self):
-        new_model = CustomCLIP(
+        new_obj = CustomCLIP(
             clip_model=self.clip_model,
-            processor=self.processor,
+            tokenizer=self.prompt_learner.processor if hasattr(self.prompt_learner, 'processor') else None,
             classnames=self.classnames,
             n_ctx=self.n_ctx,
             template=self.template,
             device=self.device,
         )
-        new_model.prompt_learner.load_state_dict(self.prompt_learner.state_dict(), strict=True)
-        return new_model
+        new_obj.prompt_learner.ctx.data = self.prompt_learner.ctx.data.clone()
+        return new_obj
 
     def __deepcopy__(self, memo):
         if id(self) in memo:
             return memo[id(self)]
-        new_obj = self.clone_prompt_only()
+        new_obj = CustomCLIP(
+            clip_model=self.clip_model,
+            tokenizer=None,
+            classnames=self.classnames,
+            n_ctx=self.n_ctx,
+            template=self.template,
+            device=self.device,
+        )
+        new_obj.prompt_learner.load_state_dict(
+            copy.deepcopy(self.prompt_learner.state_dict()), strict=True
+        )
         memo[id(self)] = new_obj
         return new_obj

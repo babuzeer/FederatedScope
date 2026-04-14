@@ -1,6 +1,8 @@
-# GGEUR (ViT): CLIP (ViT-B-16) + MLP + FedAvg (With GGEUR data generation)
+# Baseline (ViT): CLIP (ViT-B-16) + MLP + MOON (No GGEUR data generation)
 #
-# Purpose: Run GGEUR with data generation under FedAvg aggregation (ViT branch).
+# Purpose: Run MOON as a baseline comparison against GGEUR (ViT branch).
+# Ref: Li et al., "Model-Contrastive Federated Learning", CVPR 2021
+# Dataset: PACS (4 domains: photo, art_painting, cartoon, sketch; 7 classes)
 
 use_gpu: True
 device: 0
@@ -10,13 +12,13 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 60
+  client_num: 28
   total_round_num: 100
   sample_client_num: 0
 
 data:
-  type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'
+  type: 'pacs'
+  root: '/root/data/PACS'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
@@ -25,10 +27,10 @@ dataloader:
 
 model:
   type: 'ggeur_mlp'
-  num_classes: 65
+  num_classes: 7
 
 train:
-  local_update_steps: 1
+  local_update_steps: 10
   optimizer:
     type: 'Adam'
     lr: 0.0001
@@ -40,13 +42,15 @@ ggeur:
   feature_extractor: 'clip'
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
-  clip_model_path: '/root/model/open_clip_vitb16.bin'
   embedding_dim: 512
 
-  # Enable GGEUR augmentation
-  num_generated_per_sample: 50
-  num_generated_per_prototype: 50
-  target_size_per_class: 50
+  use_feature_cache: True
+  feature_cache_dir: ''
+
+  # Disable GGEUR augmentation (baseline)
+  num_generated_per_sample: 0
+  num_generated_per_prototype: 0
+  target_size_per_class: 0
 
   # MLP
   mlp_hidden_dim: 0
@@ -59,6 +63,11 @@ ggeur:
   # FedProto off
   use_fedproto: False
 
+  # MOON contrastive regularization
+  use_moon: True
+  moon_mu: 5.0
+  moon_temperature: 0.5
+
   # LDS split
   use_lds: True
   lds_alpha: 0.1
@@ -70,5 +79,4 @@ ggeur:
   use_separated_training: False
 
 outdir: 'exp/ggeur_baselines'
-expname: 'officehome_lds/vit/ggeur/fedavg'
-
+expname: 'pacs_lds/vit/moon'

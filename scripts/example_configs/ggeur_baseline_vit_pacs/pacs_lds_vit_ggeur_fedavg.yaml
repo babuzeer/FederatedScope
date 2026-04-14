@@ -1,6 +1,7 @@
 # GGEUR (ViT): CLIP (ViT-B-16) + MLP + FedAvg (With GGEUR data generation)
 #
 # Purpose: Run GGEUR with data generation under FedAvg aggregation (ViT branch).
+# Dataset: PACS (4 domains: photo, art_painting, cartoon, sketch; 7 classes)
 
 use_gpu: True
 device: 0
@@ -10,13 +11,13 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 60
+  client_num: 28
   total_round_num: 100
   sample_client_num: 0
 
 data:
-  type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'
+  type: 'pacs'
+  root: '/root/data/PACS'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
@@ -25,7 +26,7 @@ dataloader:
 
 model:
   type: 'ggeur_mlp'
-  num_classes: 65
+  num_classes: 7
 
 train:
   local_update_steps: 1
@@ -70,5 +71,4 @@ ggeur:
   use_separated_training: False
 
 outdir: 'exp/ggeur_baselines'
-expname: 'officehome_lds/vit/ggeur/fedavg'
-
+expname: 'pacs_lds/vit/ggeur/fedavg'

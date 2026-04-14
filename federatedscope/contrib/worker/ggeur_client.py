@@ -11,6 +11,7 @@ Handles:
 """
 
 import os
+import time
 import logging
 import copy
 import numpy as np
@@ -438,6 +439,10 @@ class GGEURClient(Client):
         self.local_features = {}
         self.local_labels = {}
 
+        # QPS tracking
+        _qps_samples = 0
+        _qps_time = 0.0
+
         if has_paths:
             # Dataset with image paths - can use caching
             num_samples = len(subset_indices) if is_subset else len(base_dataset)
@@ -499,12 +504,15 @@ class GGEURClient(Client):
                         images = torch.stack(images).to(self.device)
 
                         # Extract features using appropriate extractor
+                        _t0 = time.time()
                         if self.feature_extractor_type == 'cnn':
                             features = self.cnn_extractor(images)
                         elif self.feature_extractor_type == 'timm':
                             features = self.timm_extractor(images)
                         else:
                             features = self.clip_model.encode_image(images)
+                        _qps_samples += len(images)
+                        _qps_time += time.time() - _t0
                         features = features.cpu().numpy()
 
                         for feat, label, path in zip(features, labels, batch_paths):
@@ -544,12 +552,15 @@ class GGEURClient(Client):
                         continue
 
                     # Extract features using appropriate extractor
+                    _t0 = time.time()
                     if self.feature_extractor_type == 'cnn':
                         features = self.cnn_extractor(images)
                     elif self.feature_extractor_type == 'timm':
                         features = self.timm_extractor(images)
                     else:
                         features = self.clip_model.encode_image(images)
+                    _qps_samples += len(images)
+                    _qps_time += time.time() - _t0
                     features = features.cpu().numpy()
                     labels = labels.cpu().numpy()
 
@@ -566,6 +577,10 @@ class GGEURClient(Client):
             self.local_features[label] = np.array(self.local_features[label])
 
         total_samples = sum(len(v) for v in self.local_features.values())
+        if _qps_time > 0:
+            qps = _qps_samples / _qps_time
+            logger.info(f"Client {self.ID}: Feature extraction QPS={qps:.1f} img/s "
+                        f"({_qps_samples} samples in {_qps_time:.2f}s)")
         logger.info(f"Client {self.ID}: Extracted {total_samples} {extractor_name} features from {len(self.local_features)} classes")
 
     def _extract_clip_features(self):
@@ -2031,55 +2046,53 @@ class GGEURClient(Client):
         return [f"class {i}" for i in range(num_classes)]
 
     def _build_prompt_model(self):
-        """Build CustomCLIP (HuggingFace-based) for PromptFL."""
+        """Build CustomCLIP (open_clip-based) for PromptFL."""
+        import open_clip
         from federatedscope.contrib.model.ggeur_prompt import CustomCLIP
-        from transformers import CLIPModel, CLIPProcessor
 
         n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
         class_names = self._get_class_names()
-        model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
+        clip_model_name = getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16')
         clip_pretrained = getattr(self.ggeur_cfg, 'clip_pretrained', 'openai')
-
-        # Determine HuggingFace model identifier
-        # Support local path or HuggingFace hub id
-        if model_path and os.path.isdir(model_path):
-            hf_model_id = model_path
-        else:
-            # Map open_clip model names to HuggingFace ids
-            clip_model_name = getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16')
-            hf_model_id = getattr(self.ggeur_cfg, 'hf_clip_model_id', 'openai/clip-vit-base-patch16')
-
-        try:
-            logger.info(f"Client {self.ID}: Loading HuggingFace CLIP from {hf_model_id}")
-            self.hf_clip_model = CLIPModel.from_pretrained(hf_model_id)
-            processor = CLIPProcessor.from_pretrained(hf_model_id)
-        except Exception as e:
-            logger.error(f"Client {self.ID}: Failed to load HF CLIP: {e}")
-            return
-
+        model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
         template = getattr(self.ggeur_cfg, 'prompt_template', 'a photo of a {}')
 
+        try:
+            if model_path and os.path.isfile(model_path):
+                logger.info(f"Client {self.ID}: Loading open_clip CLIP from {model_path}")
+                clip_model, _, _ = open_clip.create_model_and_transforms(
+                    clip_model_name, pretrained=model_path
+                )
+            else:
+                logger.info(f"Client {self.ID}: Loading open_clip CLIP pretrained={clip_pretrained}")
+                clip_model, _, _ = open_clip.create_model_and_transforms(
+                    clip_model_name, pretrained=clip_pretrained
+                )
+            tokenizer = open_clip.get_tokenizer(clip_model_name)
+        except Exception as e:
+            logger.error(f"Client {self.ID}: Failed to load open_clip CLIP: {e}")
+            return
+
         self.custom_clip = CustomCLIP(
-            clip_model=self.hf_clip_model,
-            processor=processor,
+            clip_model=clip_model,
+            tokenizer=tokenizer,
             classnames=class_names,
             n_ctx=n_ctx,
             template=template,
             device=self.device,
         )
-        # Keep backward-compat references
         self.prompt_learner = self.custom_clip.prompt_learner
         self.text_encoder = self.custom_clip.text_encoder
 
-        logger.info(f"Client {self.ID}: Built CustomCLIP with {n_ctx} ctx tokens, "
+        logger.info(f"Client {self.ID}: Built CustomCLIP (open_clip) with {n_ctx} ctx tokens, "
                     f"{len(class_names)} classes")
 
     def _train_prompt_on_augmented_data(self):
         """
         Train soft prompt ctx vectors on augmented CLIP features.
 
-        Uses CustomCLIP's PromptLearner + TextEncoder (HuggingFace-based).
-        Image features are pre-extracted; only ctx vectors are updated.
+        Uses CustomCLIP (open_clip-based). Image features are pre-extracted;
+        only ctx vectors are updated.
 
         Returns:
             sample_size, prompt_para dict, results dict
@@ -2088,7 +2101,7 @@ class GGEURClient(Client):
             return 0, {}, {}
 
         lr = getattr(self.ggeur_cfg, 'prompt_lr', 0.002)
-        local_epochs = getattr(self.ggeur_cfg, 'prompt_local_epochs', 10)
+        local_epochs = getattr(self.ggeur_cfg, 'prompt_local_epochs', 1)
 
         self.custom_clip.prompt_learner.train()
 
@@ -2099,35 +2112,39 @@ class GGEURClient(Client):
         total_samples = 0
 
         for epoch in range(local_epochs):
+            epoch_loss = 0.0
+            epoch_correct = 0
+            epoch_samples = 0
+
             for features, labels in self.augmented_loader:
                 features = features.to(self.device)
                 labels = labels.to(self.device)
 
-                # Normalize pre-extracted image features
-                img_feats = F.normalize(features, p=2, dim=1)
-
-                # Get text features via CustomCLIP's prompt + text encoder
-                prompt_embeds, attn_mask = self.custom_clip.prompt_learner()
-                text_feats = self.custom_clip.text_encoder(
-                    prompt_embeds, attn_mask, self.custom_clip.clip_model
-                )
-                text_feats = F.normalize(text_feats, p=2, dim=1)
-
-                # Scale by learned logit_scale (same as CustomCLIP.forward)
-                logit_scale = self.custom_clip.clip_model.logit_scale.exp()
-                logits = logit_scale * img_feats @ text_feats.T
-
-                loss = F.cross_entropy(logits, labels)
-
                 optimizer.zero_grad()
+
+                # Forward: text encoder runs per batch so gradients flow correctly
+                prompt_embeds, eot_pos = self.custom_clip.prompt_learner()
+                text_feats = self.custom_clip.text_encoder(
+                    prompt_embeds, eot_pos, self.custom_clip.clip_model
+                )
+                text_feats_norm = F.normalize(text_feats, p=2, dim=1)          # (K, d)
+                logit_scale = self.custom_clip.clip_model.logit_scale.exp()
+
+                img_feats = F.normalize(features, p=2, dim=1)                  # (B, d)
+                logits = logit_scale * (img_feats @ text_feats_norm.T)         # (B, K)
+                loss = F.cross_entropy(logits, labels)
                 loss.backward()
                 optimizer.step()
 
-                batch_size = features.size(0)
-                total_loss += loss.item() * batch_size
-                _, predicted = torch.max(logits, 1)
-                total_correct += (predicted == labels).sum().item()
-                total_samples += batch_size
+                with torch.no_grad():
+                    _, predicted = torch.max(logits, 1)
+                    epoch_correct += (predicted == labels).sum().item()
+                    epoch_samples += features.size(0)
+                    epoch_loss += loss.item() * features.size(0)
+
+            total_loss += epoch_loss
+            total_correct += epoch_correct
+            total_samples += epoch_samples
 
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         accuracy = total_correct / total_samples if total_samples > 0 else 0

@@ -12,6 +12,7 @@ Handles:
 """
 
 import os
+import time
 import logging
 import copy
 import re
@@ -127,6 +128,17 @@ class GGEURServer(Server):
         self.global_prompt_ctx = None          # Aggregated ctx tensor [n_ctx, ctx_dim]
         self.prompt_test_accuracies_history = {}
         self.best_prompt_avg_accuracy = 0.0
+
+        # Training wall-clock timer
+        self._train_start_time = time.time()
+
+        # Per-round timing
+        self._round_start_time = None
+        self._round_durations = []   # seconds per round
+
+        # Communication volume (bytes)
+        self._bytes_sent = 0      # server → clients
+        self._bytes_recv = 0      # clients → server
         # CLIP model and prompt components for server-side evaluation
         self.prompt_learner_eval = None
         self.text_encoder_eval = None
@@ -440,14 +452,14 @@ class GGEURServer(Server):
                 except Exception as e:
                     logger.warning(f"Server: Failed to load cache for {domain}: {e}")
 
-            # Load test dataset with SAME parameters as client data
+            # Load test dataset with CLIP normalization (CRITICAL for PromptFL)
             try:
                 from torchvision import transforms
                 transform = transforms.Compose([
                     transforms.Resize((224, 224)),
                     transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                       std=[0.229, 0.224, 0.225])
+                    transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                       std=[0.26862954, 0.26130258, 0.27577711])
                 ])
 
                 test_dataset = dataset_class(
@@ -567,6 +579,7 @@ class GGEURServer(Server):
         """Handle receiving local statistics from a client"""
         client_id = message.sender
         content = message.content
+        self._bytes_recv += self._sizeof_content(content)
 
         logger.info(f"Server: Received local statistics from client {client_id}")
 
@@ -681,6 +694,9 @@ class GGEURServer(Server):
             model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
         # Broadcast to all clients
+        send_bytes = self._sizeof_content(model_para)
+        self._bytes_sent += send_bytes * self._client_num
+        self._round_start_time = time.time()
         for client_id in range(1, self._client_num + 1):
             self.comm_manager.send(
                 Message(
@@ -920,7 +936,7 @@ class GGEURServer(Server):
                 'other_prototypes': {client_id: other_prototypes.get(client_id, {})},
                 'global_prototypes': self.global_prototypes  # For feature alignment
             }
-
+            self._bytes_sent += self._sizeof_content(content)
             self.comm_manager.send(
                 Message(
                     msg_type='global_covariances',
@@ -941,6 +957,7 @@ class GGEURServer(Server):
         round_idx = message.state
         sender = message.sender
         content = message.content
+        self._bytes_recv += self._sizeof_content(content)
 
         if isinstance(content, tuple) and len(content) == 2:
             sample_size, model_para = content
@@ -1064,7 +1081,12 @@ class GGEURServer(Server):
                 logger.info(f"Server: Round {round_idx} CNN Test Accuracy - {acc_str}")
 
         # Log progress
-        logger.info(f"Server: Round {round_idx} aggregation complete, total samples: {total_samples}")
+        if self._round_start_time is not None:
+            round_elapsed = time.time() - self._round_start_time
+            self._round_durations.append(round_elapsed)
+            logger.info(f"Server: Round {round_idx} aggregation complete, "
+                        f"total samples: {total_samples}, "
+                        f"round time: {round_elapsed:.1f}s")
 
         # Move to next round
         self.state = round_idx + 1
@@ -1101,7 +1123,7 @@ class GGEURServer(Server):
                     avg = torch.tensor(avg)
                 if avg.device != cur.device:
                     avg = avg.to(cur.device)
-                grads[key] = (cur.detach() - avg.detach()).type_as(cur)
+                grads[key] = (avg.detach() - cur.detach()).type_as(cur)
 
         self.fedopt_optimizer.zero_grad()
         for name, p in self.global_mlp.named_parameters():
@@ -1159,21 +1181,43 @@ class GGEURServer(Server):
             return None
 
         first_params = valid_params[0][1]
+        if not isinstance(first_params, dict):
+            logger.warning(f"Server: Expected dict for model params, got {type(first_params)}, skipping aggregation")
+            return None
+
         aggregated_params = {}
 
         for key in first_params.keys():
             param_tensor = first_params[key]
+            if isinstance(param_tensor, dict):
+                # Nested dict (e.g. combined params accidentally passed in); skip
+                logger.debug(f"Server: Skipping nested dict value for key '{key}' during aggregation setup")
+                continue
             if not isinstance(param_tensor, torch.Tensor):
-                param_tensor = torch.tensor(param_tensor)
+                try:
+                    param_tensor = torch.tensor(param_tensor)
+                except Exception as e:
+                    logger.debug(f"Server: Cannot convert key '{key}' to tensor ({e}), skipping")
+                    continue
             aggregated_params[key] = torch.zeros_like(param_tensor).float()
 
-        # Weighted average
+        if not aggregated_params:
+            return None
+
+        # Weighted average — only iterate over keys validated from first_params
         for sample_size, params in valid_params:
             weight = sample_size / total_samples
-            for key in params.keys():
+            for key in aggregated_params.keys():
+                if key not in params:
+                    continue
                 param_tensor = params[key]
+                if isinstance(param_tensor, dict):
+                    continue
                 if not isinstance(param_tensor, torch.Tensor):
-                    param_tensor = torch.tensor(param_tensor)
+                    try:
+                        param_tensor = torch.tensor(param_tensor)
+                    except Exception:
+                        continue
                 aggregated_params[key] += weight * param_tensor.float()
 
         return aggregated_params
@@ -1322,6 +1366,26 @@ class GGEURServer(Server):
 
         return results
 
+    @staticmethod
+    def _sizeof_content(content) -> int:
+        """Estimate byte size of message content (tensors + numpy arrays)."""
+        total = 0
+        if content is None:
+            return 0
+        if isinstance(content, torch.Tensor):
+            return content.nelement() * content.element_size()
+        if isinstance(content, np.ndarray):
+            return content.nbytes
+        if isinstance(content, dict):
+            for v in content.values():
+                total += GGEURServer._sizeof_content(v)
+            return total
+        if isinstance(content, (list, tuple)):
+            for v in content:
+                total += GGEURServer._sizeof_content(v)
+            return total
+        return 0
+
     def _finish(self):
         """Finish FL training"""
         logger.info("="*60)
@@ -1368,6 +1432,32 @@ class GGEURServer(Server):
                     logger.info(f"  {domain}: final={acc_list[-1]:.4f}, best={max(acc_list):.4f}")
             logger.info(f"Prompt Best Average Accuracy: {self.best_prompt_avg_accuracy:.4f}")
 
+        logger.info("="*60)
+
+        elapsed = time.time() - self._train_start_time
+        h, rem = divmod(int(elapsed), 3600)
+        m, s = divmod(rem, 60)
+        logger.info(f"Server: Total training time: {h:02d}h {m:02d}m {s:02d}s ({elapsed:.1f}s)")
+
+        if self._round_durations:
+            avg_round = sum(self._round_durations) / len(self._round_durations)
+            logger.info(f"Server: Avg round time: {avg_round:.1f}s  "
+                        f"(min={min(self._round_durations):.1f}s, "
+                        f"max={max(self._round_durations):.1f}s, "
+                        f"rounds={len(self._round_durations)})")
+
+        def _fmt_bytes(n):
+            for unit in ('B', 'KB', 'MB', 'GB'):
+                if n < 1024:
+                    return f"{n:.2f} {unit}"
+                n /= 1024
+            return f"{n:.2f} TB"
+
+        total_comm = self._bytes_sent + self._bytes_recv
+        logger.info(f"Server: Communication volume - "
+                    f"sent={_fmt_bytes(self._bytes_sent)}, "
+                    f"recv={_fmt_bytes(self._bytes_recv)}, "
+                    f"total={_fmt_bytes(total_comm)}")
         logger.info("="*60)
 
         for client_id in range(1, self._client_num + 1):
@@ -1418,17 +1508,16 @@ class GGEURServer(Server):
         if not self.test_features:
             return {}
 
-        # Build or update eval CustomCLIP (HuggingFace-based)
+        # Build or update eval CustomCLIP (open_clip-based)
         if self.prompt_learner_eval is None:
+            import open_clip
             from federatedscope.contrib.model.ggeur_prompt import CustomCLIP
-            from transformers import CLIPModel, CLIPProcessor
 
             n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
             num_classes = self._cfg.model.num_classes
-            hf_model_id = getattr(self.ggeur_cfg, 'hf_clip_model_id', 'openai/clip-vit-base-patch16')
+            clip_model_name = getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16')
+            clip_pretrained = getattr(self.ggeur_cfg, 'clip_pretrained', 'openai')
             model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
-            if model_path and os.path.isdir(model_path):
-                hf_model_id = model_path
 
             # Get class names
             cfg_names = getattr(self.ggeur_cfg, 'prompt_class_names', [])
@@ -1454,24 +1543,30 @@ class GGEURServer(Server):
             template = getattr(self.ggeur_cfg, 'prompt_template', 'a photo of a {}')
 
             try:
-                hf_clip = CLIPModel.from_pretrained(hf_model_id)
-                processor = CLIPProcessor.from_pretrained(hf_model_id)
+                if model_path and os.path.isfile(model_path):
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        clip_model_name, pretrained=model_path
+                    )
+                else:
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        clip_model_name, pretrained=clip_pretrained
+                    )
+                tokenizer = open_clip.get_tokenizer(clip_model_name)
             except Exception as e:
-                logger.error(f"Server: Failed to load HF CLIP for prompt eval: {e}")
+                logger.error(f"Server: Failed to load open_clip CLIP for prompt eval: {e}")
                 return {}
 
             custom_clip = CustomCLIP(
-                clip_model=hf_clip,
-                processor=processor,
+                clip_model=clip_model,
+                tokenizer=tokenizer,
                 classnames=class_names,
                 n_ctx=n_ctx,
                 template=template,
                 device=self.device,
             )
-            # Store only the components needed for eval
             self.prompt_learner_eval = custom_clip.prompt_learner
             self.text_encoder_eval = custom_clip.text_encoder
-            self._eval_hf_clip = custom_clip.clip_model
+            self._eval_clip = custom_clip.clip_model
 
         # Load current global ctx
         self.prompt_learner_eval.ctx.data = self.global_prompt_ctx.to(self.device)
@@ -1480,10 +1575,10 @@ class GGEURServer(Server):
         self.prompt_learner_eval.eval()
 
         with torch.no_grad():
-            prompt_embeds, attn_mask = self.prompt_learner_eval()
-            text_feats = self.text_encoder_eval(prompt_embeds, attn_mask, self._eval_hf_clip)
+            prompts, eot_pos = self.prompt_learner_eval()
+            text_feats = self.text_encoder_eval(prompts, eot_pos, self._eval_clip)
             text_feats = F.normalize(text_feats, p=2, dim=1)
-            logit_scale = self._eval_hf_clip.logit_scale.exp()
+            logit_scale = self._eval_clip.logit_scale.exp()
 
             for domain, features in self.test_features.items():
                 labels = self.test_labels[domain]

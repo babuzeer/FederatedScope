@@ -1,10 +1,11 @@
-# GGEUR + PromptFL (CLIP Text Soft Prompts)
+# GGEUR + PromptFL (CLIP Text Soft Prompts) - PACS
 #
 # Combines GGEUR Gaussian feature augmentation with PromptFL:
 # 1. GGEUR extracts CLIP features and augments them via global covariance
 # 2. PromptFL trains soft text prompts (ctx vectors) on the augmented features
-# 3. Only ctx vectors are federated (16x512 = 8192 params vs MLP's 33280)
+# 3. Only ctx vectors are federated (16x512 = 8192 params vs MLP's 3584)
 #
+# Dataset: PACS (4 domains: photo, art_painting, cartoon, sketch; 7 classes)
 # Requires: feature_extractor='clip' (text prompts need CLIP text encoder)
 # Reference: PromptFL (Guo et al., 2022) + GGEUR
 
@@ -23,8 +24,8 @@ federate:
 
 # ========== Data Settings ==========
 data:
-  type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'
+  type: 'pacs'
+  root: '/root/data/PACS'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
@@ -34,7 +35,7 @@ dataloader:
 # ========== Model Settings ==========
 model:
   type: 'ggeur_mlp'
-  num_classes: 65
+  num_classes: 7
 
 # ========== Training Settings ==========
 train:
@@ -58,12 +59,12 @@ ggeur:
   use_feature_cache: True
   feature_cache_dir: ''
 
-  # ===== Feature Augmentation (disabled to isolate PromptFL) =====
+  # ===== Feature Augmentation =====
   num_generated_per_sample: 0
   num_generated_per_prototype: 0
   target_size_per_class: 20
 
-  # ===== MLP Classifier (still trained alongside PromptFL) =====
+  # ===== MLP Classifier =====
   mlp_hidden_dim: 0
   mlp_dropout: 0.0
 
@@ -86,16 +87,11 @@ ggeur:
   prompt_length: 16
   prompt_lr: 0.002
   prompt_local_epochs: 1
-  # Temperature for cosine similarity logits
   prompt_temperature: 0.07
-  # Optional: override class names (leave empty to auto-detect from dataset)
   prompt_class_names: []
-  # Text prompt template
   prompt_template: 'a photo of a {}'
-  # HuggingFace CLIP model directory (must contain config.json + pytorch_model.bin)
-  # Set this to your local HF CLIP model path
   hf_clip_model_id: 'openai/clip-vit-base-patch16'
 
 # ========== Output Settings ==========
 outdir: 'exp/ggeur_promptfl_clip'
-expname: 'ggeur_promptfl_officehome'
+expname: 'ggeur_promptfl_pacs'

@@ -202,12 +202,13 @@ def _load_pacs_ggeur_data(config, client_cfgs=None):
     # Default splits
     splits = tuple(config.data.splits) if hasattr(config.data, 'splits') else (0.8, 0.1, 0.1)
 
-    # Standard transforms for PACS
+    # CLIP transforms for PACS (CRITICAL for PromptFL)
+    # CLIP expects its own normalization, not ImageNet's
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                           std=[0.26862954, 0.26130258, 0.27577711])
     ])
 
     domains = PACS.DOMAINS  # ['photo', 'art_painting', 'cartoon', 'sketch']
@@ -333,12 +334,13 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
     # Default splits
     splits = tuple(config.data.splits) if hasattr(config.data, 'splits') else (0.7, 0.0, 0.3)
 
-    # Standard transforms for Office-Home
+    # CLIP transforms for Office-Home (CRITICAL for PromptFL)
+    # CLIP expects its own normalization, not ImageNet's
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                           std=[0.26862954, 0.26130258, 0.27577711])
     ])
 
     domains = OfficeHome.DOMAINS  # ['Art', 'Clipart', 'Product', 'Real_World']
