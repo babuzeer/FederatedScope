@@ -36,7 +36,7 @@ federate:
 # ========== Data Settings ==========
 data:
   type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
@@ -62,7 +62,7 @@ ggeur:
   # CLIP Feature Extraction
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
-  clip_model_path: '/root/model/open_clip_vitb16.bin'  # Local path
+  clip_model_path: '/root/autodl-tmp/models/open_clip_vitb16.bin'  # Local path
   embedding_dim: 512
 
   # Feature Caching

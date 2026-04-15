@@ -37,7 +37,7 @@ federate:
 
 # ========== Data Settings ==========
 data:
-  root: '/root/data/PACS'
+  root: '/root/autodl-tmp/datasets/PACS'
   type: 'pacs'
   splits: [0.8, 0.1, 0.1]
   dirichlet_alpha: 0.08       # Keep high heterogeneity for CDA advantage

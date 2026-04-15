@@ -20,7 +20,7 @@ federate:
 
 # Data settings - Same as cross_domain_adaptive
 data:
-  root: '/root/data/PACS'
+  root: '/root/autodl-tmp/datasets/PACS'
   type: 'pacs'
   splits: [0.8, 0.1, 0.1]  # train, val, test
   dirichlet_alpha: 0.1  # Same heterogeneity as cross_domain_adaptive

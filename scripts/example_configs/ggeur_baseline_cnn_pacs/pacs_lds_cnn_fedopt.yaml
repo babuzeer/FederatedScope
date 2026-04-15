@@ -24,7 +24,7 @@ fedopt:
 
 data:
   type: 'pacs'
-  root: '/root/data/PACS'
+  root: '/root/autodl-tmp/datasets/PACS'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:

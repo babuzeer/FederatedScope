@@ -34,7 +34,7 @@ federate:
 # Note: Data will be loaded via ggeur_data.py which supports LDS partitioning
 data:
   type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:

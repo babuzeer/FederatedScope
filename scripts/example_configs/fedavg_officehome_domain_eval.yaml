@@ -21,7 +21,7 @@ federate:
 
 # Data settings - Same as ggeur_officehome_lds.yaml
 data:
-  root: 'OfficeHomeDataset_10072016/'
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016/'
   type: 'OfficeHome'
   splits: [0.8, 0.1, 0.1]  # train, val, test
   splitter: 'lda_domain'  # Same as GGEUR_Clip config

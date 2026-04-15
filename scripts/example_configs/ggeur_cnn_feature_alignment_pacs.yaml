@@ -27,7 +27,7 @@ federate:
 # ========== Data Settings ==========
 data:
   type: 'pacs'
-  root: 'data/PACS'
+  root: '/root/autodl-tmp/datasets/PACS'
   splits: [0.8, 0.1, 0.1]
 
 dataloader:
@@ -53,7 +53,7 @@ ggeur:
   # CLIP Feature Extraction
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
-  clip_model_path: '/root/model/open_clip_vitb16.bin'
+  clip_model_path: '/root/autodl-tmp/models/open_clip_vitb16.bin'
   embedding_dim: 512
 
   # Feature Caching

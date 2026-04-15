@@ -18,7 +18,7 @@ federate:
 # ========== Data Settings ==========
 data:
   type: 'pacs'
-  root: 'data/PACS'  # Path to PACS dataset
+  root: '/root/autodl-tmp/datasets/PACS'  # Path to PACS dataset
   splits: [0.8, 0.1, 0.1]  # train, val, test ratios
 
 dataloader:

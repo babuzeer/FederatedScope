@@ -18,7 +18,7 @@ federate:
 # ========== Data Settings ==========
 data:
   type: 'office-home'
-  root: 'OfficeHomeDataset_10072016'  # Path to Office-Home dataset
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016'  # Path to Office-Home dataset
   splits: [0.7, 0.0, 0.3]  # train, val, test ratios
 
 dataloader:
@@ -44,7 +44,7 @@ ggeur:
   # CLIP Feature Extraction
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
-  clip_model_path: '/root/model/open_clip_vitb16.bin'  # Optional: local path to CLIP weights
+  clip_model_path: '/root/autodl-tmp/models/open_clip_vitb16.bin'  # Optional: local path to CLIP weights
   embedding_dim: 512
 
   # Feature Augmentation

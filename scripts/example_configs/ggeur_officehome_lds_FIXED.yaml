@@ -1,6 +1,6 @@
 data:
   batch_size: 16
-  root: OfficeHomeDataset_10072016/
+  root: /root/autodl-tmp/datasets/OfficeHomeDataset_10072016/
   splits:
   - 0.8
   - 0.1
