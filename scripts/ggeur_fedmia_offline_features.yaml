@@ -44,6 +44,20 @@ eval:
   best_res_update_round_wise_key: 'test_loss'
 
 attack:
-  attack_method: fedmia
+  attack_method: ggeur_fedmia
   fedmia_target_client_id: 1
   fedmia_variant: FedMIA-I
+
+  # GGEUR heterogeneity handling
+  use_ggeur: True
+  ggeur_num_per_sample: 50
+  ggeur_target_size: 50
+  ggeur_use_cross_client: True
+
+  # Modular attack framework
+  modular_attacks: True
+  attack_plugins:
+    - loss_series
+    - avg_cosine
+    - fedmia_i
+    - fedmia_ii

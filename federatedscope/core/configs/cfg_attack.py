@@ -62,6 +62,19 @@ def extend_attack_cfg(cfg):
     cfg.attack.fedmia_target_client_id = 1
     cfg.attack.fedmia_variant = 'FedMIA-I'
 
+    # for modular attack framework
+    cfg.attack.modular_attacks = True
+    cfg.attack.attack_plugins = [
+        'blackbox_loss', 'grad_cosine', 'grad_diff', 'grad_norm',
+        'loss_series', 'avg_cosine', 'fedmia_i', 'fedmia_ii',
+    ]
+
+    # for GGEUR heterogeneity handling
+    cfg.attack.use_ggeur = False
+    cfg.attack.ggeur_num_per_sample = 50
+    cfg.attack.ggeur_target_size = 50
+    cfg.attack.ggeur_use_cross_client = True
+
     # --------------- register corresponding check function ----------
     cfg.register_cfg_check_fun(assert_attack_cfg)
 

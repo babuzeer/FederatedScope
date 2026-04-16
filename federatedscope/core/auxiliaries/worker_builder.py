@@ -170,6 +170,11 @@ def get_server_cls(cfg):
             FedMIAServer
         return FedMIAServer
 
+    elif cfg.attack.attack_method.lower() in ['ggeur_fedmia']:
+        from federatedscope.contrib.worker.ggeur_fedmia_server import \
+            GGEURFedMIAServer
+        return GGEURFedMIAServer
+
     elif cfg.attack.attack_method.lower() in ['backdoor']:
         from federatedscope.attack.worker_as_attacker.server_attacker \
             import BackdoorServer

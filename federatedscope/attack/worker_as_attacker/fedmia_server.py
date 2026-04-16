@@ -276,11 +276,10 @@ class FedMIAServer(PassiveServer):
         # Store client model state
         self.client_model_states[round_num][sender_id] = copy.deepcopy(model_para)
         
-        # Save PKL file for this client
-        self._save_client_pkl(round_num, sender_id, model_para)
-        
-        # Check if this is the final round
+        # Save PKL file every 10 rounds and at the final round
         is_final_round = (round_num == self.total_round_num - 1)
+        if round_num % 10 == 0 or is_final_round:
+            self._save_client_pkl(round_num, sender_id, model_para)
         
         # Standard aggregation
         Server.callback_funcs_model_para(self, message)
