@@ -17,6 +17,7 @@ import copy
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from federatedscope.core.message import Message
@@ -25,6 +26,8 @@ from federatedscope.contrib.data.ggeur_backdoor import \
     build_poison_test_dataset, get_active_backdoor_attacker_ids, \
     is_ggeur_backdoor_attack, parse_attacker_ids, \
     validate_ggeur_backdoor_config
+from federatedscope.contrib.model.bad_pfl_generator import \
+    BadPFLFeatureGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +86,7 @@ class GGEURServer(Server):
         self.use_fedproto = bool(getattr(self.ggeur_cfg, 'use_fedproto', False))
         self.fedproto_global_prototypes = {}  # {class_idx: torch.Tensor}
 
-        # ===== CerP (Feature-space Backdoor Attack) =====
+        # ===== CerP / PFedBA (Feature-space Backdoor Attack) =====
         attack_method = str(getattr(getattr(config, 'attack', None),
                                     'attack_method', '')).lower()
         self.use_backdoor = is_ggeur_backdoor_attack(config)
@@ -99,8 +102,20 @@ class GGEURServer(Server):
         if self.use_backdoor:
             validate_ggeur_backdoor_config(config)
 
-        self.use_cerp = attack_method == 'cerp'
-        self.cerp_cfg = getattr(getattr(config, 'attack', None), 'cerp', None)
+        self.use_cerp = attack_method in {'cerp', 'pfedba'}
+        self.cerp_method_name = 'PFedBA' if attack_method == 'pfedba' else 'CerP'
+        self.cerp_payload_key = 'pfedba' if attack_method == 'pfedba' else 'cerp'
+        self.cerp_cfg = None
+        attack_cfg = getattr(config, 'attack', None)
+        if attack_cfg is not None:
+            if attack_method == 'pfedba':
+                self.cerp_cfg = getattr(attack_cfg, 'pfedba', None)
+                if self.cerp_cfg is None:
+                    self.cerp_cfg = getattr(attack_cfg, 'cerp', None)
+            else:
+                self.cerp_cfg = getattr(attack_cfg, 'cerp', None)
+                if self.cerp_cfg is None:
+                    self.cerp_cfg = getattr(attack_cfg, 'pfedba', None)
         self.cerp_attacker_ids = self._parse_attacker_ids(
             getattr(getattr(config, 'attack', None), 'attacker_id', -1))
         self.cerp_target_label = int(
@@ -126,6 +141,49 @@ class GGEURServer(Server):
         self.cerp_shared_trigger = None
         self.cerp_prev_attacker_models = {}
         self.current_training_clients = list(range(1, self._client_num + 1))
+
+        # ===== Bad-PFL (shared feature generator on augmented data) =====
+        self.use_bad_pfl = attack_method in {'bad_pfl', 'badpfl', 'bad-pfl'}
+        self.bad_pfl_cfg = getattr(attack_cfg, 'bad_pfl', None)
+        self.bad_pfl_attacker_ids = self._parse_attacker_ids(
+            getattr(getattr(config, 'attack', None), 'attacker_id', -1))
+        self.bad_pfl_target_label = int(
+            getattr(getattr(config, 'attack', None), 'target_label_ind', -1))
+        self.bad_pfl_start_round = int(
+            getattr(self.bad_pfl_cfg, 'start_round', 1)
+        ) if self.bad_pfl_cfg is not None else 1
+        self.bad_pfl_generator_hidden_dim = int(
+            getattr(self.bad_pfl_cfg, 'generator_hidden_dim', 512)
+        ) if self.bad_pfl_cfg is not None else 512
+        self.bad_pfl_trigger_scale = float(
+            getattr(self.bad_pfl_cfg, 'trigger_scale', 0.2)
+        ) if self.bad_pfl_cfg is not None else 0.2
+        self.bad_pfl_trigger_max_norm = float(
+            getattr(self.bad_pfl_cfg, 'trigger_max_norm', 1.0)
+        ) if self.bad_pfl_cfg is not None else 1.0
+        self.bad_pfl_disruptive_eps = float(
+            getattr(self.bad_pfl_cfg, 'disruptive_eps', 0.2)
+        ) if self.bad_pfl_cfg is not None else 0.2
+        self.bad_pfl_disruptive_alpha = float(
+            getattr(self.bad_pfl_cfg, 'disruptive_alpha', 0.2)
+        ) if self.bad_pfl_cfg is not None else 0.2
+        self.bad_pfl_disruptive_steps = int(
+            getattr(self.bad_pfl_cfg, 'disruptive_steps', 1)
+        ) if self.bad_pfl_cfg is not None else 1
+        self.bad_pfl_target_feature_blend = float(
+            getattr(self.bad_pfl_cfg, 'target_feature_blend', 0.0)
+        ) if self.bad_pfl_cfg is not None else 0.0
+        self.bad_pfl_use_shared_target_reference = bool(
+            getattr(self.bad_pfl_cfg, 'use_shared_target_reference', True)
+        ) if self.bad_pfl_cfg is not None else True
+        self.bad_pfl_force_attacker_participation = bool(
+            getattr(self.bad_pfl_cfg, 'force_attacker_participation', False)
+        ) if self.bad_pfl_cfg is not None else False
+        self.bad_pfl_eval_poison = bool(
+            getattr(self.bad_pfl_cfg, 'eval_poison', True)
+        ) if self.bad_pfl_cfg is not None else True
+        self.bad_pfl_generator = None
+        self.bad_pfl_shared_target_reference = None
 
         # MLP model for aggregation
         self.global_mlp = None
@@ -202,6 +260,262 @@ class GGEURServer(Server):
             'token', 'text', 'prompt', 'soft_prompt', 'auto'
         }
 
+    def _build_bad_pfl_generator(self):
+        if self.bad_pfl_generator is not None:
+            return self.bad_pfl_generator
+
+        input_dim = int(getattr(self.ggeur_cfg, 'embedding_dim', 0))
+        if input_dim <= 0:
+            return None
+
+        self.bad_pfl_generator = BadPFLFeatureGenerator(
+            input_dim=input_dim,
+            hidden_dim=self.bad_pfl_generator_hidden_dim,
+        ).to(self.device)
+        return self.bad_pfl_generator
+
+    def _serialize_bad_pfl_generator_state(self):
+        if self.bad_pfl_generator is None:
+            return None
+        return {
+            name: tensor.detach().cpu().numpy().astype(np.float32)
+            for name, tensor in self.bad_pfl_generator.state_dict().items()
+        }
+
+    def _load_bad_pfl_generator_state(self, state_dict):
+        if not isinstance(state_dict, dict):
+            return
+
+        generator = self._build_bad_pfl_generator()
+        if generator is None:
+            return
+
+        loaded_state = {}
+        for name, tensor in generator.state_dict().items():
+            value = state_dict.get(name, None)
+            if value is None:
+                loaded_state[name] = tensor
+                continue
+            if isinstance(value, torch.Tensor):
+                loaded_state[name] = value.to(self.device, dtype=tensor.dtype)
+            else:
+                loaded_state[name] = torch.tensor(
+                    value, device=self.device, dtype=tensor.dtype)
+        generator.load_state_dict(loaded_state, strict=False)
+
+    def _maybe_init_bad_pfl_generator(self):
+        if not self.use_bad_pfl:
+            return
+        if self.bad_pfl_generator is not None:
+            return
+
+        generator = self._build_bad_pfl_generator()
+        if generator is None:
+            return
+
+        rng = np.random.RandomState(int(getattr(self._cfg, 'seed', 0)) + 4096)
+        with torch.no_grad():
+            for param in generator.parameters():
+                init_value = rng.normal(
+                    loc=0.0,
+                    scale=0.02,
+                    size=tuple(param.shape),
+                ).astype(np.float32)
+                param.copy_(torch.from_numpy(init_value).to(self.device))
+        generator.eval()
+
+    def _project_bad_pfl_trigger(self, trigger_delta):
+        if trigger_delta is None:
+            return None
+
+        max_norm = float(self.bad_pfl_trigger_max_norm)
+        if max_norm <= 0:
+            return trigger_delta
+
+        if trigger_delta.dim() == 1:
+            trigger_delta = trigger_delta.unsqueeze(0)
+
+        norms = torch.norm(trigger_delta, p=2, dim=1, keepdim=True)
+        scale = torch.clamp(max_norm / (norms + 1e-12), max=1.0)
+        return trigger_delta * scale
+
+    def _resolve_bad_pfl_target_reference(self, features=None, labels=None):
+        if self.bad_pfl_use_shared_target_reference and \
+                self.bad_pfl_shared_target_reference is not None:
+            return self.bad_pfl_shared_target_reference
+        if features is None or labels is None or self.bad_pfl_target_label < 0:
+            return None
+
+        if isinstance(labels, torch.Tensor):
+            mask = labels == int(self.bad_pfl_target_label)
+            if not bool(mask.any()):
+                return None
+            if isinstance(features, torch.Tensor):
+                target_features = features[mask].detach().to(self.device)
+            else:
+                target_features = torch.tensor(
+                    np.asarray(features)[mask.detach().cpu().numpy()],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+        else:
+            labels_np = np.asarray(labels)
+            mask = labels_np == int(self.bad_pfl_target_label)
+            if not np.any(mask):
+                return None
+            target_features = torch.tensor(
+                np.asarray(features)[mask],
+                device=self.device,
+                dtype=torch.float32,
+            )
+
+        if target_features.numel() == 0:
+            return None
+        return target_features.mean(dim=0).detach()
+
+    def _compute_bad_pfl_target_shift(self, features, target_reference):
+        if features is None:
+            return None
+
+        blend = float(self.bad_pfl_target_feature_blend)
+        if target_reference is None or blend <= 0:
+            return torch.zeros_like(features)
+
+        if not isinstance(target_reference, torch.Tensor):
+            target_reference = torch.tensor(
+                target_reference, device=self.device, dtype=features.dtype)
+        else:
+            target_reference = target_reference.to(
+                self.device, dtype=features.dtype)
+
+        if target_reference.dim() == 1:
+            target_reference = target_reference.unsqueeze(0).expand(
+                features.size(0), -1)
+
+        return self._project_bad_pfl_trigger(
+            blend * (target_reference - features))
+
+    def _compute_bad_pfl_disruptive_noise(self, features, labels):
+        if features is None:
+            return None
+        if self.global_mlp is None or labels is None:
+            return torch.zeros_like(features)
+
+        eps = float(self.bad_pfl_disruptive_eps)
+        steps = max(int(self.bad_pfl_disruptive_steps), 0)
+        if eps <= 0 or steps <= 0 or features.numel() == 0:
+            return torch.zeros_like(features)
+
+        alpha = float(self.bad_pfl_disruptive_alpha)
+        if alpha <= 0:
+            alpha = eps / float(steps)
+
+        noise = torch.zeros_like(features)
+        was_training = bool(self.global_mlp.training)
+        dropout_training = None
+        if hasattr(self.global_mlp, 'dropout'):
+            dropout_training = bool(self.global_mlp.dropout.training)
+        self.global_mlp.train()
+        if hasattr(self.global_mlp, 'dropout'):
+            self.global_mlp.dropout.eval()
+
+        for _ in range(steps):
+            adv_features = (features.detach() + noise).clone()
+            adv_features.requires_grad_(True)
+            outputs = self.global_mlp(adv_features)
+            loss = F.cross_entropy(outputs, labels)
+            grad = torch.autograd.grad(
+                loss,
+                adv_features,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+            noise = noise.detach() + alpha * torch.sign(grad.detach())
+            noise = torch.clamp(noise, min=-eps, max=eps)
+
+        if not was_training:
+            self.global_mlp.eval()
+        if dropout_training is not None:
+            if dropout_training:
+                self.global_mlp.dropout.train()
+            else:
+                self.global_mlp.dropout.eval()
+
+        return noise.detach()
+
+    def _build_bad_pfl_payload(self, client_id):
+        if not self.use_bad_pfl:
+            return {'enabled': False}
+
+        self._maybe_init_bad_pfl_generator()
+        target_reference = None
+        if self.bad_pfl_shared_target_reference is not None:
+            target_reference = self.bad_pfl_shared_target_reference.detach().cpu(
+            ).numpy().astype(np.float32)
+        return {
+            'enabled': True,
+            'active': bool(
+                client_id in self.bad_pfl_attacker_ids and
+                self.state >= self.bad_pfl_start_round and
+                self.bad_pfl_target_label >= 0
+            ),
+            'generator_state': self._serialize_bad_pfl_generator_state(),
+            'target_reference': target_reference,
+        }
+
+    def _update_bad_pfl_states(self, valid_msgs):
+        if not self.use_bad_pfl:
+            return
+
+        self._maybe_init_bad_pfl_generator()
+        if self.bad_pfl_generator is None:
+            return
+
+        received_states = []
+        received_target_references = []
+        for _, model_para, sender in valid_msgs:
+            if int(sender) not in self.bad_pfl_attacker_ids:
+                continue
+            if not isinstance(model_para, dict):
+                continue
+            generator_state = model_para.get('bad_pfl_generator', None)
+            if isinstance(generator_state, dict):
+                received_states.append(generator_state)
+            target_reference = model_para.get('bad_pfl_target_reference', None)
+            if target_reference is not None:
+                if isinstance(target_reference, torch.Tensor):
+                    target_reference = target_reference.detach().cpu().numpy()
+                received_target_references.append(
+                    np.asarray(target_reference, dtype=np.float32))
+
+        if not received_states:
+            return
+
+        averaged_state = {}
+        for name in self.bad_pfl_generator.state_dict().keys():
+            parts = []
+            for state in received_states:
+                value = state.get(name, None)
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().cpu().numpy()
+                parts.append(np.asarray(value, dtype=np.float32))
+            if parts:
+                averaged_state[name] = np.mean(
+                    np.stack(parts, axis=0), axis=0).astype(np.float32)
+
+        if averaged_state:
+            self._load_bad_pfl_generator_state(averaged_state)
+            self.bad_pfl_generator.eval()
+        if received_target_references:
+            averaged_reference = np.mean(
+                np.stack(received_target_references, axis=0),
+                axis=0,
+            ).astype(np.float32)
+            self.bad_pfl_shared_target_reference = torch.tensor(
+                averaged_reference, device=self.device, dtype=torch.float32)
+
     def _resolve_cerp_trigger_token_ids(self):
         if not self._use_cerp_token_trigger():
             return None
@@ -222,7 +536,8 @@ class GGEURServer(Server):
                 fallback_text, add_special_tokens=False)
         if not token_ids:
             raise ValueError(
-                f'Server: failed to tokenize CerP trigger text '
+                f'Server: failed to tokenize {self.cerp_method_name} trigger '
+                f'text '
                 f'`{trigger_text}`.')
 
         self._cerp_trigger_token_ids = torch.tensor(
@@ -270,7 +585,8 @@ class GGEURServer(Server):
                 delta = trigger_delta.to(self.device)
                 if delta.dim() != 2 or delta.shape[0] != prompt_len:
                     raise ValueError(
-                        f'Server: invalid CerP token trigger shape '
+                        f'Server: invalid {self.cerp_method_name} token '
+                        f'trigger shape '
                         f'{tuple(delta.shape)}, expected ({prompt_len}, H).')
                 prompt_embeds = prompt_embeds + \
                     delta.unsqueeze(0).expand(batch_size, -1, -1)
@@ -441,6 +757,10 @@ class GGEURServer(Server):
         force_attackers = bool(
             self.use_cerp and self.cerp_force_attacker_participation and
             self.state >= self.cerp_start_round and self.cerp_target_label >= 0)
+        if self.use_bad_pfl and self.bad_pfl_force_attacker_participation and \
+                self.state >= self.bad_pfl_start_round and \
+                self.bad_pfl_target_label >= 0:
+            force_attackers = True
 
         if not force_attackers:
             return np.random.choice(available_clients,
@@ -451,6 +771,9 @@ class GGEURServer(Server):
             client_id for client_id in self.cerp_attacker_ids
             if client_id in available_clients
         ]
+        for client_id in self.bad_pfl_attacker_ids:
+            if client_id in available_clients and client_id not in forced_clients:
+                forced_clients.append(client_id)
         forced_clients = forced_clients[:min(len(forced_clients),
                                              sample_client_num)]
         remaining_num = sample_client_num - len(forced_clients)
@@ -473,6 +796,257 @@ class GGEURServer(Server):
         if isinstance(model_para, dict) and 'mlp' in model_para:
             return model_para.get('mlp')
         return model_para
+
+    @staticmethod
+    def _state_dict_to_vector(state_dict):
+        if not isinstance(state_dict, dict):
+            return None
+
+        parts = []
+        for name in sorted(state_dict.keys()):
+            value = state_dict.get(name, None)
+            if value is None:
+                continue
+            try:
+                if isinstance(value, torch.Tensor):
+                    tensor = value.detach().cpu().float().reshape(-1)
+                else:
+                    tensor = torch.as_tensor(value).detach().cpu().float(
+                    ).reshape(-1)
+            except Exception:
+                continue
+            if tensor.numel() > 0:
+                parts.append(tensor)
+
+        if not parts:
+            return None
+        return torch.cat(parts, dim=0)
+
+    @staticmethod
+    def _vector_distance(vec_a, vec_b):
+        if vec_a is None or vec_b is None:
+            return None
+        if int(vec_a.numel()) != int(vec_b.numel()):
+            return None
+
+        diff = vec_a - vec_b
+        l2_distance = float(torch.norm(diff, p=2).item())
+        cosine_distance = float(
+            1.0 - F.cosine_similarity(
+                vec_a, vec_b, dim=0, eps=1e-12).item())
+        return l2_distance, cosine_distance
+
+    def _log_cerp_attack_statistics(self, valid_msgs, round_idx):
+        if not self.use_cerp:
+            return
+        if round_idx < self.cerp_start_round or self.cerp_target_label < 0:
+            return
+
+        attacker_ids = set(int(client_id) for client_id in self.cerp_attacker_ids)
+        if not attacker_ids:
+            return
+
+        sample_l2_sum = 0.0
+        sample_cosine_sum = 0.0
+        sample_count = 0
+        gen_gen_l2_sum = 0.0
+        gen_gen_cosine_sum = 0.0
+        gen_gen_count = 0
+        orig_gen_l2_sum = 0.0
+        orig_gen_cosine_sum = 0.0
+        orig_gen_count = 0
+        sample_attackers = set()
+        model_orig_gen_l2_sum = 0.0
+        model_orig_gen_cosine_sum = 0.0
+        model_orig_gen_count = 0
+        model_orig_gen_attackers = set()
+
+        client_vectors = {}
+        for _, model_para, sender in valid_msgs:
+            sender = int(sender)
+
+            state_dict = self._extract_mlp_state_from_payload(model_para)
+            vector = self._state_dict_to_vector(state_dict)
+            if vector is not None:
+                client_vectors[sender] = vector
+
+            if sender not in attacker_ids or not isinstance(model_para, dict):
+                continue
+
+            stats = model_para.get('cerp_sample_distance_stats', None)
+            if isinstance(stats, dict):
+                try:
+                    count = int(stats.get('count', 0) or 0)
+                    l2_sum = float(stats.get('l2_sum', 0.0) or 0.0)
+                    cosine_sum = float(stats.get(
+                        'cosine_sum', 0.0) or 0.0)
+                    client_gen_gen_count = int(
+                        stats.get('gen_gen_count', 0) or 0)
+                    client_gen_gen_l2_sum = float(
+                        stats.get('gen_gen_l2_sum', 0.0) or 0.0)
+                    client_gen_gen_cosine_sum = float(
+                        stats.get('gen_gen_cosine_sum', 0.0) or 0.0)
+                    client_orig_gen_count = int(
+                        stats.get('orig_gen_count', 0) or 0)
+                    client_orig_gen_l2_sum = float(
+                        stats.get('orig_gen_l2_sum', 0.0) or 0.0)
+                    client_orig_gen_cosine_sum = float(
+                        stats.get('orig_gen_cosine_sum', 0.0) or 0.0)
+                except Exception:
+                    count = 0
+                    client_gen_gen_count = 0
+                    client_orig_gen_count = 0
+                    l2_sum = 0.0
+                    cosine_sum = 0.0
+                    client_gen_gen_l2_sum = 0.0
+                    client_gen_gen_cosine_sum = 0.0
+                    client_orig_gen_l2_sum = 0.0
+                    client_orig_gen_cosine_sum = 0.0
+
+                if count > 0:
+                    sample_l2_sum += l2_sum
+                    sample_cosine_sum += cosine_sum
+                    sample_count += count
+                    sample_attackers.add(sender)
+                if client_gen_gen_count > 0:
+                    gen_gen_l2_sum += client_gen_gen_l2_sum
+                    gen_gen_cosine_sum += client_gen_gen_cosine_sum
+                    gen_gen_count += client_gen_gen_count
+                    sample_attackers.add(sender)
+                if client_orig_gen_count > 0:
+                    orig_gen_l2_sum += client_orig_gen_l2_sum
+                    orig_gen_cosine_sum += client_orig_gen_cosine_sum
+                    orig_gen_count += client_orig_gen_count
+                    sample_attackers.add(sender)
+
+            model_stats = model_para.get('cerp_model_distance_stats', None)
+            if isinstance(model_stats, dict):
+                try:
+                    client_model_orig_gen_count = int(
+                        model_stats.get('orig_gen_count', 0) or 0)
+                    client_model_orig_gen_l2_sum = float(
+                        model_stats.get('orig_gen_l2_sum', 0.0) or 0.0)
+                    client_model_orig_gen_cosine_sum = float(
+                        model_stats.get('orig_gen_cosine_sum', 0.0) or 0.0)
+                except Exception:
+                    client_model_orig_gen_count = 0
+                    client_model_orig_gen_l2_sum = 0.0
+                    client_model_orig_gen_cosine_sum = 0.0
+                if client_model_orig_gen_count > 0:
+                    model_orig_gen_l2_sum += client_model_orig_gen_l2_sum
+                    model_orig_gen_cosine_sum += \
+                        client_model_orig_gen_cosine_sum
+                    model_orig_gen_count += client_model_orig_gen_count
+                    model_orig_gen_attackers.add(sender)
+
+        if sample_count > 0:
+            logger.info(
+                f"Server: Round {round_idx} {self.cerp_method_name} "
+                f"attack-generated sample distance - "
+                f"l2={sample_l2_sum / sample_count:.6f}, "
+                f"cosine={sample_cosine_sum / sample_count:.6f}, "
+                f"samples={sample_count}, "
+                f"attackers={sorted(sample_attackers)}")
+        if gen_gen_count > 0:
+            logger.info(
+                f"Server: Round {round_idx} {self.cerp_method_name} "
+                f"generated-generated sample distance - "
+                f"l2={gen_gen_l2_sum / gen_gen_count:.6f}, "
+                f"cosine={gen_gen_cosine_sum / gen_gen_count:.6f}, "
+                f"pairs={gen_gen_count}, "
+                f"attackers={sorted(sample_attackers)}")
+        if orig_gen_count > 0:
+            logger.info(
+                f"Server: Round {round_idx} {self.cerp_method_name} "
+                f"original-generated sample distance - "
+                f"l2={orig_gen_l2_sum / orig_gen_count:.6f}, "
+                f"cosine={orig_gen_cosine_sum / orig_gen_count:.6f}, "
+                f"pairs={orig_gen_count}, "
+                f"attackers={sorted(sample_attackers)}")
+        if model_orig_gen_count > 0:
+            logger.info(
+                f"Server: Round {round_idx} {self.cerp_method_name} "
+                f"original-generated model distance - "
+                f"l2={model_orig_gen_l2_sum / model_orig_gen_count:.6f}, "
+                f"cosine="
+                f"{model_orig_gen_cosine_sum / model_orig_gen_count:.6f}, "
+                f"models={model_orig_gen_count}, "
+                f"attackers={sorted(model_orig_gen_attackers)}")
+
+        attacker_vectors = {
+            client_id: vector
+            for client_id, vector in client_vectors.items()
+            if client_id in attacker_ids
+        }
+        if not attacker_vectors or len(client_vectors) <= 1:
+            return
+
+        attacker_model_l2_sum = 0.0
+        attacker_model_cosine_sum = 0.0
+        attacker_model_pairs = 0
+        attacker_vector_ids = sorted(attacker_vectors.keys())
+        for idx, attacker_id in enumerate(attacker_vector_ids):
+            for other_id in attacker_vector_ids[idx + 1:]:
+                distances = self._vector_distance(
+                    attacker_vectors[attacker_id],
+                    attacker_vectors[other_id],
+                )
+                if distances is None:
+                    continue
+                l2_distance, cosine_distance = distances
+                attacker_model_l2_sum += l2_distance
+                attacker_model_cosine_sum += cosine_distance
+                attacker_model_pairs += 1
+
+        if attacker_model_pairs > 0:
+            logger.info(
+                f"Server: Round {round_idx} {self.cerp_method_name} "
+                f"generated-generated model distance - "
+                f"l2={attacker_model_l2_sum / attacker_model_pairs:.6f}, "
+                f"cosine="
+                f"{attacker_model_cosine_sum / attacker_model_pairs:.6f}, "
+                f"pairs={attacker_model_pairs}, "
+                f"attackers={attacker_vector_ids}")
+
+        all_l2_sum = 0.0
+        all_cosine_sum = 0.0
+        all_pairs = 0
+        benign_l2_sum = 0.0
+        benign_cosine_sum = 0.0
+        benign_pairs = 0
+
+        for attacker_id, attacker_vector in attacker_vectors.items():
+            for other_id, other_vector in client_vectors.items():
+                if int(other_id) == int(attacker_id):
+                    continue
+                distances = self._vector_distance(attacker_vector,
+                                                  other_vector)
+                if distances is None:
+                    continue
+                l2_distance, cosine_distance = distances
+                all_l2_sum += l2_distance
+                all_cosine_sum += cosine_distance
+                all_pairs += 1
+                if int(other_id) not in attacker_ids:
+                    benign_l2_sum += l2_distance
+                    benign_cosine_sum += cosine_distance
+                    benign_pairs += 1
+
+        if all_pairs <= 0:
+            return
+
+        msg = (
+            f"Server: Round {round_idx} {self.cerp_method_name} "
+            f"attacker-client model distance - "
+            f"all_other_l2={all_l2_sum / all_pairs:.6f}, "
+            f"all_other_cosine={all_cosine_sum / all_pairs:.6f}, "
+            f"all_other_pairs={all_pairs}")
+        if benign_pairs > 0:
+            msg += (
+                f", benign_l2={benign_l2_sum / benign_pairs:.6f}, "
+                f"benign_cosine={benign_cosine_sum / benign_pairs:.6f}, "
+                f"benign_pairs={benign_pairs}")
+        logger.info(msg)
 
     def _update_cerp_states(self, valid_msgs):
         if not self.use_cerp:
@@ -1381,6 +1955,73 @@ class GGEURServer(Server):
                 results['average'] = sum(results.values()) / len(results)
             return results
 
+        if self.use_bad_pfl:
+            if not self.bad_pfl_eval_poison or self.bad_pfl_target_label < 0:
+                return {}
+            if not self.test_data_loaded:
+                self._load_test_data_and_features()
+            if not self.test_features:
+                return {}
+
+            self._maybe_init_bad_pfl_generator()
+            if self.bad_pfl_generator is None:
+                return {}
+
+            self.global_mlp.eval()
+            self.bad_pfl_generator.eval()
+            results = {}
+            batch_size = int(getattr(self.ggeur_cfg, 'bert_batch_size', 32))
+            if batch_size <= 0:
+                batch_size = 32
+
+            for domain, features in self.test_features.items():
+                labels = self.test_labels.get(domain, None)
+                if labels is None or len(labels) == 0:
+                    continue
+                target_reference = self._resolve_bad_pfl_target_reference(
+                    features, labels)
+
+                mask = labels != self.bad_pfl_target_label
+                if not np.any(mask):
+                    continue
+
+                domain_features = torch.from_numpy(
+                    features[mask]).float().to(self.device)
+                domain_labels = torch.from_numpy(
+                    labels[mask]).long().to(self.device)
+
+                poison_predictions = []
+                for start in range(0, domain_features.size(0), batch_size):
+                    batch_features = domain_features[start:start + batch_size]
+                    batch_labels = domain_labels[start:start + batch_size]
+                    disruptive = self._compute_bad_pfl_disruptive_noise(
+                        batch_features, batch_labels)
+                    trigger_delta = self.bad_pfl_trigger_scale * \
+                        self.bad_pfl_generator(batch_features)
+                    trigger_delta = trigger_delta + \
+                        self._compute_bad_pfl_target_shift(
+                            batch_features, target_reference)
+                    trigger_delta = self._project_bad_pfl_trigger(
+                        trigger_delta)
+                    poison_features = batch_features + disruptive + \
+                        trigger_delta
+                    outputs = self.global_mlp(poison_features)
+                    poison_predictions.append(
+                        torch.argmax(outputs, dim=1).detach().cpu())
+
+                if not poison_predictions:
+                    continue
+
+                predicted = torch.cat(poison_predictions, dim=0)
+                target_tensor = torch.full_like(
+                    predicted, fill_value=int(self.bad_pfl_target_label))
+                asr = (predicted == target_tensor).float().mean().item()
+                results[domain] = asr
+
+            if results:
+                results['average'] = sum(results.values()) / len(results)
+            return results
+
         if not self.use_cerp or not self.cerp_eval_poison:
             return {}
         if self.cerp_shared_trigger is None or self.cerp_target_label < 0:
@@ -1505,6 +2146,8 @@ class GGEURServer(Server):
                     self._build_global_cnn(num_classes)
                 if self.use_cerp:
                     self._maybe_init_cerp_trigger()
+                if self.use_bad_pfl:
+                    self._maybe_init_bad_pfl_generator()
 
             # Broadcast global covariances to all clients
             self._broadcast_global_covariances(other_prototypes)
@@ -1569,6 +2212,7 @@ class GGEURServer(Server):
         self.current_training_clients = list(receiver)
 
         active_attacker_ids = set(self.cerp_attacker_ids)
+        active_attacker_ids.update(self.bad_pfl_attacker_ids)
         active_attacker_ids.update(self.backdoor_attacker_ids)
         selected_attackers = [
             client_id for client_id in receiver
@@ -1584,11 +2228,20 @@ class GGEURServer(Server):
             if self.use_cerp:
                 cerp_payload = self._build_cerp_payload(client_id)
                 if isinstance(payload, dict):
-                    payload['cerp'] = cerp_payload
+                    payload[self.cerp_payload_key] = cerp_payload
                 else:
                     payload = {
                         'mlp': payload,
-                        'cerp': cerp_payload,
+                        self.cerp_payload_key: cerp_payload,
+                    }
+            if self.use_bad_pfl:
+                bad_pfl_payload = self._build_bad_pfl_payload(client_id)
+                if isinstance(payload, dict):
+                    payload['bad_pfl'] = bad_pfl_payload
+                else:
+                    payload = {
+                        'mlp': payload,
+                        'bad_pfl': bad_pfl_payload,
                     }
 
             self.comm_manager.send(
@@ -1936,6 +2589,9 @@ class GGEURServer(Server):
                 self._aggregate_fedproto_prototypes(valid_params)
             if self.use_cerp:
                 self._update_cerp_states(valid_msgs)
+                self._log_cerp_attack_statistics(valid_msgs, round_idx)
+            if self.use_bad_pfl:
+                self._update_bad_pfl_states(valid_msgs)
 
             # Evaluate MLP on test sets (using CLIP features)
             test_results = self._evaluate_on_test_sets()
@@ -1947,7 +2603,8 @@ class GGEURServer(Server):
             if poison_results:
                 asr_str = ', '.join(
                     [f"{k}: {v:.4f}" for k, v in poison_results.items()])
-                attack_name = 'CerP' if self.use_cerp else 'Backdoor'
+                attack_name = 'Bad-PFL' if self.use_bad_pfl else \
+                    self.cerp_method_name if self.use_cerp else 'Backdoor'
                 logger.info(
                     f"Server: Round {round_idx} {attack_name} Poison ASR - "
                     f"{asr_str}")

@@ -21,8 +21,9 @@ def wrap_attacker_trainer(base_trainer, config):
     elif config.attack.attack_method.lower() == 'gaussian_noise':
         from federatedscope.attack.trainer import wrap_GaussianAttackTrainer
         return wrap_GaussianAttackTrainer(base_trainer)
-    elif config.attack.attack_method.lower() == 'cerp':
-        # CerP for GGEUR is implemented inside the custom client/server
+    elif config.attack.attack_method.lower() in ['cerp', 'pfedba', 'bad_pfl']:
+        # CerP/PFedBA/Bad-PFL for GGEUR are implemented inside the custom
+        # client/server
         # workflow, so the generic attack trainer should remain unchanged.
         return base_trainer
     else:

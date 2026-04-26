@@ -1,0 +1,86 @@
+# Small smoke config for validating GGEUR + Bad-PFL on data/sentiment
+use_gpu: False
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 4
+  total_round_num: 2
+  sample_client_num: 4
+
+data:
+  type: 'mdsent'
+  root: 'data/sentiment'
+  splits: [0.8, 0, 0.2]
+  dirichlet_alpha: 0.0
+  args:
+    - include_unlabeled: True
+      balance_test: False
+      max_samples_per_domain: 40
+      seed: 42
+      use_cache: True
+
+dataloader:
+  batch_size: 8
+  num_workers: 0
+
+model:
+  type: 'ggeur_lstm'
+  num_classes: 4
+  in_channels: 768
+  hidden: 64
+  layer: 1
+  dropout: 0.1
+
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 0.01
+
+ggeur:
+  use: True
+  feature_extractor: 'bert'
+  bert_model_path: 'pretrained_models/nlptown_bert_base_multilingual_uncased_senti'
+  bert_tokenizer_path: ''
+  bert_max_length: 128
+  bert_pooling: 'cls'
+  bert_batch_size: 8
+  bert_local_files_only: True
+  bert_use_pretrained_weights: True
+  embedding_dim: 768
+  use_feature_cache: True
+  feature_cache_dir: ''
+  num_generated_per_sample: 2
+  num_generated_per_prototype: 2
+  target_size_per_class: 4
+  use_cross_client_prototypes: True
+  statistics_round: 0
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+attack:
+  attack_method: 'bad_pfl'
+  attacker_id: [1]
+  poison_ratio: 0.25
+  target_label_ind: 3
+  label_type: 'dirty'
+  bad_pfl:
+    start_round: 1
+    generator_hidden_dim: 128
+    generator_lr: 1e-3
+    generator_steps: 1
+    generator_tune_batches: 2
+    trigger_scale: 0.1
+    trigger_max_norm: 0.5
+    disruptive_eps: 0.1
+    disruptive_alpha: 0.1
+    disruptive_steps: 1
+    lambda_trigger_reg: 0.0
+    eval_poison: True
+
+outdir: 'exp/ggeur_bad_pfl_smoke'
+expname: 'ggeur_mdsent_lstm_bad_pfl_smoke'
