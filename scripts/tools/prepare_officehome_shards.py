@@ -14,10 +14,13 @@ import os
 import os.path as osp
 import random
 import shutil
+import sys
 from collections import Counter
 from typing import Dict, List, Tuple
 
 import numpy as np
+
+DOMAINS = ['Art', 'Clipart', 'Product', 'Real World']
 
 
 def parse_args():
@@ -42,6 +45,11 @@ def parse_args():
                         type=int,
                         default=42,
                         help='Random seed for LDS')
+    parser.add_argument('--min-samples-per-client',
+                        type=int,
+                        default=32,
+                        help='Minimum number of training samples each client '
+                        'must receive after domain-internal split')
     parser.add_argument(
         '--splits',
         nargs=3,
@@ -57,6 +65,28 @@ def parse_args():
                         action='store_true',
                         help='Overwrite existing shards')
     return parser.parse_args()
+
+
+def validate_args(args):
+    if args.clients <= 0:
+        raise ValueError('--clients must be positive')
+
+    if args.min_samples_per_client <= 0:
+        raise ValueError('--min-samples-per-client must be positive')
+
+    if len(args.splits) != 3:
+        raise ValueError('--splits must contain train/val/test ratios')
+
+    split_sum = sum(args.splits)
+    if not np.isclose(split_sum, 1.0):
+        raise ValueError(f'--splits must sum to 1.0, but got {args.splits} '
+                         f'(sum={split_sum:.6f})')
+
+    num_domains = len(DOMAINS)
+    if args.clients % num_domains != 0:
+        raise ValueError(
+            f'--clients must be divisible by the number of domains '
+            f'({num_domains}), but got {args.clients}')
 
 
 def load_office_home_data(root: str,
@@ -218,13 +248,90 @@ def apply_lds(split_data: Dict, num_clients_per_domain: int, alpha: float,
     return result
 
 
+def split_uniformly(split_data: Dict, num_clients_per_domain: int,
+                    seed: int) -> List[Tuple[List[str], List[int]]]:
+    """Uniformly split one domain's train set into multiple clients."""
+    train_paths, train_labels = split_data['train']
+    if len(train_paths) == 0:
+        return [([], []) for _ in range(num_clients_per_domain)]
+
+    np.random.seed(seed)
+    indices = np.random.permutation(len(train_paths))
+    splits = np.array_split(indices, num_clients_per_domain)
+    return [([train_paths[i] for i in split], [train_labels[i] for i in split])
+            for split in splits]
+
+
+def enforce_min_samples_per_client(
+        client_train_data: List[Tuple[List[str],
+                                      List[int]]], min_samples_per_client: int,
+        domain: str) -> List[Tuple[List[str], List[int]]]:
+    """
+    Ensure each client receives at least ``min_samples_per_client`` samples.
+
+    The repair strategy is intentionally simple:
+    - move samples from the currently largest shard to the smallest shard
+    - fail fast if the total sample count cannot satisfy the constraint
+    """
+    total_samples = sum(len(paths) for paths, _ in client_train_data)
+    required_samples = len(client_train_data) * min_samples_per_client
+
+    if total_samples < required_samples:
+        raise ValueError(
+            f"Domain '{domain}' has only {total_samples} train samples, "
+            f'which cannot satisfy min_samples_per_client='
+            f'{min_samples_per_client} for {len(client_train_data)} clients')
+
+    repaired = [(list(paths), list(labels))
+                for paths, labels in client_train_data]
+
+    def _sizes():
+        return [len(paths) for paths, _ in repaired]
+
+    while True:
+        sizes = _sizes()
+        min_size = min(sizes)
+        if min_size >= min_samples_per_client:
+            break
+
+        receiver_idx = sizes.index(min_size)
+        donor_idx = sizes.index(max(sizes))
+
+        if receiver_idx == donor_idx or sizes[
+                donor_idx] <= min_samples_per_client:
+            raise ValueError(
+                f"Unable to rebalance domain '{domain}' to satisfy "
+                f'min_samples_per_client={min_samples_per_client}. '
+                f'Current shard sizes: {sizes}')
+
+        donor_paths, donor_labels = repaired[donor_idx]
+        receiver_paths, receiver_labels = repaired[receiver_idx]
+
+        move_count = min(min_samples_per_client - len(receiver_paths),
+                         len(donor_paths) - min_samples_per_client)
+        if move_count <= 0:
+            raise ValueError(
+                f"Unable to continue rebalancing domain '{domain}'. "
+                f'Current shard sizes: {sizes}')
+
+        move_indices = random.sample(range(len(donor_paths)), move_count)
+        move_indices.sort(reverse=True)
+
+        for idx in move_indices:
+            receiver_paths.append(donor_paths.pop(idx))
+            receiver_labels.append(donor_labels.pop(idx))
+
+    return repaired
+
+
 def build_label_hist(labels: List[int]) -> Dict[str, int]:
     """Build label histogram"""
     counter = Counter(labels)
     return {str(k): v for k, v in sorted(counter.items())}
 
 
-def save_shard(output_dir: str, split_data: Dict, client_train_data: Tuple):
+def save_shard(output_dir: str, split_data: Dict, client_train_data: Tuple,
+               domain: str):
     """
     Save shard data to JSON files.
     
@@ -268,6 +375,7 @@ def save_shard(output_dir: str, split_data: Dict, client_train_data: Tuple):
 
     # Save metadata
     meta = {
+        'domain': domain,
         'num_samples': {
             'train': len(train_paths),
             'val': len(val_paths),
@@ -289,6 +397,9 @@ def create_manifest(manifest_path: str, args, client_metas: Dict[int, Dict]):
         'root': osp.abspath(args.root),
         'seed': args.lds_seed,
         'lds_alpha': args.lds_alpha if args.lds_alpha > 0 else None,
+        'clients_per_domain': args.clients // len(DOMAINS),
+        'domains': DOMAINS,
+        'min_samples_per_client': args.min_samples_per_client,
         'splits': args.splits,
         'total_clients': args.clients,
         'clients': []
@@ -298,6 +409,7 @@ def create_manifest(manifest_path: str, args, client_metas: Dict[int, Dict]):
         meta = client_metas[client_id]
         manifest['clients'].append({
             'client_id': client_id,
+            'domain': meta['domain'],
             'shard_path': meta['shard_path'],
             'num_samples': meta['num_samples'],
             'label_hist': meta['label_hist']
@@ -311,17 +423,15 @@ def create_manifest(manifest_path: str, args, client_metas: Dict[int, Dict]):
 
 def main():
     args = parse_args()
+    try:
+        validate_args(args)
+    except ValueError as error:
+        print(f'Error: {error}', file=sys.stderr)
+        sys.exit(1)
 
     # Validate arguments
-    domains = ['Art', 'Clipart', 'Product', 'Real World']
+    domains = DOMAINS
     num_domains = len(domains)
-
-    if args.clients % num_domains != 0:
-        print(
-            f'Warning: clients ({args.clients}) not divisible by {num_domains} domains'
-        )
-        print(f'Adjusting to {num_domains} clients (1 per domain)')
-        args.clients = num_domains
 
     clients_per_domain = args.clients // num_domains
     use_lds = args.lds_alpha > 0
@@ -331,6 +441,7 @@ def main():
     print(f'Root: {args.root}')
     print(f'Output: {args.output}')
     print(f'Clients: {args.clients} ({clients_per_domain} per domain)')
+    print(f'Min samples/client: {args.min_samples_per_client}')
     print(
         f'Splits: train={args.splits[0]}, val={args.splits[1]}, test={args.splits[2]}'
     )
@@ -387,21 +498,27 @@ def main():
                 split_data_dict, clients_per_domain, args.lds_alpha,
                 args.lds_seed + domains.index(domain))
         else:
-            # Uniform split
-            train_paths, train_labels = split_data_dict['train']
-            indices = np.random.permutation(len(train_paths))
-            splits = np.array_split(indices, clients_per_domain)
-            client_train_data = [([train_paths[i] for i in split],
-                                  [train_labels[i] for i in split])
-                                 for split in splits]
+            client_train_data = split_uniformly(
+                split_data_dict, clients_per_domain,
+                args.lds_seed + domains.index(domain))
+
+        try:
+            client_train_data = enforce_min_samples_per_client(
+                client_train_data, args.min_samples_per_client, domain)
+        except ValueError as error:
+            print(f'Error: {error}', file=sys.stderr)
+            sys.exit(1)
+        shard_sizes = [len(paths) for paths, _ in client_train_data]
+        print(f'Final per-client train sizes for {domain}: {shard_sizes}')
 
         # Save shards for this domain
         for i, train_data in enumerate(client_train_data):
             shard_dir = osp.join(args.output, f'client_{client_id}')
 
-            meta = save_shard(shard_dir, split_data_dict, train_data)
+            meta = save_shard(shard_dir, split_data_dict, train_data, domain)
             # Create full metadata dict
             full_meta = {
+                'domain': domain,
                 'shard_path': osp.abspath(shard_dir),
                 'num_samples': meta['num_samples'],
                 'label_hist': meta['label_hist']
@@ -409,8 +526,8 @@ def main():
             client_metas[client_id] = full_meta
 
             print(
-                f'  Client {client_id}: train={meta["num_samples"]["train"]} samples -> {shard_dir}'
-            )
+                f'  Client {client_id} ({domain}): '
+                f'train={meta["num_samples"]["train"]} samples -> {shard_dir}')
             client_id += 1
 
     # Create manifest
