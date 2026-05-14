@@ -119,6 +119,11 @@ class GGEURClient(Client):
     5. (Optional) End-to-end fine-tuning with CNN backbone
     """
 
+    # Shared CLIP model for PromptFL text encoding - loaded once, reused by all clients
+    _shared_prompt_clip = None        # open_clip model (CPU when idle, GPU during forward)
+    _shared_prompt_tokenizer = None
+    _shared_prompt_clip_name = None   # track which model is loaded
+
     def __init__(self, ID=-1, server_id=None, state=-1, config=None,
                  data=None, model=None, device='cpu', strategy=None,
                  is_unseen_client=False, *args, **kwargs):
@@ -172,6 +177,10 @@ class GGEURClient(Client):
         self.augmented_labels = None
         self.augmented_loader = None
 
+        # Real local features saved before augmentation (for PromptFL training)
+        self.real_local_features = {}
+        self.prompt_loader = None
+
         # MLP classifier
         self.mlp_classifier = None
 
@@ -222,6 +231,28 @@ class GGEURClient(Client):
             self._load_timm_extractor()
         else:
             self._load_clip_model()
+
+    def _unload_feature_extractor(self):
+        """Unload feature extractor from GPU to free VRAM after feature caching."""
+        unloaded = False
+        if self.clip_model is not None:
+            self.clip_model = self.clip_model.cpu()
+            del self.clip_model
+            self.clip_model = None
+            unloaded = True
+        if self.cnn_extractor is not None:
+            self.cnn_extractor = self.cnn_extractor.cpu()
+            del self.cnn_extractor
+            self.cnn_extractor = None
+            unloaded = True
+        if self.timm_extractor is not None:
+            self.timm_extractor = self.timm_extractor.cpu()
+            del self.timm_extractor
+            self.timm_extractor = None
+            unloaded = True
+        if unloaded:
+            torch.cuda.empty_cache()
+            logger.info(f"Client {self.ID}: Feature extractor unloaded from GPU")
 
     def _load_cnn_extractor(self):
         """Load CNN feature extractor"""
@@ -487,8 +518,9 @@ class GGEURClient(Client):
                 self._load_feature_extractor()
 
                 # Create a mini dataloader for samples to extract
-                batch_size = 32
-                with torch.no_grad():
+                batch_size = getattr(self.ggeur_cfg, 'extract_batch_size', 64)
+                use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction', True) and torch.cuda.is_available()
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_fp16):
                     for i in range(0, len(base_indices_to_extract), batch_size):
                         batch_base_indices = base_indices_to_extract[i:i + batch_size]
                         batch_paths = paths_to_extract[i:i + batch_size]
@@ -537,8 +569,10 @@ class GGEURClient(Client):
             logger.info(f"Client {self.ID}: Dataset does not have image paths, caching disabled")
             self._load_feature_extractor()
 
-            dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
-            with torch.no_grad():
+            use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction', True) and torch.cuda.is_available()
+            extract_batch_size = getattr(self.ggeur_cfg, 'extract_batch_size', 64)
+            dataloader = DataLoader(dataset, batch_size=extract_batch_size, shuffle=False)
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_fp16):
                 for batch in dataloader:
                     if len(batch) >= 2:
                         images, labels = batch[0], batch[1]
@@ -661,6 +695,10 @@ class GGEURClient(Client):
                 if hasattr(proto, 'shape'):
                     logger.info(f"  Class {cls}: shape={proto.shape}, mean={proto.mean():.4f}")
 
+        # Save real local features before augmentation clears them (for PromptFL)
+        if self.use_promptfl:
+            self.real_local_features = {k: v.copy() for k, v in self.local_features.items()}
+
         # Perform augmentation
         self._perform_augmentation()
 
@@ -670,6 +708,7 @@ class GGEURClient(Client):
         # Build PromptFL model if enabled
         if self.use_promptfl:
             self._build_prompt_model()
+            self._build_prompt_loader()
 
         # Build CNN based on mode
         if self.use_feature_alignment:
@@ -879,6 +918,10 @@ class GGEURClient(Client):
 
         self.augmentation_done = True
 
+        # Free raw features from memory - augmented_features/loader are all we need now
+        self.local_features = {}
+        self.local_labels = {}
+
     def _build_mlp_classifier(self):
         """Build MLP classifier for augmented features"""
         # IMPORTANT: Always use config's num_classes, not the unique labels in augmented data
@@ -933,6 +976,11 @@ class GGEURClient(Client):
             # Upload to server
             self._upload_local_statistics()
 
+            # Unload extractor to free VRAM (features are cached to disk)
+            if getattr(self.ggeur_cfg, 'unload_extractor_after_cache', True):
+                if not (self.use_cnn_distillation or self.use_feature_alignment):
+                    self._unload_feature_extractor()
+
             return  # Don't do normal training in this round
 
         # Wait for augmentation to complete
@@ -980,6 +1028,8 @@ class GGEURClient(Client):
                     ctx_tensor = prompt_para.get('ctx')
                     if ctx_tensor is not None:
                         self.prompt_learner.ctx.data = ctx_tensor.to(self.device)
+                        # Save global ctx for FedProx proximal term
+                        self.global_prompt_ctx = ctx_tensor.to(self.device).detach().clone()
                 except Exception as e:
                     logger.debug(f"Client {self.ID}: Could not load prompt ctx: {e}")
 
@@ -2046,66 +2096,172 @@ class GGEURClient(Client):
         return [f"class {i}" for i in range(num_classes)]
 
     def _build_prompt_model(self):
-        """Build CustomCLIP (open_clip-based) for PromptFL."""
+        """Build PromptFL components. CLIP backbone is shared across all clients
+        (class-level singleton) to avoid loading N copies into GPU memory."""
         import open_clip
-        from federatedscope.contrib.model.ggeur_prompt import CustomCLIP
+        from federatedscope.contrib.model.ggeur_prompt import PromptLearner, TextEncoder
 
         n_ctx = getattr(self.ggeur_cfg, 'prompt_length', 16)
         class_names = self._get_class_names()
         clip_model_name = getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16')
-        clip_pretrained = getattr(self.ggeur_cfg, 'clip_pretrained', 'openai')
         model_path = getattr(self.ggeur_cfg, 'clip_model_path', '')
+        clip_pretrained = getattr(self.ggeur_cfg, 'clip_pretrained', 'openai')
         template = getattr(self.ggeur_cfg, 'prompt_template', 'a photo of a {}')
 
+        # Load shared CLIP once (CPU), reused by all clients
+        if GGEURClient._shared_prompt_clip is None or GGEURClient._shared_prompt_clip_name != clip_model_name:
+            try:
+                if model_path and os.path.isfile(model_path):
+                    logger.info(f"Client {self.ID}: Loading shared prompt CLIP from {model_path}")
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        clip_model_name, pretrained=model_path
+                    )
+                else:
+                    clip_model, _, _ = open_clip.create_model_and_transforms(
+                        clip_model_name, pretrained=clip_pretrained
+                    )
+                for p in clip_model.parameters():
+                    p.requires_grad = False
+                clip_model.eval()
+                GGEURClient._shared_prompt_clip = clip_model.cpu()
+                GGEURClient._shared_prompt_tokenizer = open_clip.get_tokenizer(clip_model_name)
+                GGEURClient._shared_prompt_clip_name = clip_model_name
+                logger.info(f"Shared prompt CLIP loaded (CPU), will be moved to GPU only during forward pass")
+            except Exception as e:
+                logger.error(f"Client {self.ID}: Failed to load shared CLIP: {e}")
+                return
+
+        # Each client only stores its own ctx (16x512 = 32KB) and token buffers
+        # PromptLearner is built on CPU using the shared clip_model
         try:
-            if model_path and os.path.isfile(model_path):
-                logger.info(f"Client {self.ID}: Loading open_clip CLIP from {model_path}")
-                clip_model, _, _ = open_clip.create_model_and_transforms(
-                    clip_model_name, pretrained=model_path
-                )
-            else:
-                logger.info(f"Client {self.ID}: Loading open_clip CLIP pretrained={clip_pretrained}")
-                clip_model, _, _ = open_clip.create_model_and_transforms(
-                    clip_model_name, pretrained=clip_pretrained
-                )
-            tokenizer = open_clip.get_tokenizer(clip_model_name)
+            self.prompt_learner = PromptLearner(
+                clip_model=GGEURClient._shared_prompt_clip,
+                tokenizer=GGEURClient._shared_prompt_tokenizer,
+                classnames=class_names,
+                n_ctx=n_ctx,
+                template=template,
+                device=torch.device('cpu'),  # buffers on CPU, moved to GPU during forward
+            )
+            self.text_encoder = TextEncoder(device=self.device)
+            # Move only the small trainable ctx to GPU; buffers stay CPU until needed
+            self.prompt_learner.ctx.data = self.prompt_learner.ctx.data.to(self.device)
         except Exception as e:
-            logger.error(f"Client {self.ID}: Failed to load open_clip CLIP: {e}")
+            logger.error(f"Client {self.ID}: Failed to build PromptLearner: {e}")
             return
 
-        self.custom_clip = CustomCLIP(
-            clip_model=clip_model,
-            tokenizer=tokenizer,
-            classnames=class_names,
-            n_ctx=n_ctx,
-            template=template,
-            device=self.device,
-        )
-        self.prompt_learner = self.custom_clip.prompt_learner
-        self.text_encoder = self.custom_clip.text_encoder
+        logger.info(f"Client {self.ID}: PromptLearner ready ({n_ctx} ctx tokens, "
+                    f"{len(class_names)} classes, shared CLIP backbone)")
 
-        logger.info(f"Client {self.ID}: Built CustomCLIP (open_clip) with {n_ctx} ctx tokens, "
-                    f"{len(class_names)} classes")
+    def _build_prompt_loader(self):
+        """
+        Build a prompt-specific data loader using:
+        1. Real local CLIP features (not Gaussian samples) for classes this client has
+        2. Gaussian samples around OTHER clients' prototype means for missing classes
+           (anchored to real feature statistics, provides cross-domain coverage)
+        """
+        all_features = []
+        all_labels = []
+
+        requested_n_per_proto = getattr(self.ggeur_cfg, 'prompt_samples_per_proto', 20)
+        local_classes = set()
+        local_class_sizes = []
+        n_local_samples = 0
+
+        for class_idx, feats in self.real_local_features.items():
+            if feats.shape[0] <= 0:
+                continue
+            local_classes.add(int(class_idx))
+            local_class_sizes.append(int(feats.shape[0]))
+
+        avg_local_per_class = int(round(np.mean(local_class_sizes))) if local_class_sizes else 1
+        effective_n_per_proto = max(1, min(int(requested_n_per_proto), avg_local_per_class))
+        target_local_per_class = max(1, effective_n_per_proto)
+
+        # 1. Real local features (upsample lightly for class balance)
+        for class_idx, feats in self.real_local_features.items():
+            if feats.shape[0] <= 0:
+                continue
+
+            balanced_feats = feats
+            if feats.shape[0] < target_local_per_class:
+                repeat_idx = np.random.choice(feats.shape[0],
+                                              target_local_per_class - feats.shape[0],
+                                              replace=True)
+                balanced_feats = np.concatenate([feats, feats[repeat_idx]], axis=0)
+
+            all_features.append(balanced_feats)
+            all_labels.append(np.full(balanced_feats.shape[0], int(class_idx)))
+            n_local_samples += int(balanced_feats.shape[0])
+
+        # 2. Gaussian samples around other clients' prototype means for missing classes
+        n_proto_samples = 0
+        if self.other_prototypes:
+            for class_idx, prototypes in self.other_prototypes.items():
+                if int(class_idx) not in local_classes and len(prototypes) > 0:
+                    proto_mean = np.mean(np.stack(prototypes), axis=0)
+                    cov = self.global_cov_matrices.get(
+                        class_idx,
+                        self.global_cov_matrices.get(int(class_idx), None)
+                    )
+                    if cov is None:
+                        cov = np.eye(self.embedding_dim) * 0.01
+                    generated = self._generate_samples(proto_mean, cov, effective_n_per_proto)
+                    all_features.append(generated)
+                    all_labels.append(np.full(effective_n_per_proto, int(class_idx)))
+                    n_proto_samples += int(effective_n_per_proto)
+
+        if not all_features:
+            logger.warning(f"Client {self.ID}: No data for prompt_loader, falling back to augmented_loader")
+            self.prompt_loader = self.augmented_loader
+            return
+
+        features = np.vstack(all_features)
+        labels = np.concatenate(all_labels)
+
+        dataset = AugmentedFeatureDataset(features, labels)
+        self.prompt_loader = DataLoader(
+            dataset,
+            batch_size=self._cfg.dataloader.batch_size,
+            shuffle=True
+        )
+
+        logger.info(f"Client {self.ID}: prompt_loader built - "
+                    f"{features.shape[0]} samples, {len(np.unique(labels))} classes "
+                    f"({n_local_samples} balanced local, {n_proto_samples} proto-augmented, "
+                    f"requested_proto={requested_n_per_proto}, effective_proto={effective_n_per_proto})")
 
     def _train_prompt_on_augmented_data(self):
         """
         Train soft prompt ctx vectors on augmented CLIP features.
-
-        Uses CustomCLIP (open_clip-based). Image features are pre-extracted;
-        only ctx vectors are updated.
-
-        Returns:
-            sample_size, prompt_para dict, results dict
+        The shared CLIP backbone is moved to GPU only for this client's turn,
+        then moved back to CPU to free VRAM for the next client.
         """
-        if self.custom_clip is None or self.augmented_loader is None:
+        if self.prompt_learner is None or self.prompt_loader is None:
             return 0, {}, {}
 
         lr = getattr(self.ggeur_cfg, 'prompt_lr', 0.002)
         local_epochs = getattr(self.ggeur_cfg, 'prompt_local_epochs', 1)
 
-        self.custom_clip.prompt_learner.train()
+        # Move shared CLIP to GPU for this client's forward pass
+        clip_model = GGEURClient._shared_prompt_clip.to(self.device)
+        clip_model.eval()
 
-        optimizer = torch.optim.Adam([self.custom_clip.prompt_learner.ctx], lr=lr)
+        # Move prompt buffers to GPU
+        self.prompt_learner.token_prefix = self.prompt_learner.token_prefix.to(self.device)
+        self.prompt_learner.token_suffix = self.prompt_learner.token_suffix.to(self.device)
+        self.prompt_learner.tokenized_prompts = self.prompt_learner.tokenized_prompts.to(self.device)
+        self.prompt_learner.train()
+
+        optimizer = torch.optim.Adam([self.prompt_learner.ctx], lr=lr)
+
+        # Use configured temperature instead of CLIP's logit_scale (~100).
+        # logit_scale ≈ 100 amplifies gradients 100x, causing client drift.
+        temperature = getattr(self.ggeur_cfg, 'prompt_temperature', 0.07)
+        logit_scale = 1.0 / temperature
+
+        # FedProx proximal term: keeps local ctx close to global ctx
+        prompt_mu = getattr(self.ggeur_cfg, 'prompt_proximal_mu', 0.0)
+        global_ctx = self.global_prompt_ctx  # may be None in round 0
 
         total_loss = 0.0
         total_correct = 0
@@ -2116,24 +2272,26 @@ class GGEURClient(Client):
             epoch_correct = 0
             epoch_samples = 0
 
-            for features, labels in self.augmented_loader:
+            for features, labels in self.prompt_loader:
                 features = features.to(self.device)
                 labels = labels.to(self.device)
 
                 optimizer.zero_grad()
 
-                # Forward: text encoder runs per batch so gradients flow correctly
-                prompt_embeds, eot_pos = self.custom_clip.prompt_learner()
-                text_feats = self.custom_clip.text_encoder(
-                    prompt_embeds, eot_pos, self.custom_clip.clip_model
-                )
-                text_feats_norm = F.normalize(text_feats, p=2, dim=1)          # (K, d)
-                logit_scale = self.custom_clip.clip_model.logit_scale.exp()
+                prompt_embeds, eot_pos = self.prompt_learner()
+                text_feats = self.text_encoder(prompt_embeds, eot_pos, clip_model)
+                text_feats_norm = F.normalize(text_feats, p=2, dim=1)
 
-                img_feats = F.normalize(features, p=2, dim=1)                  # (B, d)
-                logits = logit_scale * (img_feats @ text_feats_norm.T)         # (B, K)
+                img_feats = F.normalize(features, p=2, dim=1)
+                logits = logit_scale * (img_feats @ text_feats_norm.T)
                 loss = F.cross_entropy(logits, labels)
+
+                if prompt_mu > 0.0 and global_ctx is not None:
+                    proximal_loss = (prompt_mu / 2.0) * ((self.prompt_learner.ctx - global_ctx) ** 2).sum()
+                    loss = loss + proximal_loss
+
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_([self.prompt_learner.ctx], max_norm=1.0)
                 optimizer.step()
 
                 with torch.no_grad():
@@ -2146,13 +2304,24 @@ class GGEURClient(Client):
             total_correct += epoch_correct
             total_samples += epoch_samples
 
+        # Move shared CLIP back to CPU and free GPU memory
+        GGEURClient._shared_prompt_clip = clip_model.cpu()
+        # Move prompt buffers back to CPU
+        self.prompt_learner.token_prefix = self.prompt_learner.token_prefix.cpu()
+        self.prompt_learner.token_suffix = self.prompt_learner.token_suffix.cpu()
+        self.prompt_learner.tokenized_prompts = self.prompt_learner.tokenized_prompts.cpu()
+        torch.cuda.empty_cache()
+
         avg_loss = total_loss / total_samples if total_samples > 0 else 0
         accuracy = total_correct / total_samples if total_samples > 0 else 0
 
         logger.info(f"Client {self.ID}: Prompt training - loss={avg_loss:.4f}, acc={accuracy:.4f}, "
                     f"samples={total_samples}")
 
-        prompt_para = {'ctx': copy.deepcopy(self.custom_clip.prompt_learner.ctx.data.cpu())}
+        prompt_para = {
+            'ctx': copy.deepcopy(self.prompt_learner.ctx.data.cpu()),
+            'sample_size': int(total_samples)
+        }
         results = {'prompt_loss': avg_loss, 'prompt_acc': accuracy, 'prompt_total': total_samples}
 
         return total_samples, prompt_para, results

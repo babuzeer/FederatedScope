@@ -1,11 +1,3 @@
-# Baseline (MLP-Mixer): MLP-Mixer-B/16 + MLP + FedProx (No GGEUR data generation)
-#
-# Purpose: Run FedProx as a baseline comparison against GGEUR (Mixer branch).
-# Dataset: PACS (4 domains: photo, art_painting, cartoon, sketch; 7 classes)
-#
-# Prerequisites:
-#   pretrained_weights/mixer_b16_224_complete.pth
-
 use_gpu: True
 device: 0
 seed: 42
@@ -14,17 +6,13 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 28
+  client_num: 60
   total_round_num: 100
   sample_client_num: 0
 
-fedprox:
-  use: True
-  mu: 0.1
-
 data:
-  type: 'pacs'
-  root: '/root/autodl-tmp/datasets/PACS'
+  type: 'domainnet'
+  root: '/root/autodl-tmp/datasets/DomainNet'
   splits: [0.7, 0.0, 0.3]
 
 dataloader:
@@ -33,18 +21,18 @@ dataloader:
 
 model:
   type: 'ggeur_mlp'
-  num_classes: 7
+  num_classes: 345
 
 train:
-  local_update_steps: 8
+  local_update_steps: 5
   optimizer:
     type: 'Adam'
-    lr: 0.0002
+    lr: 0.0001
 
 ggeur:
   use: True
-
-  # Feature extractor (MLP-Mixer with local weights)
+  
+  domainnet_shared_classes_only: False
   feature_extractor: 'timm'
   timm_model: 'mixer_b16_224'
   timm_pretrained: False
@@ -53,35 +41,26 @@ ggeur:
   timm_global_pool: 'avg'
   freeze_backbone: True
   embedding_dim: 768
-
   use_feature_cache: True
   feature_cache_dir: ''
-
-  # Disable GGEUR augmentation (baseline)
   num_generated_per_sample: 0
   num_generated_per_prototype: 0
   target_size_per_class: 0
-
-  # MLP classifier
   mlp_hidden_dim: 0
   mlp_dropout: 0.0
-
-  # Multi-domain settings
   use_cross_client_prototypes: True
   statistics_round: 0
-
-  # FedProto off
   use_fedproto: False
-
-  # LDS split
+  use_moon: True
+  moon_mu: 5.0
+  moon_temperature: 0.5
   use_lds: True
   lds_alpha: 0.1
   lds_seed: 42
-
-  # Keep other modes off
   use_cnn_distillation: False
   use_feature_alignment: False
   use_separated_training: False
 
-outdir: 'exp/ggeur_baselines'
-expname: 'pacs_lds/mixer/fedprox'
+outdir: 'exp/domainnet_4domains/mlp/moon'
+expname: 'domainnet_4domains_mlp_moon'
+

@@ -143,6 +143,16 @@ class GGEURServer(Server):
         self.prompt_learner_eval = None
         self.text_encoder_eval = None
 
+    def _get_domainnet_eval_metadata(self):
+        """Resolve DomainNet evaluation domains and classes."""
+        from federatedscope.cv.dataset.domainnet import discover_domainnet_metadata
+
+        selected_domains = list(getattr(self.ggeur_cfg, 'domainnet_domains', []))
+        shared_classes_only = getattr(self.ggeur_cfg,
+                                      'domainnet_shared_classes_only', False)
+        return discover_domainnet_metadata(self._cfg.data.root, selected_domains,
+                                           shared_classes_only)
+
     def _get_embedding_dim(self):
         """Get embedding dim, preferring inferred value from client statistics."""
         if isinstance(self.inferred_embedding_dim, int) and self.inferred_embedding_dim > 0:
@@ -373,6 +383,14 @@ class GGEURServer(Server):
         seed = self._cfg.seed if hasattr(self._cfg, 'seed') else 123
 
         dataset_name = data_type
+        cache_suffix = ''
+        if 'domainnet' in data_type or 'domain-net' in data_type or 'domain_net' in data_type:
+            selected_domains = list(getattr(self.ggeur_cfg, 'domainnet_domains', []))
+            shared_classes_only = getattr(self.ggeur_cfg,
+                                          'domainnet_shared_classes_only', False)
+            domain_token = '-'.join(selected_domains) if selected_domains else 'auto'
+            shared_token = 'shared' if shared_classes_only else 'union'
+            cache_suffix = f"_{shared_token}_{domain_token}"
 
         # Build model string based on feature extractor type
         if self.feature_extractor_type == 'cnn':
@@ -391,7 +409,7 @@ class GGEURServer(Server):
 
         # Include split params in filename to ensure cache invalidation when params change
         split_str = f"split{int(splits[0]*100)}_{int(splits[1]*100)}_{int(100-splits[0]*100-splits[1]*100)}_seed{seed}"
-        cache_filename = f"{dataset_name}_{domain}_test_{prefix}_{model_str}_{split_str}.npz"
+        cache_filename = f"{dataset_name}_{domain}_test_{prefix}_{model_str}_{split_str}{cache_suffix}.npz"
 
         return os.path.join(cache_dir, cache_filename)
 
@@ -425,17 +443,37 @@ class GGEURServer(Server):
             domains = ['photo', 'art_painting', 'cartoon', 'sketch']
             from federatedscope.cv.dataset.pacs import PACS
             dataset_class = PACS
+            dataset_kwargs = {}
         elif 'office' in data_type and 'home' in data_type:
             domains = ['Art', 'Clipart', 'Product', 'Real_World']
             from federatedscope.cv.dataset.office_home import OfficeHome
             dataset_class = OfficeHome
+            dataset_kwargs = {}
+        elif 'domainnet' in data_type or 'domain-net' in data_type or \
+                'domain_net' in data_type:
+            from federatedscope.cv.dataset.domainnet import DomainNet
+            domains, classes = self._get_domainnet_eval_metadata()
+            dataset_class = DomainNet
+            dataset_kwargs = {'classes': classes}
+            cache_meta = {
+                'class_count': len(classes),
+                'shared_classes_only': int(getattr(
+                    self.ggeur_cfg, 'domainnet_shared_classes_only', False)),
+                'selected_domains': '|'.join(
+                    list(getattr(self.ggeur_cfg, 'domainnet_domains', [])))
+            }
         elif 'office' in data_type and 'caltech' in data_type:
             domains = ['amazon', 'caltech', 'dslr', 'webcam']
             from federatedscope.cv.dataset.office_caltech import OfficeCaltech10
             dataset_class = OfficeCaltech10
+            dataset_kwargs = {}
+            cache_meta = {}
         else:
             logger.warning(f"Server: Unknown dataset type {data_type}, skipping test evaluation")
             return
+        if 'domainnet' not in data_type and 'domain-net' not in data_type and \
+                'domain_net' not in data_type:
+            cache_meta = {}
 
         # Load test data for each domain
         for domain in domains:
@@ -445,6 +483,14 @@ class GGEURServer(Server):
             if os.path.exists(cache_path):
                 try:
                     data = np.load(cache_path)
+                    if cache_meta:
+                        cached_class_count = int(data['class_count']) if 'class_count' in data.files else -1
+                        cached_shared = int(data['shared_classes_only']) if 'shared_classes_only' in data.files else -1
+                        cached_domains = str(data['selected_domains']) if 'selected_domains' in data.files else ''
+                        if cached_class_count != cache_meta['class_count'] or \
+                                cached_shared != cache_meta['shared_classes_only'] or \
+                                cached_domains != cache_meta['selected_domains']:
+                            raise ValueError('DomainNet test cache metadata mismatch')
                     self.test_features[domain] = data['features']
                     self.test_labels[domain] = data['labels']
                     logger.info(f"Server: Loaded {len(self.test_labels[domain])} cached test features for {domain}")
@@ -469,7 +515,8 @@ class GGEURServer(Server):
                     transform=transform,
                     train_ratio=train_ratio,
                     val_ratio=val_ratio,
-                    seed=seed
+                    seed=seed,
+                    **dataset_kwargs
                 )
 
                 if len(test_dataset) == 0:
@@ -511,7 +558,8 @@ class GGEURServer(Server):
                 # Save to cache
                 np.savez(cache_path,
                         features=self.test_features[domain],
-                        labels=self.test_labels[domain])
+                        labels=self.test_labels[domain],
+                        **cache_meta)
 
                 logger.info(f"Server: Extracted and cached {len(self.test_labels[domain])} test features for {domain}")
 
@@ -1123,7 +1171,7 @@ class GGEURServer(Server):
                     avg = torch.tensor(avg)
                 if avg.device != cur.device:
                     avg = avg.to(cur.device)
-                grads[key] = (avg.detach() - cur.detach()).type_as(cur)
+                grads[key] = (cur.detach() - avg.detach()).type_as(cur)
 
         self.fedopt_optimizer.zero_grad()
         for name, p in self.global_mlp.named_parameters():
@@ -1249,10 +1297,18 @@ class GGEURServer(Server):
             domains = ['photo', 'art_painting', 'cartoon', 'sketch']
             from federatedscope.cv.dataset.pacs import PACS
             dataset_class = PACS
+            dataset_kwargs = {}
         elif 'office' in data_type and 'home' in data_type:
             domains = ['Art', 'Clipart', 'Product', 'Real_World']
             from federatedscope.cv.dataset.office_home import OfficeHome
             dataset_class = OfficeHome
+            dataset_kwargs = {}
+        elif 'domainnet' in data_type or 'domain-net' in data_type or \
+                'domain_net' in data_type:
+            from federatedscope.cv.dataset.domainnet import DomainNet
+            domains, classes = self._get_domainnet_eval_metadata()
+            dataset_class = DomainNet
+            dataset_kwargs = {'classes': classes}
         else:
             logger.warning(f"Server: Unknown dataset type {data_type} for CNN evaluation")
             return
@@ -1274,7 +1330,8 @@ class GGEURServer(Server):
                     transform=transform,
                     train_ratio=train_ratio,
                     val_ratio=val_ratio,
-                    seed=seed
+                    seed=seed,
+                    **dataset_kwargs
                 )
 
                 if len(test_dataset) > 0:
@@ -1485,17 +1542,23 @@ class GGEURServer(Server):
     def _aggregate_prompt(self, valid_params, total_samples):
         """Aggregate prompt ctx vectors from clients using weighted average."""
         prompt_params = []
-        for s, p in valid_params:
+        for _, p in valid_params:
             if isinstance(p, dict) and p.get('prompt') is not None:
-                prompt_params.append((s, p['prompt']))
+                prompt_dict = p['prompt']
+                ctx = prompt_dict.get('ctx')
+                prompt_sample_size = int(prompt_dict.get('sample_size', 0))
+                if ctx is not None and prompt_sample_size > 0:
+                    prompt_params.append((prompt_sample_size, {'ctx': ctx}))
 
         if not prompt_params:
             return
 
-        aggregated = self._aggregate_model_params(prompt_params, total_samples)
+        total_prompt_samples = sum(s for s, _ in prompt_params)
+        aggregated = self._aggregate_model_params(prompt_params, total_prompt_samples)
         if aggregated and 'ctx' in aggregated:
             self.global_prompt_ctx = aggregated['ctx'].to(self.device)
-            logger.info(f"Server: Aggregated prompt ctx from {len(prompt_params)} clients")
+            logger.info(f"Server: Aggregated prompt ctx from {len(prompt_params)} clients "
+                        f"(prompt_samples={total_prompt_samples})")
 
     def _evaluate_prompt_on_test_sets(self):
         """Evaluate global prompt on test sets using CLIP image features."""
@@ -1578,7 +1641,8 @@ class GGEURServer(Server):
             prompts, eot_pos = self.prompt_learner_eval()
             text_feats = self.text_encoder_eval(prompts, eot_pos, self._eval_clip)
             text_feats = F.normalize(text_feats, p=2, dim=1)
-            logit_scale = self._eval_clip.logit_scale.exp()
+            temperature = getattr(self.ggeur_cfg, 'prompt_temperature', 0.07)
+            logit_scale = 1.0 / temperature
 
             for domain, features in self.test_features.items():
                 labels = self.test_labels[domain]

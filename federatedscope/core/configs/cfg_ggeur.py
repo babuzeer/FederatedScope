@@ -62,6 +62,13 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.feature_cache_dir = ''
     # Whether to use cached features if available
     cfg.ggeur.use_feature_cache = True
+    # Unload feature extractor from GPU after extraction (saves VRAM in standalone mode)
+    # Only applies when CNN distillation/alignment modes are disabled
+    cfg.ggeur.unload_extractor_after_cache = True
+    # Use fp16 (half precision) for feature extraction (saves VRAM, ~2x faster on Tensor Cores)
+    cfg.ggeur.use_fp16_extraction = True
+    # Batch size for feature extraction (larger = faster; reduce if OOM during extraction)
+    cfg.ggeur.extract_batch_size = 64
 
     # ========== Feature Augmentation ==========
     # Number of samples to generate per original sample
@@ -78,6 +85,11 @@ def extend_ggeur_cfg(cfg):
     # ========== Multi-domain Settings ==========
     # Whether to use cross-client prototypes for augmentation
     cfg.ggeur.use_cross_client_prototypes = True
+    # Optional selected domains for DomainNet. Empty = auto-discover extracted domains.
+    cfg.ggeur.domainnet_domains = []
+    # If True, keep only classes present in every selected DomainNet domain.
+    # If False, use the union of classes across selected domains.
+    cfg.ggeur.domainnet_shared_classes_only = False
 
     # ========== Training Settings ==========
     cfg.ggeur.statistics_round = 0  # Round to collect statistics (usually 0)
@@ -202,6 +214,13 @@ def extend_ggeur_cfg(cfg):
     # HuggingFace CLIP model directory or Hub ID for PromptFL
     # e.g. '/root/model/clip-vit-base-patch16' or 'openai/clip-vit-base-patch16'
     cfg.ggeur.hf_clip_model_id = 'openai/clip-vit-base-patch16'
+    # FedProx proximal term weight for prompt (0.0 = disabled).
+    # Penalizes ||ctx_local - ctx_global||^2 to reduce client drift.
+    cfg.ggeur.prompt_proximal_mu = 0.0
+    # Gaussian samples per prototype class in prompt_loader.
+    # For classes missing locally, this many samples are generated around the
+    # cross-client prototype mean using the global covariance matrix.
+    cfg.ggeur.prompt_samples_per_proto = 20
 
     return cfg
 

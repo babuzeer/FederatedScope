@@ -10,7 +10,7 @@
 
 # ========== Basic Settings ==========
 use_gpu: True
-device: 1
+device: 0
 seed: 42
 verbose: 1
 
@@ -18,8 +18,8 @@ verbose: 1
 federate:
   method: 'ggeur'
   mode: 'standalone'
-  client_num: 4
-  total_round_num: 20
+  client_num: 60
+  total_round_num: 100
 
 # ========== Data Settings ==========
 data:
@@ -58,17 +58,17 @@ ggeur:
   use_feature_cache: True
   feature_cache_dir: ''
 
-  # ===== Feature Augmentation (disabled to isolate PromptFL) =====
-  num_generated_per_sample: 0
-  num_generated_per_prototype: 0
-  target_size_per_class: 20
+  # ===== Feature Augmentation =====
+  num_generated_per_sample: 50
+  num_generated_per_prototype: 50
+  target_size_per_class: 50
 
   # ===== MLP Classifier (still trained alongside PromptFL) =====
   mlp_hidden_dim: 0
   mlp_dropout: 0.0
 
   # ===== Multi-domain Settings =====
-  use_cross_client_prototypes: False
+  use_cross_client_prototypes: True
   statistics_round: 0
 
   # ===== LDS Settings =====
@@ -84,10 +84,14 @@ ggeur:
   # ===== PromptFL Settings =====
   use_promptfl: True
   prompt_length: 16
-  prompt_lr: 0.002
+  prompt_lr: 0.0005
   prompt_local_epochs: 1
-  # Temperature for cosine similarity logits
+  # Temperature for cosine similarity logits (replaces CLIP's logit_scale ~100)
   prompt_temperature: 0.07
+  # FedProx proximal term to reduce client drift (0.0 = disabled)
+  prompt_proximal_mu: 0.1
+  # Gaussian samples per prototype class in prompt_loader (cross-domain coverage)
+  prompt_samples_per_proto: 4
   # Optional: override class names (leave empty to auto-detect from dataset)
   prompt_class_names: []
   # Text prompt template

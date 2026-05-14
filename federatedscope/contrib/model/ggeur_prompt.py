@@ -122,13 +122,12 @@ class TextEncoder(nn.Module):
         # positional embedding
         x = prompts + clip_model.positional_embedding[:L]  # (K, L, d)
 
-        x = x.permute(1, 0, 2)                    # (L, K, d) - transformer expects seq-first
-        # Pass causal attn_mask to match open_clip's encode_text behavior
+        # open_clip's Transformer.forward() handles seq/batch permutation internally;
+        # pass x as batch-first (K, L, d) directly.
         attn_mask = None
         if hasattr(clip_model, 'attn_mask') and clip_model.attn_mask is not None:
             attn_mask = clip_model.attn_mask[:L, :L].to(x.device)
-        x = clip_model.transformer(x, attn_mask=attn_mask)  # (L, K, d)
-        x = x.permute(1, 0, 2)                    # (K, L, d)
+        x = clip_model.transformer(x, attn_mask=attn_mask)  # (K, L, d)
         x = clip_model.ln_final(x)                # (K, L, d)
 
         # Clamp eot_pos to valid range to avoid out-of-bounds indexing

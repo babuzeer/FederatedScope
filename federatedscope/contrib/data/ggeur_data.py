@@ -24,6 +24,7 @@ def load_ggeur_data(config, client_cfgs=None):
     Supports:
     - PACS: 4 domains (photo, art_painting, cartoon, sketch)
     - Office-Home: 4 domains (Art, Clipart, Product, Real_World)
+    - DomainNet: auto-discovered extracted domains (e.g. clipart/infograph/painting/real)
 
     Each domain can have multiple clients (data split among them).
     If LDS is enabled, uses Dirichlet distribution for non-IID data split.
@@ -42,6 +43,8 @@ def load_ggeur_data(config, client_cfgs=None):
         return _load_pacs_ggeur_data(config, client_cfgs)
     elif data_type in ['office-home', 'officehome', 'office_home']:
         return _load_officehome_ggeur_data(config, client_cfgs)
+    elif data_type in ['domainnet', 'domain-net', 'domain_net']:
+        return _load_domainnet_ggeur_data(config, client_cfgs)
     else:
         logger.warning(f"Data type {data_type} not specifically supported for GGEUR_Clip, "
                        f"falling back to standard loading")
@@ -94,13 +97,14 @@ def _split_dataset_with_lds(dataset, dirichlet_proportions, seed=42):
 
     # Get all labels
     targets = np.array(dataset.targets)
-    num_classes = len(np.unique(targets))
+    unique_labels = np.unique(targets)
+    num_present_classes = len(unique_labels)
 
     # Collect indices for this client
     client_indices = []
     class_counts = {}
 
-    for class_idx in range(num_classes):
+    for class_idx in unique_labels:
         # Get all indices for this class
         class_mask = targets == class_idx
         class_indices = np.where(class_mask)[0]
@@ -129,7 +133,7 @@ def _split_dataset_with_lds(dataset, dirichlet_proportions, seed=42):
 
     logger.info(f"  LDS allocation: {total_allocated}/{total_available} samples "
                 f"({100*total_allocated/total_available:.1f}%), "
-                f"{non_empty_classes}/{num_classes} classes with data")
+                f"{non_empty_classes}/{num_present_classes} classes with data")
 
     return Subset(dataset, client_indices), class_counts
 
@@ -473,6 +477,160 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
     else:
         logger.info(f"GGEUR_Clip Office-Home data loaded: {len(data_dict)} clients, "
                     f"domains={domains}, clients_per_domain={clients_per_domain}")
+
+    return data_dict, config
+
+
+def _load_domainnet_ggeur_data(config, client_cfgs=None):
+    """Load DomainNet dataset for GGEUR."""
+    from federatedscope.cv.dataset.domainnet import (
+        discover_domainnet_metadata, load_domainnet_domain_data)
+
+    root = config.data.root
+    batch_size = config.dataloader.batch_size
+    num_workers = config.dataloader.num_workers
+    splits = tuple(config.data.splits) if hasattr(config.data, 'splits') else (0.7, 0.0, 0.3)
+
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                             std=[0.26862954, 0.26130258, 0.27577711])
+    ])
+
+    selected_domains = list(
+        getattr(config.ggeur, 'domainnet_domains', [])) if hasattr(config,
+                                                                    'ggeur') else []
+    shared_classes_only = getattr(config.ggeur,
+                                  'domainnet_shared_classes_only',
+                                  False) if hasattr(config, 'ggeur') else False
+    domains, classes = discover_domainnet_metadata(root, selected_domains,
+                                                   shared_classes_only)
+    num_domains = len(domains)
+    num_classes = len(classes)
+
+    use_lds = getattr(config.ggeur, 'use_lds', False) if hasattr(config,
+                                                                  'ggeur') else False
+    configured_client_num = config.federate.client_num
+
+    if configured_client_num % num_domains != 0:
+        logger.warning(f"client_num ({configured_client_num}) is not divisible by "
+                       f"num_domains ({num_domains}). Adjusting to {num_domains} clients.")
+        clients_per_domain = 1
+        total_clients = num_domains
+    else:
+        clients_per_domain = configured_client_num // num_domains
+        total_clients = configured_client_num
+
+    if use_lds:
+        lds_alpha = getattr(config.ggeur, 'lds_alpha', 0.1)
+        lds_seed = getattr(config.ggeur, 'lds_seed', 42)
+        logger.info(f"GGEUR DomainNet with LDS: alpha={lds_alpha}, "
+                    f"{total_clients} clients ({clients_per_domain} per domain)")
+        dirichlet_matrix = _generate_dirichlet_matrix(num_domains, num_classes,
+                                                      lds_alpha, lds_seed)
+    else:
+        logger.info(f"GGEUR DomainNet: {total_clients} clients, "
+                    f"{clients_per_domain} per domain")
+        dirichlet_matrix = None
+
+    data_dict = {}
+    client_id = 1
+    total_train_samples = 0
+    total_original_samples = 0
+
+    for domain_idx, domain in enumerate(domains):
+        logger.info(f"Loading DomainNet domain '{domain}'")
+
+        try:
+            domain_data = load_domainnet_domain_data(root=root,
+                                                     domain=domain,
+                                                     classes=classes,
+                                                     splits=splits,
+                                                     transform=transform,
+                                                     seed=config.seed)
+
+            train_dataset = domain_data['train']
+            val_dataset = domain_data['val']
+            test_dataset = domain_data['test']
+            total_original_samples += len(train_dataset)
+
+            if use_lds:
+                lds_subset, _ = _split_dataset_with_lds(
+                    train_dataset,
+                    dirichlet_matrix[domain_idx],
+                    seed=config.seed + domain_idx)
+
+                if clients_per_domain > 1:
+                    train_subsets = _split_subset_for_clients(
+                        lds_subset, clients_per_domain, seed=config.seed + domain_idx)
+                else:
+                    train_subsets = [lds_subset]
+            else:
+                if clients_per_domain > 1:
+                    train_subsets = _split_dataset_for_clients(
+                        train_dataset, clients_per_domain, seed=config.seed)
+                else:
+                    train_subsets = [train_dataset]
+
+            for train_subset in train_subsets:
+                train_size = len(train_subset)
+                if train_size == 0:
+                    logger.warning(
+                        f"Skipping empty DomainNet client subset for domain '{domain}'.")
+                    continue
+                total_train_samples += train_size
+
+                data_dict[client_id] = {
+                    'train': DataLoader(train_subset,
+                                        batch_size=batch_size,
+                                        shuffle=True,
+                                        num_workers=num_workers,
+                                        drop_last=False),
+                    'val': DataLoader(val_dataset,
+                                      batch_size=batch_size,
+                                      shuffle=False,
+                                      num_workers=num_workers)
+                    if len(val_dataset) > 0 else None,
+                    'test': DataLoader(test_dataset,
+                                       batch_size=batch_size,
+                                       shuffle=False,
+                                       num_workers=num_workers)
+                }
+
+                logger.info(f"  Client {client_id} ({domain}): train={train_size}")
+                client_id += 1
+
+        except Exception as error:
+            logger.error(f"Failed to load DomainNet domain {domain}: {error}")
+            raise
+
+    actual_client_num = len(data_dict)
+    if actual_client_num != total_clients:
+        logger.warning(f"Adjusted DomainNet client_num from {total_clients} "
+                       f"to actual non-empty client count {actual_client_num}")
+    config.federate.client_num = actual_client_num
+    if getattr(config, 'model', None) is not None and getattr(config.model,
+                                                               'num_classes',
+                                                               None) != num_classes:
+        logger.warning(f"Overriding model.num_classes from {config.model.num_classes} "
+                       f"to discovered DomainNet class count {num_classes}")
+        config.model.num_classes = num_classes
+
+    if use_lds:
+        logger.info("GGEUR DomainNet LDS Summary:")
+        logger.info(f"  Domains: {domains}")
+        logger.info(f"  Classes: {num_classes} "
+                    f"(shared_only={shared_classes_only})")
+        logger.info(f"  Original train samples: {total_original_samples}")
+        logger.info(f"  LDS allocated samples: {total_train_samples} "
+                    f"({100 * total_train_samples / total_original_samples:.1f}%)")
+        logger.info(f"  Alpha: {lds_alpha}")
+    else:
+        logger.info(f"GGEUR DomainNet data loaded: {len(data_dict)} clients, "
+                    f"domains={domains}, classes={num_classes}, "
+                    f"clients_per_domain={clients_per_domain}, "
+                    f"shared_only={shared_classes_only}")
 
     return data_dict, config
 
