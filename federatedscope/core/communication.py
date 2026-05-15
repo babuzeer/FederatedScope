@@ -205,8 +205,8 @@ class gRPCCommManager(object):
                 receiver_address = self.neighbors[each_receiver]
                 self._send(receiver_address, message)
 
-    def receive(self):
-        received_msg = self.server_funcs.receive()
+    def receive(self, timeout=None):
+        received_msg = self.server_funcs.receive(timeout=timeout)
         message = Message()
         message.parse(received_msg.msg)
         return message

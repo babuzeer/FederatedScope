@@ -2,6 +2,7 @@ import logging
 import copy
 import os
 import sys
+import queue
 
 import numpy as np
 import pickle
@@ -171,7 +172,7 @@ class Server(BaseServer):
         self.join_in_client_num = 0
         self.join_in_info = dict()
         self.first_join_timestamp = None
-        self.join_timeout_seconds = 300
+        self.join_timeout_seconds = 60
         # the unseen clients indicate the ones that do not contribute to FL
         # process by training on their local data and uploading their local
         # model update. The splitting is useful to check participation
@@ -262,7 +263,11 @@ class Server(BaseServer):
 
         # Begin: Broadcast model parameters and start to FL train
         while self.join_in_client_num < self.client_num:
-            msg = self.comm_manager.receive()
+            self._check_join_timeout()
+            try:
+                msg = self.comm_manager.receive(timeout=1.0)
+            except queue.Empty:
+                continue
             self.msg_handlers[msg.msg_type](msg)
 
         # Running: listen for message (updates from clients),
@@ -890,6 +895,12 @@ class Server(BaseServer):
                     timestamp=self.cur_timestamp,
                     content=model_para))
 
+    def _notify_joined_clients_to_finish(self):
+        if self.is_finish or len(self.comm_manager.neighbors) == 0:
+            return
+
+        self.terminate(msg_type='finish')
+
     def eval(self):
         """
         To conduct evaluation. When ``cfg.federate.make_global_eval=True``, \
@@ -1040,22 +1051,28 @@ class Server(BaseServer):
                             timestamp=self.cur_timestamp,
                             content=self._cfg.federate.join_in_info.copy()))
 
-        if self.first_join_timestamp is not None:
-            elapsed_time = time.time() - self.first_join_timestamp
-            if not self.check_client_join_in() and \
-                    elapsed_time > self.join_timeout_seconds:
-                logger.error(
-                    f'Server: Timeout waiting for clients to join. Expected '
-                    f'{self.client_num} clients, but only '
-                    f'{self.join_in_client_num} joined after '
-                    f'{elapsed_time:.1f} seconds. Joined client IDs: '
-                    f'{list(self.comm_manager.neighbors.keys())}')
-                raise TimeoutError(
-                    f'Only {self.join_in_client_num}/{self.client_num} '
-                    f'clients joined after {self.join_timeout_seconds} '
-                    f'seconds')
+        self._check_join_timeout()
 
         self.trigger_for_start()
+
+    def _check_join_timeout(self):
+        if self.first_join_timestamp is None or self.check_client_join_in():
+            return
+
+        elapsed_time = time.time() - self.first_join_timestamp
+        if elapsed_time <= self.join_timeout_seconds:
+            return
+
+        logger.error(
+            f'Server: Timeout waiting for clients to join. Expected '
+            f'{self.client_num} clients, but only '
+            f'{self.join_in_client_num} joined after '
+            f'{elapsed_time:.1f} seconds. Joined client IDs: '
+            f'{list(self.comm_manager.neighbors.keys())}')
+        self._notify_joined_clients_to_finish()
+        raise TimeoutError(
+            f'Only {self.join_in_client_num}/{self.client_num} '
+            f'clients joined after {self.join_timeout_seconds} seconds')
 
     def callback_funcs_for_metrics(self, message: Message):
         """
