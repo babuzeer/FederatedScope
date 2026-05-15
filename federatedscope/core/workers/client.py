@@ -229,8 +229,25 @@ class Client(BaseClient):
         To listen to the message and handle them accordingly (used for \
         distributed mode)
         """
+        pending_messages = []
+
         while True:
             msg = self.comm_manager.receive()
+
+            if self._mode == 'distributed' and self.ID == -1:
+                if msg.msg_type == 'assign_client_id':
+                    self.msg_handlers[msg.msg_type](msg)
+                    for pending_msg in pending_messages:
+                        if self.state <= pending_msg.state:
+                            self.msg_handlers[pending_msg.msg_type](
+                                pending_msg)
+                    pending_messages.clear()
+                else:
+                    pending_messages.append(msg)
+                    if msg.msg_type == 'finish':
+                        break
+                    continue
+
             if self.state <= msg.state:
                 self.msg_handlers[msg.msg_type](msg)
 

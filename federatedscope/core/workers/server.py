@@ -170,6 +170,8 @@ class Server(BaseServer):
         self.sample_client_num = int(self._cfg.federate.sample_client_num)
         self.join_in_client_num = 0
         self.join_in_info = dict()
+        self.first_join_timestamp = None
+        self.join_timeout_seconds = 300
         # the unseen clients indicate the ones that do not contribute to FL
         # process by training on their local data and uploading their local
         # model update. The splitting is useful to check participation
@@ -1000,12 +1002,16 @@ class Server(BaseServer):
         """
 
         if 'info' in message.msg_type:
+            if self.first_join_timestamp is None:
+                self.first_join_timestamp = time.time()
             sender, info = message.sender, message.content
             for key in self._cfg.federate.join_in_info:
                 assert key in info
             self.join_in_info[sender] = info
             logger.info('Server: Client #{:d} has joined in !'.format(sender))
         else:
+            if self.first_join_timestamp is None:
+                self.first_join_timestamp = time.time()
             self.join_in_client_num += 1
             sender, address = message.sender, message.content
             if int(sender) == -1:  # assign number to client
@@ -1019,6 +1025,8 @@ class Server(BaseServer):
                             state=self.state,
                             timestamp=self.cur_timestamp,
                             content=str(sender)))
+                logger.info(
+                    f'Server: Assigned ID #{sender} to client at {address}')
             else:
                 self.comm_manager.add_neighbors(neighbor_id=sender,
                                                 address=address)
@@ -1031,6 +1039,21 @@ class Server(BaseServer):
                             state=self.state,
                             timestamp=self.cur_timestamp,
                             content=self._cfg.federate.join_in_info.copy()))
+
+        if self.first_join_timestamp is not None:
+            elapsed_time = time.time() - self.first_join_timestamp
+            if not self.check_client_join_in() and \
+                    elapsed_time > self.join_timeout_seconds:
+                logger.error(
+                    f'Server: Timeout waiting for clients to join. Expected '
+                    f'{self.client_num} clients, but only '
+                    f'{self.join_in_client_num} joined after '
+                    f'{elapsed_time:.1f} seconds. Joined client IDs: '
+                    f'{list(self.comm_manager.neighbors.keys())}')
+                raise TimeoutError(
+                    f'Only {self.join_in_client_num}/{self.client_num} '
+                    f'clients joined after {self.join_timeout_seconds} '
+                    f'seconds')
 
         self.trigger_for_start()
 
