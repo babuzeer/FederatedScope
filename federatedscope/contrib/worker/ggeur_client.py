@@ -216,6 +216,7 @@ class GGEURClient(Client):
         self.text_encoder = None
         self.custom_clip = None        # CustomCLIP (HuggingFace-based) for PromptFL
         self.hf_clip_model = None      # HuggingFace CLIPModel (separate from open_clip)
+        self.global_prompt_ctx = None  # Latest global PromptFL context
 
     def _register_default_handlers(self):
         """Register message handlers"""
