@@ -17,6 +17,9 @@ import logging
 import copy
 import re
 import queue
+import base64
+import io
+import zlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -719,6 +722,7 @@ class GGEURServer(Server):
                 )
 
         self._validate_received_statistics(client_id, content)
+        content = self._normalize_received_statistics(client_id, content)
 
         # Store statistics
         self.local_statistics_buffer[client_id] = {
@@ -778,10 +782,18 @@ class GGEURServer(Server):
         counts = content.get('counts', {})
 
         for class_idx, mean in means.items():
-            mean_arr = np.asarray(mean)
+            mean_arr = self._payload_to_ndarray(mean)
             cov = self._get_class_value(covs, class_idx)
             count = self._get_class_value(counts, class_idx)
-            cov_arr = np.asarray(cov)
+            cov_arr = self._payload_to_ndarray(cov)
+            if mean_arr is None:
+                invalid.append(f"class {class_idx}: mean decode failed")
+                continue
+            if cov_arr is None:
+                invalid.append(f"class {class_idx}: cov decode failed")
+                continue
+            mean_arr = np.asarray(mean_arr)
+            cov_arr = np.asarray(cov_arr)
             if mean_arr.shape != (expected_dim, ):
                 invalid.append(
                     f"class {class_idx}: mean shape {mean_arr.shape}")
@@ -799,6 +811,45 @@ class GGEURServer(Server):
                 f"Please clear stale feature cache or align all clients to "
                 f"the same feature_extractor/embedding_dim.")
 
+    def _normalize_received_statistics(self, client_id, content):
+        """Decode compact local-statistics payloads from a client."""
+        normalized = dict(content)
+        expected_dim = int(self._get_embedding_dim())
+
+        means = {}
+        for class_idx, mean in content.get('means', {}).items():
+            key = int(class_idx)
+            means[key] = np.asarray(
+                self._payload_to_ndarray(mean), dtype=np.float32)
+
+        covs = {}
+        for class_idx, cov in content.get('covs', {}).items():
+            key = int(class_idx)
+            covs[key] = np.asarray(
+                self._payload_to_ndarray(cov), dtype=np.float32)
+
+        counts = {}
+        for class_idx, count in content.get('counts', {}).items():
+            counts[int(class_idx)] = int(count)
+
+        prototypes = {}
+        for class_idx, proto in content.get('prototypes', {}).items():
+            key = int(class_idx)
+            proto_arr = np.asarray(
+                self._payload_to_ndarray(proto), dtype=np.float32)
+            if proto_arr.shape != (expected_dim, ):
+                raise ValueError(
+                    f"Server: Invalid prototype from client {client_id}, "
+                    f"class {class_idx}: shape {proto_arr.shape}, "
+                    f"expected ({expected_dim},).")
+            prototypes[key] = proto_arr
+
+        normalized['means'] = means
+        normalized['covs'] = covs
+        normalized['counts'] = counts
+        normalized['prototypes'] = prototypes
+        return normalized
+
     @staticmethod
     def _get_class_value(mapping, class_idx):
         """Read class-keyed stats regardless of int/string key serialization."""
@@ -814,6 +865,26 @@ class GGEURServer(Server):
         except (TypeError, ValueError):
             return None
         return mapping.get(int_key)
+
+    @staticmethod
+    def _payload_to_ndarray(payload):
+        """Decode compact gRPC payloads back to ndarray-compatible values."""
+        if isinstance(payload, bytes):
+            payload = payload.decode('utf-8')
+        if isinstance(payload, str):
+            if payload.startswith('znp:'):
+                try:
+                    raw = zlib.decompress(base64.b64decode(payload[4:]))
+                    return np.load(io.BytesIO(raw), allow_pickle=False)
+                except Exception:
+                    return None
+            try:
+                payload = param2tensor(payload)
+            except Exception:
+                return None
+        if isinstance(payload, torch.Tensor):
+            return payload.detach().cpu().numpy()
+        return payload
 
     def _ensure_stat_shapes(self, client_id, class_idx, mean, cov, count,
                             embedding_dim):
@@ -1195,8 +1266,19 @@ class GGEURServer(Server):
                 for value in payload
             ]
         if isinstance(payload, (np.ndarray, torch.Tensor)):
-            return b64serializer(payload).decode('utf-8')
+            return GGEURServer._serialize_ndarray_payload(payload)
         return payload
+
+    @staticmethod
+    def _serialize_ndarray_payload(payload):
+        """Serialize ndarray/tensor as compressed base64 to keep gRPC payloads small."""
+        if isinstance(payload, torch.Tensor):
+            payload = payload.detach().cpu().numpy()
+        array = np.asarray(payload, dtype=np.float16)
+        buffer = io.BytesIO()
+        np.save(buffer, array, allow_pickle=False)
+        compressed = zlib.compress(buffer.getvalue(), level=3)
+        return 'znp:' + base64.b64encode(compressed).decode('ascii')
 
     def callback_funcs_model_para(self, message: Message):
         """
@@ -1304,19 +1386,23 @@ class GGEURServer(Server):
                     except Exception as e:
                         logger.debug(f"Server: Could not load MLP params: {e}")
 
+        should_eval = self._should_run_server_eval()
+
         # Evaluate MLP on test sets (using CLIP features)
-        test_results = self._evaluate_on_test_sets()
-        if test_results:
-            acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
-            logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+        if should_eval:
+            test_results = self._evaluate_on_test_sets()
+            if test_results:
+                acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
+                logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
 
         # Aggregate and evaluate PromptFL if enabled
         if self.use_promptfl:
             self._aggregate_prompt(valid_params, total_samples)
-            prompt_results = self._evaluate_prompt_on_test_sets()
-            if prompt_results:
-                acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in prompt_results.items()])
-                logger.info(f"Server: Round {round_idx} Prompt Test Accuracy - {acc_str}")
+            if should_eval:
+                prompt_results = self._evaluate_prompt_on_test_sets()
+                if prompt_results:
+                    acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in prompt_results.items()])
+                    logger.info(f"Server: Round {round_idx} Prompt Test Accuracy - {acc_str}")
 
         # Evaluate CNN on test sets (using original images) if enabled
         # Include separated training Phase 2
@@ -1324,7 +1410,7 @@ class GGEURServer(Server):
             (self.use_cnn_distillation or self.use_feature_alignment) or
             (self.use_separated_training and self.training_phase == 'cnn_backbone')
         )
-        if should_eval_cnn and self.global_cnn is not None:
+        if should_eval and should_eval_cnn and self.global_cnn is not None:
             cnn_test_results = self._evaluate_cnn_on_test_sets()
             if cnn_test_results:
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in cnn_test_results.items()])
@@ -1345,6 +1431,14 @@ class GGEURServer(Server):
             self._start_training_round()
         else:
             self._finish()
+
+    def _should_run_server_eval(self):
+        """Whether this GGEUR server should run server-side evaluation."""
+        eval_freq = getattr(getattr(self._cfg, 'eval', None), 'freq', 1)
+        try:
+            return int(eval_freq) > 0
+        except Exception:
+            return True
 
     def _apply_fedopt_update(self, averaged_state_dict):
         """

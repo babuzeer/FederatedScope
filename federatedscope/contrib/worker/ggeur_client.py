@@ -14,13 +14,16 @@ import os
 import time
 import logging
 import copy
+import base64
+import io
+import zlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from federatedscope.core.message import Message
+from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.auxiliaries.utils import param2tensor
 from federatedscope.core.workers import Client
 from federatedscope.register import register_worker
@@ -756,10 +759,10 @@ class GGEURClient(Client):
         content = {
             'client_id': self.ID,
             'embedding_dim': int(self.embedding_dim),
-            'means': self.local_means,
-            'covs': self.local_covs,
+            'means': self._serialize_array_payload(self.local_means),
+            'covs': self._serialize_array_payload(self.local_covs),
             'counts': self.local_counts,
-            'prototypes': prototypes
+            'prototypes': self._serialize_array_payload(prototypes)
         }
 
         self.comm_manager.send(
@@ -774,6 +777,39 @@ class GGEURClient(Client):
 
         self.statistics_uploaded = True
         logger.info(f"Client {self.ID}: Statistics uploaded")
+
+    @staticmethod
+    def _serialize_array_payload(payload):
+        """Encode array/tensor leaves to compact strings for gRPC transfer."""
+        if isinstance(payload, dict):
+            return {
+                key: GGEURClient._serialize_array_payload(value)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [
+                GGEURClient._serialize_array_payload(value)
+                for value in payload
+            ]
+        if isinstance(payload, tuple):
+            return [
+                GGEURClient._serialize_array_payload(value)
+                for value in payload
+            ]
+        if isinstance(payload, (np.ndarray, torch.Tensor)):
+            return GGEURClient._serialize_ndarray_payload(payload)
+        return payload
+
+    @staticmethod
+    def _serialize_ndarray_payload(payload):
+        """Serialize ndarray/tensor as compressed base64 to keep gRPC payloads small."""
+        if isinstance(payload, torch.Tensor):
+            payload = payload.detach().cpu().numpy()
+        array = np.asarray(payload, dtype=np.float16)
+        buffer = io.BytesIO()
+        np.save(buffer, array, allow_pickle=False)
+        compressed = zlib.compress(buffer.getvalue(), level=3)
+        return 'znp:' + base64.b64encode(compressed).decode('ascii')
 
     def callback_for_global_covariances(self, message: Message):
         """Handle receiving global covariance matrices from server"""
@@ -949,6 +985,12 @@ class GGEURClient(Client):
         if isinstance(payload, bytes):
             payload = payload.decode('utf-8')
         if isinstance(payload, str):
+            if payload.startswith('znp:'):
+                try:
+                    raw = zlib.decompress(base64.b64decode(payload[4:]))
+                    return np.load(io.BytesIO(raw), allow_pickle=False)
+                except Exception:
+                    return None
             try:
                 payload = param2tensor(payload)
             except Exception:
@@ -2501,6 +2543,8 @@ class GGEURClient(Client):
 
         lr = getattr(self.ggeur_cfg, 'prompt_lr', 0.002)
         local_epochs = getattr(self.ggeur_cfg, 'prompt_local_epochs', 1)
+        max_train_batches = int(
+            getattr(self.ggeur_cfg, 'prompt_max_train_batches', 0))
 
         # Move shared CLIP to GPU for this client's forward pass
         clip_model = GGEURClient._shared_prompt_clip.to(self.device)
@@ -2532,7 +2576,10 @@ class GGEURClient(Client):
             epoch_correct = 0
             epoch_samples = 0
 
-            for features, labels in self.prompt_loader:
+            for batch_idx, (features, labels) in enumerate(self.prompt_loader):
+                if max_train_batches > 0 and batch_idx >= max_train_batches:
+                    break
+
                 features = features.to(self.device)
                 labels = labels.to(self.device)
 

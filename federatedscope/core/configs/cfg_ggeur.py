@@ -207,6 +207,8 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.prompt_lr = 0.002
     # Local training epochs per round for prompt
     cfg.ggeur.prompt_local_epochs = 10
+    # Optional cap on PromptFL local batches per round. 0 means no cap.
+    cfg.ggeur.prompt_max_train_batches = 0
     # Temperature for cosine similarity logits
     cfg.ggeur.prompt_temperature = 0.07
     # Optional: manually specify class names (list of strings).
