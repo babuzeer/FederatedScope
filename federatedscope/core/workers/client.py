@@ -532,7 +532,9 @@ class Client(BaseClient):
         """
         sender, timestamp = message.sender, message.timestamp
         self.state = message.state
-        if message.content is not None:
+        if message.content not in [None, ''] and \
+                not (isinstance(message.content, dict) and
+                     len(message.content) == 0):
             self.trainer.update(message.content,
                                 strict=self._cfg.federate.share_local_model)
         if self.early_stopper.early_stopped and self._cfg.federate.method in [
@@ -592,11 +594,15 @@ class Client(BaseClient):
             f"================= client {self.ID} received finish message "
             f"=================")
 
-        if message.content is not None:
+        if message.content not in [None, ''] and \
+                not (isinstance(message.content, dict) and
+                     len(message.content) == 0):
             self.trainer.update(message.content,
                                 strict=self._cfg.federate.share_local_model)
 
         self._monitor.finish_fl()
+        if hasattr(self.comm_manager, 'shutdown'):
+            self.comm_manager.shutdown()
 
     def callback_funcs_for_converged(self, message: Message):
         """

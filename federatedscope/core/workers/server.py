@@ -131,39 +131,48 @@ class Server(BaseServer):
             shared_party_num=int(self._cfg.federate.sample_client_num)
         ).fixedpoint2float if self._cfg.federate.use_ss else None
 
+        self.trainer = None
+        self.trainers = []
+
         if self._cfg.federate.make_global_eval:
             # set up a trainer for conducting evaluation in server
             assert self.models is not None
-            assert self.data is not None
 
-            if self._cfg.backend == 'torch':
-                import torch.nn as nn
-                # Set BN track_running_stats to False
-                for name, module in model.named_modules():
-                    if isinstance(module, nn.BatchNorm2d):
-                        module.track_running_stats = False
-            elif self._cfg.backend == 'tensorflow':
-                # TODO: implement this
-                pass
+            if self.data is None:
+                logger.info('Server: `make_global_eval=True` but no server '
+                            'data was built. Skip generic eval trainer '
+                            'setup and rely on worker-specific evaluation '
+                            'logic if provided.')
             else:
-                raise ValueError(f'Unknown backend named {self._cfg.backend}.')
+                if self._cfg.backend == 'torch':
+                    import torch.nn as nn
+                    # Set BN track_running_stats to False
+                    for name, module in model.named_modules():
+                        if isinstance(module, nn.BatchNorm2d):
+                            module.track_running_stats = False
+                elif self._cfg.backend == 'tensorflow':
+                    # TODO: implement this
+                    pass
+                else:
+                    raise ValueError(
+                        f'Unknown backend named {self._cfg.backend}.')
 
-            self.trainer = get_trainer(
-                model=self.models[0],
-                data=self.data,
-                device=self.device,
-                config=self._cfg,
-                only_for_eval=True,
-                monitor=self._monitor
-            )  # the trainer is only used for global evaluation
-            self.trainers = [self.trainer]
-            if self.model_num > 1:
-                # By default, the evaluation is conducted by calling
-                # trainer[i].eval over all internal models
-                self.trainers.extend([
-                    copy.deepcopy(self.trainer)
-                    for _ in range(self.model_num - 1)
-                ])
+                self.trainer = get_trainer(
+                    model=self.models[0],
+                    data=self.data,
+                    device=self.device,
+                    config=self._cfg,
+                    only_for_eval=True,
+                    monitor=self._monitor
+                )  # the trainer is only used for global evaluation
+                self.trainers = [self.trainer]
+                if self.model_num > 1:
+                    # By default, the evaluation is conducted by calling
+                    # trainer[i].eval over all internal models
+                    self.trainers.extend([
+                        copy.deepcopy(self.trainer)
+                        for _ in range(self.model_num - 1)
+                    ])
 
         # Initialize the number of joined-in clients
         self._client_num = client_num
@@ -317,7 +326,8 @@ class Server(BaseServer):
                         num_failure = 0
                     time_counter.reset()
 
-        self.terminate(msg_type='finish')
+        if not self.is_finish:
+            self.terminate(msg_type='finish')
 
     def check_and_move_on(self,
                           check_eval_result=False,
@@ -879,6 +889,8 @@ class Server(BaseServer):
         """
         To terminate the FL course
         """
+        if self.is_finish:
+            return
         self.is_finish = True
         if self.model_num > 1:
             model_para = [model.state_dict() for model in self.models]
@@ -894,12 +906,15 @@ class Server(BaseServer):
                     state=self.state,
                     timestamp=self.cur_timestamp,
                     content=model_para))
+        if hasattr(self.comm_manager, 'shutdown'):
+            self.comm_manager.shutdown()
 
     def _notify_joined_clients_to_finish(self):
         if self.is_finish or len(self.comm_manager.neighbors) == 0:
             return
 
-        self.terminate(msg_type='finish')
+        if not self.is_finish:
+            self.terminate(msg_type='finish')
 
     def eval(self):
         """
@@ -908,6 +923,10 @@ class Server(BaseServer):
         """
 
         if self._cfg.federate.make_global_eval:
+            if not self.trainers:
+                logger.info('Server: No generic eval trainer is available; '
+                            'skip base eval().')
+                return
             # By default, the evaluation is conducted one-by-one for all
             # internal models;
             # for other cases such as ensemble, override the eval function

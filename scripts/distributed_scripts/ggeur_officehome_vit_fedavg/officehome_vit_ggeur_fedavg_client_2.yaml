@@ -1,0 +1,80 @@
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'ggeur'
+  mode: 'distributed'
+  client_num: 4
+  total_round_num: 5
+  sample_client_num: 4
+  make_global_eval: False
+  online_aggr: False
+
+distribute:
+  use: True
+  role: 'client'
+  server_host: '127.0.0.1'
+  server_port: 51051
+  client_host: '127.0.0.1'
+  client_port: 51053
+  data_idx: 2
+
+data:
+  type: 'office-home'
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 16
+  num_workers: 0
+
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+
+eval:
+  freq: 1
+  metrics: ['acc']
+  split: ['test']
+  best_res_update_round_wise_key: 'test_acc'
+
+trainer:
+  type: 'ggeur'
+
+ggeur:
+  use: True
+  feature_extractor: 'clip'
+  clip_model: 'ViT-B-16'
+  clip_pretrained: 'openai'
+  clip_model_path: '/root/autodl-tmp/models/open_clip_vitb16.bin'
+  embedding_dim: 512
+
+  num_generated_per_sample: 2
+  num_generated_per_prototype: 2
+  target_size_per_class: 2
+
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  use_cross_client_prototypes: True
+  statistics_round: 0
+  use_fedproto: False
+
+  use_lds: True
+  lds_alpha: 0.1
+  lds_seed: 42
+
+  use_cnn_distillation: False
+  use_feature_alignment: False
+  use_separated_training: False
+
+outdir: 'exp/distributed_samples/officehome_vit_ggeur_fedavg/client_2'
+expname: 'officehome_vit_ggeur_fedavg_client_2'

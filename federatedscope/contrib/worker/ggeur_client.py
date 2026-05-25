@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from federatedscope.core.message import Message
+from federatedscope.core.auxiliaries.utils import param2tensor
 from federatedscope.core.workers import Client
 from federatedscope.register import register_worker
 
@@ -168,6 +169,7 @@ class GGEURClient(Client):
         # Global covariance from server
         self.global_cov_matrices = None
         self.other_prototypes = None  # Prototypes from other clients
+        self._cov_factor_cache = {}
 
         # Global prototypes for feature alignment
         self.global_prototypes = None  # {class_idx: mean vector}
@@ -264,12 +266,14 @@ class GGEURClient(Client):
 
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             pretrained = getattr(self.ggeur_cfg, 'cnn_pretrained', True)
+            checkpoint_path = getattr(self.ggeur_cfg, 'cnn_checkpoint_path', '')
             freeze = getattr(self.ggeur_cfg, 'freeze_backbone', True)
 
             self.cnn_extractor = CNNFeatureExtractor(
                 model_name=model_name,
                 pretrained=pretrained,
-                freeze=freeze
+                freeze=freeze,
+                checkpoint_path=checkpoint_path,
             )
             self.cnn_extractor = self.cnn_extractor.to(self.device)
 
@@ -346,6 +350,13 @@ class GGEURClient(Client):
 
             self.clip_model = self.clip_model.to(self.device)
             self.clip_model.eval()
+            visual_dim = getattr(getattr(self.clip_model, 'visual', None),
+                                 'output_dim', None)
+            if visual_dim is None and hasattr(self.clip_model,
+                                              'text_projection'):
+                visual_dim = int(self.clip_model.text_projection.shape[1])
+            if visual_dim is not None:
+                self.embedding_dim = int(visual_dim)
             logger.info(f"Client {self.ID}: Loaded CLIP model {model_name}")
 
         except ImportError:
@@ -382,10 +393,12 @@ class GGEURClient(Client):
             model_str = f"{clip_model}_{pretrained}"
             prefix = 'clip'
 
+        dim_str = f"d{int(self.embedding_dim)}"
         if domain:
-            cache_filename = f"{dataset_name}_{domain}_{prefix}_{model_str}.npz"
+            cache_filename = (
+                f"{dataset_name}_{domain}_{prefix}_{model_str}_{dim_str}.npz")
         else:
-            cache_filename = f"{dataset_name}_{prefix}_{model_str}.npz"
+            cache_filename = f"{dataset_name}_{prefix}_{model_str}_{dim_str}.npz"
 
         return os.path.join(cache_dir, cache_filename)
 
@@ -420,6 +433,23 @@ class GGEURClient(Client):
             logger.info(f"Client {self.ID}: Saved {len(paths)} features to cache {cache_path}")
         except Exception as e:
             logger.warning(f"Client {self.ID}: Failed to save cache: {e}")
+
+    def _is_valid_feature_vector(self, feat):
+        """Check whether a cached/extracted feature matches current dim."""
+        if feat is None:
+            return False
+
+        feat_arr = np.asarray(feat)
+        if feat_arr.ndim != 1:
+            return False
+
+        expected_dim = int(getattr(self, 'embedding_dim',
+                                   getattr(self.ggeur_cfg,
+                                           'embedding_dim', 0)))
+        if expected_dim > 0 and feat_arr.shape[0] != expected_dim:
+            return False
+
+        return True
 
     def _extract_features(self):
         """
@@ -458,10 +488,26 @@ class GGEURClient(Client):
             subset_indices = None
             domain = getattr(dataset, 'domain', None)
 
+        # Load before cache lookup so embedding_dim reflects the real extractor
+        # output, not the config default from a previous backbone.
+        self._load_feature_extractor()
+
         cache_path = self._get_feature_cache_path(domain)
 
         # Load existing cache
         feature_cache = self._load_feature_cache(cache_path)
+        if feature_cache:
+            valid_cache = {
+                path: feat
+                for path, feat in feature_cache.items()
+                if self._is_valid_feature_vector(feat)
+            }
+            dropped = len(feature_cache) - len(valid_cache)
+            if dropped:
+                logger.warning(
+                    f"Client {self.ID}: Dropped {dropped} cached features "
+                    f"with wrong dim; expected {self.embedding_dim}")
+            feature_cache = valid_cache
         cache_updated = False
 
         # Check if base dataset has image paths (PACS, Office-Home style)
@@ -497,6 +543,16 @@ class GGEURClient(Client):
                 if img_path in feature_cache:
                     # Use cached feature
                     feat = feature_cache[img_path]
+                    if not self._is_valid_feature_vector(feat):
+                        logger.warning(
+                            f"Client {self.ID}: Skip invalid cached feature "
+                            f"for {img_path} with shape "
+                            f"{np.asarray(feat).shape}, expected dim "
+                            f"{self.embedding_dim}")
+                        paths_to_extract.append(img_path)
+                        indices_to_extract.append(local_idx)
+                        base_indices_to_extract.append(base_idx)
+                        continue
                     label = int(label)
                     if label not in self.local_features:
                         self.local_features[label] = []
@@ -514,9 +570,6 @@ class GGEURClient(Client):
 
             # Extract features for non-cached samples
             if paths_to_extract:
-                # Load feature extractor (CLIP or CNN)
-                self._load_feature_extractor()
-
                 # Create a mini dataloader for samples to extract
                 batch_size = getattr(self.ggeur_cfg, 'extract_batch_size', 64)
                 use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction', True) and torch.cuda.is_available()
@@ -548,6 +601,13 @@ class GGEURClient(Client):
                         features = features.cpu().numpy()
 
                         for feat, label, path in zip(features, labels, batch_paths):
+                            if not self._is_valid_feature_vector(feat):
+                                logger.warning(
+                                    f"Client {self.ID}: Skip extracted "
+                                    f"feature for {path} with invalid shape "
+                                    f"{np.asarray(feat).shape}, expected dim "
+                                    f"{self.embedding_dim}")
+                                continue
                             # Update cache
                             feature_cache[path] = feat
                             cache_updated = True
@@ -567,7 +627,6 @@ class GGEURClient(Client):
         else:
             # Fallback: Dataset without paths - cannot use caching
             logger.info(f"Client {self.ID}: Dataset does not have image paths, caching disabled")
-            self._load_feature_extractor()
 
             use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction', True) and torch.cuda.is_available()
             extract_batch_size = getattr(self.ggeur_cfg, 'extract_batch_size', 64)
@@ -599,6 +658,12 @@ class GGEURClient(Client):
                     labels = labels.cpu().numpy()
 
                     for feat, label in zip(features, labels):
+                        if not self._is_valid_feature_vector(feat):
+                            logger.warning(
+                                f"Client {self.ID}: Skip extracted feature "
+                                f"with invalid shape {np.asarray(feat).shape}, "
+                                f"expected dim {self.embedding_dim}")
+                            continue
                         label = int(label)
                         if label not in self.local_features:
                             self.local_features[label] = []
@@ -632,6 +697,16 @@ class GGEURClient(Client):
         for class_idx, features in self.local_features.items():
             if features.shape[0] == 0:
                 continue
+            if len(features.shape) != 2:
+                logger.warning(
+                    f"Client {self.ID}: Skip class {class_idx} with invalid "
+                    f"feature shape {features.shape}; expected 2D features.")
+                continue
+            if int(features.shape[1]) != int(self.embedding_dim):
+                logger.warning(
+                    f"Client {self.ID}: Skip class {class_idx} with feature "
+                    f"dim {features.shape[1]}; expected {self.embedding_dim}.")
+                continue
 
             n = features.shape[0]
             mean = np.mean(features, axis=0)
@@ -646,9 +721,31 @@ class GGEURClient(Client):
 
         logger.info(f"Client {self.ID}: Computed statistics for {len(self.local_means)} classes")
 
+    def _validate_local_statistics(self):
+        """Validate statistics dimensions before sending them to the server."""
+        expected_dim = int(self.embedding_dim)
+        invalid = []
+
+        for class_idx, mean in self.local_means.items():
+            mean_arr = np.asarray(mean)
+            cov_arr = np.asarray(self.local_covs.get(class_idx))
+            if mean_arr.shape != (expected_dim, ):
+                invalid.append(
+                    f"class {class_idx}: mean shape {mean_arr.shape}")
+                continue
+            if cov_arr.shape != (expected_dim, expected_dim):
+                invalid.append(f"class {class_idx}: cov shape {cov_arr.shape}")
+
+        if invalid:
+            detail = '; '.join(invalid[:5])
+            raise ValueError(
+                f"Client {self.ID}: Invalid local statistics for "
+                f"embedding_dim={expected_dim}. {detail}")
+
     def _upload_local_statistics(self):
         """Upload local statistics to server"""
         logger.info(f"Client {self.ID}: Uploading local statistics to server...")
+        self._validate_local_statistics()
 
         # Also send prototypes for cross-client augmentation
         prototypes = {}
@@ -682,9 +779,13 @@ class GGEURClient(Client):
         logger.info(f"Client {self.ID}: Received global covariances from server")
 
         content = message.content
-        self.global_cov_matrices = content.get('cov_matrices', {})
-        self.other_prototypes = content.get('other_prototypes', {}).get(self.ID, {})
-        self.global_prototypes = content.get('global_prototypes', {})  # For feature alignment
+        self.global_cov_matrices = self._normalize_covariance_mapping(
+            content.get('cov_matrices', {}))
+        other_prototypes = content.get('other_prototypes', {})
+        self.other_prototypes = self._normalize_prototype_mapping(
+            self._get_class_value(other_prototypes, self.ID) or {})
+        self.global_prototypes = self._normalize_prototype_mapping(
+            content.get('global_prototypes', {}))  # For feature alignment
 
         # Debug logging for received prototypes
         logger.info(f"Client {self.ID}: Received global_prototypes with {len(self.global_prototypes)} classes")
@@ -734,9 +835,126 @@ class GGEURClient(Client):
                 sender=self.ID,
                 receiver=[self.server_id],
                 state=self.state,
-                content=None
+                content='ready'
             )
         )
+
+    @staticmethod
+    def _get_class_value(mapping, class_idx):
+        """Read int-keyed payloads after serializers convert keys to strings."""
+        if not isinstance(mapping, dict):
+            return None
+        if class_idx in mapping:
+            return mapping[class_idx]
+        str_key = str(class_idx)
+        if str_key in mapping:
+            return mapping[str_key]
+        try:
+            int_key = int(class_idx)
+        except (TypeError, ValueError):
+            return None
+        return mapping.get(int_key)
+
+    def _normalize_covariance_mapping(self, cov_matrices):
+        """Convert received covariance payloads to {int: np.ndarray}."""
+        normalized = {}
+        if not isinstance(cov_matrices, dict):
+            return normalized
+
+        expected_dim = int(self.embedding_dim)
+        expected_shape = (expected_dim, expected_dim)
+        for class_idx, cov in cov_matrices.items():
+            try:
+                key = int(class_idx)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Client {self.ID}: Skip covariance with invalid class "
+                    f"key {class_idx}")
+                continue
+
+            cov_arr = self._payload_to_ndarray(cov)
+            if cov_arr is None:
+                logger.warning(
+                    f"Client {self.ID}: Skip covariance for class {key}; "
+                    f"payload could not be decoded")
+                continue
+            cov_arr = np.asarray(cov_arr, dtype=np.float32)
+            if cov_arr.shape != expected_shape:
+                logger.warning(
+                    f"Client {self.ID}: Skip covariance for class {key} "
+                    f"with shape {cov_arr.shape}, expected {expected_shape}")
+                continue
+            normalized[key] = cov_arr
+
+        return normalized
+
+    def _normalize_prototype_mapping(self, prototypes):
+        """Convert received prototype payloads to ndarray values keyed by int."""
+        normalized = {}
+        if not isinstance(prototypes, dict):
+            return normalized
+
+        expected_dim = int(self.embedding_dim)
+        expected_shape = (expected_dim, )
+        for class_idx, value in prototypes.items():
+            try:
+                key = int(class_idx)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Client {self.ID}: Skip prototype with invalid class "
+                    f"key {class_idx}")
+                continue
+
+            if (isinstance(value, list) and value and isinstance(
+                    value[0], (list, tuple, np.ndarray, str, bytes))):
+                proto_list = []
+                for proto in value:
+                    proto_arr = self._payload_to_ndarray(proto)
+                    if proto_arr is None:
+                        logger.warning(
+                            f"Client {self.ID}: Skip prototype for class "
+                            f"{key}; payload could not be decoded")
+                        continue
+                    proto_arr = np.asarray(proto_arr, dtype=np.float32)
+                    if proto_arr.shape == expected_shape:
+                        proto_list.append(proto_arr)
+                    else:
+                        logger.warning(
+                            f"Client {self.ID}: Skip prototype for class "
+                            f"{key} with shape {proto_arr.shape}, expected "
+                            f"{expected_shape}")
+                normalized[key] = proto_list
+            else:
+                proto_arr = self._payload_to_ndarray(value)
+                if proto_arr is None:
+                    logger.warning(
+                        f"Client {self.ID}: Skip prototype for class {key}; "
+                        f"payload could not be decoded")
+                    continue
+                proto_arr = np.asarray(proto_arr, dtype=np.float32)
+                if proto_arr.shape == expected_shape:
+                    normalized[key] = proto_arr
+                else:
+                    logger.warning(
+                        f"Client {self.ID}: Skip prototype for class {key} "
+                        f"with shape {proto_arr.shape}, expected "
+                        f"{expected_shape}")
+
+        return normalized
+
+    @staticmethod
+    def _payload_to_ndarray(payload):
+        """Decode compact gRPC payloads back to ndarray-compatible values."""
+        if isinstance(payload, bytes):
+            payload = payload.decode('utf-8')
+        if isinstance(payload, str):
+            try:
+                payload = param2tensor(payload)
+            except Exception:
+                return None
+        if isinstance(payload, torch.Tensor):
+            return payload.detach().cpu().numpy()
+        return payload
 
     def _nearest_pos_def(self, cov_matrix):
         """Ensure covariance matrix is positive definite"""
@@ -763,46 +981,53 @@ class GGEURClient(Client):
         return eigenvectors @ np.diag(eigenvalues) @ eigenvectors.T
 
     def _generate_samples(self, mean, cov_matrix, num_samples):
-        """Generate samples from Gaussian distribution"""
+        """Generate samples from Gaussian distribution."""
+        mean = np.asarray(mean, dtype=np.float32)
+        cov_matrix = np.asarray(cov_matrix, dtype=np.float32)
+
+        expected_dim = int(self.embedding_dim)
+        if mean.shape != (expected_dim, ):
+            raise ValueError(
+                f"Client {self.ID}: Cannot generate samples with mean shape "
+                f"{mean.shape}, expected ({expected_dim},).")
+        if cov_matrix.shape != (expected_dim, expected_dim):
+            raise ValueError(
+                f"Client {self.ID}: Cannot generate samples with covariance "
+                f"shape {cov_matrix.shape}, expected "
+                f"({expected_dim}, {expected_dim}).")
+
         dim = cov_matrix.shape[0]
+        cache_key = id(cov_matrix)
+        cached_factor = self._cov_factor_cache.get(cache_key)
 
-        # 对于高维矩阵，使用更快的采样方法
-        if dim > 512:
-            # 使用对角协方差近似（更快但损失一些精度）
-            # 或者使用低秩近似
-            try:
-                # 尝试直接Cholesky分解
-                jitter = 1e-5
-                L = np.linalg.cholesky(cov_matrix + jitter * np.eye(dim))
-                z = np.random.randn(num_samples, dim)
-                samples = mean + z @ L.T
-                return samples
-            except np.linalg.LinAlgError:
-                # 如果失败，使用对角近似
-                var = np.diag(cov_matrix)
-                var = np.maximum(var, 1e-6)
-                std = np.sqrt(var)
-                z = np.random.randn(num_samples, dim)
-                samples = mean + z * std
-                return samples
+        if cached_factor is None:
+            cov_matrix = self._nearest_pos_def(cov_matrix)
 
-        cov_matrix = self._nearest_pos_def(cov_matrix)
-
-        # Add jitter for numerical stability
-        jitter = 1e-6
-
-        while True:
-            try:
-                B = np.linalg.cholesky(cov_matrix + jitter * np.eye(dim))
-                break
-            except np.linalg.LinAlgError:
-                jitter *= 10
-                if jitter > 1:
-                    B = np.eye(dim) * 0.1
+            jitter = 1e-6
+            factor = None
+            factor_type = 'cholesky'
+            while True:
+                try:
+                    factor = np.linalg.cholesky(
+                        cov_matrix + jitter * np.eye(dim, dtype=np.float32))
                     break
+                except np.linalg.LinAlgError:
+                    jitter *= 10
+                    if jitter > 1:
+                        var = np.diag(cov_matrix)
+                        var = np.maximum(var, 1e-6)
+                        factor = np.sqrt(var)
+                        factor_type = 'diag'
+                        break
 
-        samples = np.random.multivariate_normal(mean, B @ B.T, num_samples)
-        return samples
+            cached_factor = (factor_type, factor.astype(np.float32))
+            self._cov_factor_cache[cache_key] = cached_factor
+
+        factor_type, factor = cached_factor
+        z = np.random.randn(num_samples, dim).astype(np.float32)
+        if factor_type == 'diag':
+            return mean + z * factor
+        return mean + z @ factor.T
 
     def _perform_augmentation(self):
         """Perform GGEUR_Clip feature augmentation"""
@@ -945,6 +1170,18 @@ class GGEURClient(Client):
         self.mlp_classifier = self.mlp_classifier.to(self.device)
         logger.info(f"Client {self.ID}: Built MLP classifier with {num_classes} classes")
 
+    def _should_skip_statistics_phase(self):
+        """Whether baseline mode can skip server-side statistics exchange."""
+        return (
+            int(getattr(self.ggeur_cfg, 'num_generated_per_sample', 0)) == 0
+            and int(getattr(self.ggeur_cfg, 'num_generated_per_prototype', 0)) == 0
+            and int(getattr(self.ggeur_cfg, 'target_size_per_class', 0)) == 0
+            and not getattr(self.ggeur_cfg, 'use_fedproto', False)
+            and not getattr(self.ggeur_cfg, 'use_cnn_distillation', False)
+            and not getattr(self.ggeur_cfg, 'use_feature_alignment', False)
+            and not getattr(self.ggeur_cfg, 'use_promptfl', False)
+        )
+
     def callback_funcs_for_model_para(self, message: Message):
         """
         Handle model parameters message.
@@ -969,6 +1206,28 @@ class GGEURClient(Client):
 
             # Extract CLIP features
             self._extract_clip_features()
+
+            if self._should_skip_statistics_phase():
+                logger.info(f"Client {self.ID}: Baseline mode detected, skip "
+                            f"statistics upload and prepare local features "
+                            f"for FedAvg directly")
+                self._perform_augmentation()
+                self._build_mlp_classifier()
+                self.statistics_uploaded = True
+
+                if getattr(self.ggeur_cfg, 'unload_extractor_after_cache', True):
+                    self._unload_feature_extractor()
+
+                self.comm_manager.send(
+                    Message(
+                        msg_type='augmentation_ready',
+                        sender=self.ID,
+                        receiver=[self.server_id],
+                        state=self.state,
+                        content='ready'
+                    )
+                )
+                return
 
             # Compute local statistics
             self._compute_local_statistics()

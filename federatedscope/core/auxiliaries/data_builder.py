@@ -116,6 +116,17 @@ def get_data(config, client_cfgs=None):
     # Fix the seed for data generation
     setup_seed(12345)
 
+    # In real distributed deployment, the server should not build the
+    # client-side training datasets. Methods that support server-side
+    # evaluation should load their own held-out test data from cfg paths.
+    if config.federate.mode.lower() == 'distributed' and \
+            getattr(config.distribute, 'role', 'client') == 'server' and \
+            config.federate.method.lower() in ['fedavg_domain_eval']:
+        logger.info("Distributed server role detected for method "
+                    f"{config.federate.method}: skip client dataset "
+                    "construction on the server side.")
+        return None, config
+
     for func in register.data_dict.values():
         data_and_config = func(config, client_cfgs)
         if data_and_config is not None:

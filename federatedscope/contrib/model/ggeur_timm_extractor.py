@@ -158,11 +158,11 @@ class TimmFeatureExtractor(nn.Module):
                     f"pretrained={self.pretrained}, frozen={self.freeze}")
 
     def _infer_feature_dim(self) -> int:
-        dim = getattr(self.backbone, 'num_features', None)
-        if isinstance(dim, int) and dim > 0:
-            return dim
+        declared_dim = getattr(self.backbone, 'num_features', None)
 
-        # Fallback: run a dummy forward (kept lightweight)
+        # Use the actual forward output as the source of truth. Some timm
+        # backbones keep num_features as the channel count even when forward
+        # returns an unpooled spatial tensor that this wrapper flattens.
         default_cfg = getattr(self.backbone, 'default_cfg', {}) or {}
         input_size = default_cfg.get('input_size', (self.in_chans, 224, 224))
         if not (isinstance(input_size, (tuple, list)) and len(input_size) == 3):
@@ -181,7 +181,15 @@ class TimmFeatureExtractor(nn.Module):
                 )
             if y.dim() > 2:
                 y = y.view(y.size(0), -1)
-            return int(y.shape[1])
+            actual_dim = int(y.shape[1])
+
+        if (isinstance(declared_dim, int) and declared_dim > 0
+                and int(declared_dim) != actual_dim):
+            logger.warning(
+                f"TimmFeatureExtractor: model num_features={declared_dim} "
+                f"but flattened forward dim={actual_dim}; using actual dim.")
+
+        return actual_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.freeze:

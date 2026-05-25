@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 
 from federatedscope.register import register_data
+from federatedscope.core.data.utils import convert_data_mode
 
 logger = logging.getLogger(__name__)
 
@@ -39,16 +40,31 @@ def load_ggeur_data(config, client_cfgs=None):
     """
     data_type = config.data.type.lower()
 
+    # In real distributed deployment, the server should not own or build the
+    # client training datasets. We still keep cfg.data available on the server
+    # side so worker-specific evaluation code can read test data paths if
+    # needed, but the actual loaded `data` for the server remains `None`.
+    if config.federate.mode.lower() == 'distributed' and \
+            getattr(config.distribute, 'role', 'client') == 'server':
+        logger.info("GGEUR distributed server role detected: skip building "
+                    "client datasets on the server side.")
+        return None, config
+
     if data_type == 'pacs':
-        return _load_pacs_ggeur_data(config, client_cfgs)
+        data, modified_config = _load_pacs_ggeur_data(config, client_cfgs)
     elif data_type in ['office-home', 'officehome', 'office_home']:
-        return _load_officehome_ggeur_data(config, client_cfgs)
+        data, modified_config = _load_officehome_ggeur_data(
+            config, client_cfgs)
     elif data_type in ['domainnet', 'domain-net', 'domain_net']:
-        return _load_domainnet_ggeur_data(config, client_cfgs)
+        data, modified_config = _load_domainnet_ggeur_data(
+            config, client_cfgs)
     else:
         logger.warning(f"Data type {data_type} not specifically supported for GGEUR_Clip, "
                        f"falling back to standard loading")
         return None
+
+    data = convert_data_mode(data, modified_config)
+    return data, modified_config
 
 
 def _generate_dirichlet_matrix(num_domains, num_classes, alpha, seed=42):

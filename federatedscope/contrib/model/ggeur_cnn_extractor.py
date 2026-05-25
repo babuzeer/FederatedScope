@@ -9,6 +9,7 @@ eliminating the need for feature alignment.
 """
 
 import logging
+import os
 import torch
 import torch.nn as nn
 
@@ -74,7 +75,11 @@ class CNNFeatureExtractor(nn.Module):
         'efficientnet_b7': (2560, True),
     }
 
-    def __init__(self, model_name='convnext_base', pretrained=True, freeze=True):
+    def __init__(self,
+                 model_name='convnext_base',
+                 pretrained=True,
+                 freeze=True,
+                 checkpoint_path=''):
         """
         Initialize CNN feature extractor.
 
@@ -88,6 +93,7 @@ class CNNFeatureExtractor(nn.Module):
         self.model_name = model_name.lower()
         self.pretrained = pretrained
         self.freeze = freeze
+        self.checkpoint_path = str(checkpoint_path or '')
 
         # Get feature dimension
         if self.model_name in self.MODEL_CONFIGS:
@@ -99,12 +105,15 @@ class CNNFeatureExtractor(nn.Module):
         # Build backbone
         self.backbone = self._build_backbone()
 
+        self._load_checkpoint()
+
         # Freeze if requested
         if freeze:
             self._freeze_backbone()
 
         logger.info(f"CNNFeatureExtractor: {model_name}, feature_dim={self.feature_dim}, "
-                   f"pretrained={pretrained}, frozen={freeze}")
+                   f"pretrained={pretrained}, frozen={freeze}, "
+                   f"checkpoint_path={self.checkpoint_path or 'None'}")
 
     def _build_backbone(self):
         """Build the backbone network"""
@@ -177,6 +186,37 @@ class CNNFeatureExtractor(nn.Module):
 
         return model
 
+    def _extract_state_dict(self, checkpoint):
+        if isinstance(checkpoint, dict):
+            for key in ['state_dict', 'model', 'model_state_dict', 'net']:
+                if key in checkpoint and isinstance(checkpoint[key], dict):
+                    return checkpoint[key]
+        return checkpoint
+
+    def _load_checkpoint(self):
+        ckpt = self.checkpoint_path.strip()
+        if not ckpt:
+            return
+        if not os.path.isfile(ckpt):
+            raise FileNotFoundError(f"cnn_checkpoint_path not found: {ckpt}")
+
+        checkpoint = torch.load(ckpt, map_location='cpu')
+        state_dict = self._extract_state_dict(checkpoint)
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Unsupported checkpoint format in {ckpt}")
+
+        cleaned_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                key = key[len('module.'):]
+            cleaned_state_dict[key] = value
+
+        missing, unexpected = self.backbone.load_state_dict(
+            cleaned_state_dict, strict=False)
+        logger.info(
+            f"CNNFeatureExtractor: Loaded checkpoint from {ckpt} "
+            f"(missing={len(missing)}, unexpected={len(unexpected)})")
+
     def _freeze_backbone(self):
         """Freeze all backbone parameters"""
         for param in self.backbone.parameters():
@@ -248,7 +288,8 @@ class GGEURCNNClassifier(nn.Module):
     """
 
     def __init__(self, backbone_name='convnext_base', num_classes=65,
-                 hidden_dim=0, dropout=0.0, pretrained=True, freeze_backbone=True):
+                 hidden_dim=0, dropout=0.0, pretrained=True,
+                 freeze_backbone=True, checkpoint_path=''):
         """
         Initialize GGEUR_Clip CNN classifier.
 
@@ -266,7 +307,8 @@ class GGEURCNNClassifier(nn.Module):
         self.backbone = CNNFeatureExtractor(
             model_name=backbone_name,
             pretrained=pretrained,
-            freeze=freeze_backbone
+            freeze=freeze_backbone,
+            checkpoint_path=checkpoint_path,
         )
 
         feature_dim = self.backbone.get_feature_dim()
@@ -325,7 +367,8 @@ class GGEURCNNClassifier(nn.Module):
 
 
 def get_cnn_feature_extractor(model_name='convnext_base', pretrained=True,
-                               freeze=True, device='cuda'):
+                               freeze=True, device='cuda',
+                               checkpoint_path=''):
     """
     Factory function to create CNN feature extractor.
 
@@ -341,7 +384,8 @@ def get_cnn_feature_extractor(model_name='convnext_base', pretrained=True,
     extractor = CNNFeatureExtractor(
         model_name=model_name,
         pretrained=pretrained,
-        freeze=freeze
+        freeze=freeze,
+        checkpoint_path=checkpoint_path,
     )
     extractor = extractor.to(device)
     return extractor

@@ -16,15 +16,17 @@ import time
 import logging
 import copy
 import re
+import queue
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from federatedscope.core.message import Message
+from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.workers import Server
 from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
+from federatedscope.core.auxiliaries.utils import param2tensor
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +144,71 @@ class GGEURServer(Server):
         # CLIP model and prompt components for server-side evaluation
         self.prompt_learner_eval = None
         self.text_encoder_eval = None
+
+        self.distributed_stage_timeout = int(
+            getattr(self.ggeur_cfg, 'distributed_stage_timeout', 1800))
+        self._stage_name = None
+        self._stage_start_time = None
+
+    def _mark_stage(self, stage_name):
+        self._stage_name = stage_name
+        self._stage_start_time = time.time()
+        logger.info(
+            f"Server: Entered distributed stage '{stage_name}' "
+            f"(timeout={self.distributed_stage_timeout}s)")
+
+    def _clear_stage(self):
+        self._stage_name = None
+        self._stage_start_time = None
+
+    def _check_distributed_stage_timeout(self):
+        if self.is_finish:
+            return
+        if self.distributed_stage_timeout <= 0:
+            return
+        if self._stage_name is None or self._stage_start_time is None:
+            return
+
+        elapsed = time.time() - self._stage_start_time
+        if elapsed <= self.distributed_stage_timeout:
+            return
+
+        logger.error(
+            f"Server: Timeout in distributed stage '{self._stage_name}' "
+            f"after {elapsed:.1f}s. joined_clients="
+            f"{list(getattr(self.comm_manager, 'neighbors', {}).keys())}, "
+            f"augmentation_ready={sorted(self.augmentation_ready_clients)}, "
+            f"train_buffer_rounds={list(self.msg_buffer.get('train', {}).keys())}")
+        self._notify_joined_clients_to_finish()
+        if hasattr(self.comm_manager, 'shutdown'):
+            self.comm_manager.shutdown()
+        self.is_finish = True
+        raise TimeoutError(
+            f"GGEUR distributed stage timeout: {self._stage_name}")
+
+    def run(self):
+        """Run GGEUR distributed server with GGEUR-specific stage timeouts."""
+        while self.join_in_client_num < self.client_num:
+            self._check_join_timeout()
+            try:
+                msg = self.comm_manager.receive(timeout=1.0)
+            except queue.Empty:
+                continue
+            self.msg_handlers[msg.msg_type](msg)
+
+        if self._stage_name is None:
+            self._mark_stage('statistics')
+
+        while self.state <= self.total_round_num and not self.is_finish:
+            try:
+                msg = self.comm_manager.receive(timeout=1.0)
+            except queue.Empty:
+                self._check_distributed_stage_timeout()
+                continue
+            self.msg_handlers[msg.msg_type](msg)
+
+        if not self.is_finish:
+            self.terminate(msg_type='finish')
 
     def _get_domainnet_eval_metadata(self):
         """Resolve DomainNet evaluation domains and classes."""
@@ -306,12 +373,14 @@ class GGEURServer(Server):
 
             model_name = getattr(self.ggeur_cfg, 'cnn_backbone', 'convnext_base')
             pretrained = getattr(self.ggeur_cfg, 'cnn_pretrained', True)
+            checkpoint_path = getattr(self.ggeur_cfg, 'cnn_checkpoint_path', '')
             freeze = True  # Always freeze for feature extraction
 
             self.cnn_extractor = CNNFeatureExtractor(
                 model_name=model_name,
                 pretrained=pretrained,
-                freeze=freeze
+                freeze=freeze,
+                checkpoint_path=checkpoint_path,
             )
             self.cnn_extractor = self.cnn_extractor.to(self.device)
 
@@ -649,6 +718,8 @@ class GGEURServer(Server):
                     f"server_inferred={self.inferred_embedding_dim}, client_{client_id}={client_embedding_dim}"
                 )
 
+        self._validate_received_statistics(client_id, content)
+
         # Store statistics
         self.local_statistics_buffer[client_id] = {
             'means': content['means'],
@@ -693,6 +764,79 @@ class GGEURServer(Server):
 
             self.statistics_collected = True
 
+    def _validate_received_statistics(self, client_id, content):
+        """Fail early when a client uploads statistics with wrong dimensions."""
+        if not isinstance(content, dict):
+            raise ValueError(
+                f"Server: local_statistics from client {client_id} must be "
+                f"a dict, got {type(content)}.")
+
+        expected_dim = int(self._get_embedding_dim())
+        invalid = []
+        means = content.get('means', {})
+        covs = content.get('covs', {})
+        counts = content.get('counts', {})
+
+        for class_idx, mean in means.items():
+            mean_arr = np.asarray(mean)
+            cov = self._get_class_value(covs, class_idx)
+            count = self._get_class_value(counts, class_idx)
+            cov_arr = np.asarray(cov)
+            if mean_arr.shape != (expected_dim, ):
+                invalid.append(
+                    f"class {class_idx}: mean shape {mean_arr.shape}")
+                continue
+            if cov_arr.shape != (expected_dim, expected_dim):
+                invalid.append(f"class {class_idx}: cov shape {cov_arr.shape}")
+            if count is None:
+                invalid.append(f"class {class_idx}: missing count")
+
+        if invalid:
+            detail = '; '.join(invalid[:5])
+            raise ValueError(
+                f"Server: Invalid local_statistics from client {client_id}. "
+                f"Expected embedding_dim={expected_dim}. {detail}. "
+                f"Please clear stale feature cache or align all clients to "
+                f"the same feature_extractor/embedding_dim.")
+
+    @staticmethod
+    def _get_class_value(mapping, class_idx):
+        """Read class-keyed stats regardless of int/string key serialization."""
+        if not isinstance(mapping, dict):
+            return None
+        if class_idx in mapping:
+            return mapping[class_idx]
+        str_key = str(class_idx)
+        if str_key in mapping:
+            return mapping[str_key]
+        try:
+            int_key = int(class_idx)
+        except (TypeError, ValueError):
+            return None
+        return mapping.get(int_key)
+
+    def _ensure_stat_shapes(self, client_id, class_idx, mean, cov, count,
+                            embedding_dim):
+        mean_arr = np.asarray(mean)
+        cov_arr = np.asarray(cov)
+        if mean_arr.shape != (embedding_dim, ):
+            raise ValueError(
+                f"Server: Invalid statistic during aggregation from client "
+                f"{client_id}, class {class_idx}: mean shape "
+                f"{mean_arr.shape}, expected ({embedding_dim},). "
+                f"Clear stale feature cache or align all clients to the same "
+                f"feature_extractor/embedding_dim.")
+        if cov_arr.shape != (embedding_dim, embedding_dim):
+            raise ValueError(
+                f"Server: Invalid statistic during aggregation from client "
+                f"{client_id}, class {class_idx}: cov shape {cov_arr.shape}, "
+                f"expected ({embedding_dim}, {embedding_dim}).")
+        if count is None:
+            raise ValueError(
+                f"Server: Missing count during aggregation from client "
+                f"{client_id}, class {class_idx}.")
+        return mean_arr, cov_arr, int(count)
+
     def callback_for_augmentation_ready(self, message: Message):
         """Handle client signaling augmentation is complete"""
         client_id = message.sender
@@ -702,6 +846,10 @@ class GGEURServer(Server):
 
         # When all clients are ready, start training
         if len(self.augmentation_ready_clients) >= self._client_num:
+            if self.global_mlp is None:
+                num_classes = self._cfg.model.num_classes
+                if num_classes > 0:
+                    self._build_global_mlp(num_classes)
             if self.use_fedopt:
                 logger.info("Server: All clients ready, starting FedOpt training...")
             else:
@@ -755,6 +903,7 @@ class GGEURServer(Server):
                     content=model_para
                 )
             )
+        self._mark_stage(f'round_{self.state}_model_updates')
 
     def _prepare_separated_training_params(self):
         """Prepare model parameters for separated training mode"""
@@ -885,10 +1034,17 @@ class GGEURServer(Server):
 
             # Collect statistics for this class from all clients
             for client_id, client_stats in self.local_statistics_buffer.items():
-                if class_idx in client_stats['means']:
-                    means.append(client_stats['means'][class_idx])
-                    covs.append(client_stats['covs'][class_idx])
-                    counts.append(client_stats['counts'][class_idx])
+                mean = self._get_class_value(client_stats['means'], class_idx)
+                if mean is not None:
+                    cov = self._get_class_value(client_stats['covs'],
+                                                class_idx)
+                    count = self._get_class_value(client_stats['counts'],
+                                                  class_idx)
+                    mean, cov, count = self._ensure_stat_shapes(
+                        client_id, class_idx, mean, cov, count, embedding_dim)
+                    means.append(mean)
+                    covs.append(cov)
+                    counts.append(count)
 
             if len(counts) == 0:
                 self.global_cov_matrices[class_idx] = np.eye(embedding_dim) * 0.01
@@ -937,9 +1093,22 @@ class GGEURServer(Server):
 
             # Collect means for this class from all clients
             for client_id, client_stats in self.local_statistics_buffer.items():
-                if class_idx in client_stats['means']:
-                    means.append(client_stats['means'][class_idx])
-                    counts.append(client_stats['counts'][class_idx])
+                mean = self._get_class_value(client_stats['means'], class_idx)
+                if mean is not None:
+                    count = self._get_class_value(client_stats['counts'],
+                                                  class_idx)
+                    mean_arr = np.asarray(mean)
+                    if mean_arr.shape != (embedding_dim, ):
+                        raise ValueError(
+                            f"Server: Invalid prototype statistic from client "
+                            f"{client_id}, class {class_idx}: mean shape "
+                            f"{mean_arr.shape}, expected ({embedding_dim},).")
+                    if count is None:
+                        raise ValueError(
+                            f"Server: Missing prototype count from client "
+                            f"{client_id}, class {class_idx}.")
+                    means.append(mean_arr)
+                    counts.append(int(count))
 
             if len(counts) == 0:
                 continue
@@ -980,11 +1149,18 @@ class GGEURServer(Server):
 
         for client_id in self.local_statistics_buffer.keys():
             content = {
-                'cov_matrices': self.global_cov_matrices,
-                'other_prototypes': {client_id: other_prototypes.get(client_id, {})},
-                'global_prototypes': self.global_prototypes  # For feature alignment
+                'cov_matrices': self._serialize_array_payload(
+                    self.global_cov_matrices),
+                'other_prototypes': {
+                    client_id: self._serialize_array_payload(
+                        other_prototypes.get(client_id, {}))
+                },
+                'global_prototypes': self._serialize_array_payload(
+                    self.global_prototypes)  # For feature alignment
             }
             self._bytes_sent += self._sizeof_content(content)
+            logger.info(
+                f"Server: Sending global covariances to client {client_id}")
             self.comm_manager.send(
                 Message(
                     msg_type='global_covariances',
@@ -994,8 +1170,33 @@ class GGEURServer(Server):
                     content=content
                 )
             )
+            logger.info(
+                f"Server: Sent global covariances to client {client_id}")
 
         logger.info(f"Server: Broadcasted global covariances to {len(self.local_statistics_buffer)} clients")
+        self._mark_stage('augmentation_ready')
+
+    @staticmethod
+    def _serialize_array_payload(payload):
+        """Encode array/tensor leaves to compact strings for gRPC transfer."""
+        if isinstance(payload, dict):
+            return {
+                key: GGEURServer._serialize_array_payload(value)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [
+                GGEURServer._serialize_array_payload(value)
+                for value in payload
+            ]
+        if isinstance(payload, tuple):
+            return [
+                GGEURServer._serialize_array_payload(value)
+                for value in payload
+            ]
+        if isinstance(payload, (np.ndarray, torch.Tensor)):
+            return b64serializer(payload).decode('utf-8')
+        return payload
 
     def callback_funcs_model_para(self, message: Message):
         """
@@ -1007,7 +1208,7 @@ class GGEURServer(Server):
         content = message.content
         self._bytes_recv += self._sizeof_content(content)
 
-        if isinstance(content, tuple) and len(content) == 2:
+        if isinstance(content, (tuple, list)) and len(content) == 2:
             sample_size, model_para = content
         else:
             sample_size, model_para = 0, content
@@ -1034,6 +1235,7 @@ class GGEURServer(Server):
         logger.info(
             f"Server: Performing {'FedOpt' if self.use_fedopt else 'FedAvg'} aggregation for round {round_idx}"
         )
+        self._clear_stage()
 
         # Collect all model parameters
         all_params = self.msg_buffer['train'][round_idx]
@@ -1233,6 +1435,18 @@ class GGEURServer(Server):
             logger.warning(f"Server: Expected dict for model params, got {type(first_params)}, skipping aggregation")
             return None
 
+        def _to_tensor(param):
+            if isinstance(param, torch.Tensor):
+                return param
+            try:
+                restored = param2tensor(param)
+                if isinstance(restored, torch.Tensor):
+                    return restored
+                return torch.tensor(restored)
+            except Exception as e:
+                logger.debug(f"Server: Cannot convert model parameter to tensor ({e})")
+                return None
+
         aggregated_params = {}
 
         for key in first_params.keys():
@@ -1241,12 +1455,10 @@ class GGEURServer(Server):
                 # Nested dict (e.g. combined params accidentally passed in); skip
                 logger.debug(f"Server: Skipping nested dict value for key '{key}' during aggregation setup")
                 continue
-            if not isinstance(param_tensor, torch.Tensor):
-                try:
-                    param_tensor = torch.tensor(param_tensor)
-                except Exception as e:
-                    logger.debug(f"Server: Cannot convert key '{key}' to tensor ({e}), skipping")
-                    continue
+            param_tensor = _to_tensor(param_tensor)
+            if param_tensor is None:
+                logger.debug(f"Server: Cannot convert key '{key}' to tensor, skipping")
+                continue
             aggregated_params[key] = torch.zeros_like(param_tensor).float()
 
         if not aggregated_params:
@@ -1261,11 +1473,9 @@ class GGEURServer(Server):
                 param_tensor = params[key]
                 if isinstance(param_tensor, dict):
                     continue
-                if not isinstance(param_tensor, torch.Tensor):
-                    try:
-                        param_tensor = torch.tensor(param_tensor)
-                    except Exception:
-                        continue
+                param_tensor = _to_tensor(param_tensor)
+                if param_tensor is None:
+                    continue
                 aggregated_params[key] += weight * param_tensor.float()
 
         return aggregated_params
@@ -1445,6 +1655,7 @@ class GGEURServer(Server):
 
     def _finish(self):
         """Finish FL training"""
+        self.is_finish = True
         logger.info("="*60)
         logger.info(f"Server: Training finished after {self.state} rounds")
 
@@ -1524,11 +1735,14 @@ class GGEURServer(Server):
                     sender=self.ID,
                     receiver=[client_id],
                     state=self.state,
-                    content=None
+                    content={}
                 )
             )
 
         self._monitor.finish_fl()
+        if hasattr(self.comm_manager, 'shutdown'):
+            self.comm_manager.shutdown()
+        self.state = self.total_round_num + 1
 
     # ==================== PromptFL Methods ====================
 

@@ -93,6 +93,9 @@ def extend_ggeur_cfg(cfg):
 
     # ========== Training Settings ==========
     cfg.ggeur.statistics_round = 0  # Round to collect statistics (usually 0)
+    # Timeout in seconds for GGEUR-specific distributed phases. Set <= 0 to
+    # disable the watchdog.
+    cfg.ggeur.distributed_stage_timeout = 1800
 
     # ========== FedProto Integration Settings ==========
     # Whether to use FedProto-style prototype regularization during MLP training

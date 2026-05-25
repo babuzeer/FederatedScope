@@ -48,6 +48,9 @@ class StandaloneCommManager(object):
         # All the workers share one comm_queue
         self.comm_queue.append(message)
 
+    def shutdown(self, grace=0):
+        return
+
 
 class StandaloneDDPCommManager(StandaloneCommManager):
     """
@@ -98,6 +101,9 @@ class StandaloneDDPCommManager(StandaloneCommManager):
                             break
         download_bytes, upload_bytes = message.count_bytes()
         self.monitor.track_upload_bytes(upload_bytes)
+
+    def shutdown(self, grace=0):
+        return
 
 
 class gRPCCommManager(object):
@@ -210,3 +216,13 @@ class gRPCCommManager(object):
         message = Message()
         message.parse(received_msg.msg)
         return message
+
+    def shutdown(self, grace=0):
+        grpc_server = getattr(self, 'grpc_server', None)
+        if grpc_server is None:
+            return
+        try:
+            stopped = grpc_server.stop(grace)
+            stopped.wait(timeout=grace if grace else 1)
+        finally:
+            self.grpc_server = None
