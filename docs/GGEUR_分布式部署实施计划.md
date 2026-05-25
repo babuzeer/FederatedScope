@@ -389,6 +389,34 @@
 - 配置基础现成
 - 规模比 `DomainNet` 更适合做第一轮分布式落地
 
+### 2026-05-21 状态更新
+
+当前 `OfficeHome + GGEUR + FedAvg` 分布式样板已经可以完整训练完成，阶段四“先落一个样板任务”的核心验收已经通过。
+
+已确认：
+
+- `server/client` 可以在真实 OfficeHome 数据集上完成 join
+- GGEUR 统计阶段、协方差聚合、全局协方差下发、客户端特征增强可以跑通
+- 训练轮次可以完整完成
+- 训练结束后 server/client 可以正常进入 finish 收尾路径
+
+因此下一步从“选择第一个真实样板任务”调整为：
+
+1. 进入阶段五：扩展到方法矩阵
+2. 以已跑通的 `OfficeHome + GGEUR + FedAvg` 为基线
+3. 优先补齐并验证 `OfficeHome + GGEUR + FedProx`
+4. FedProx 验证通过后，再继续推进 `FedProto`、`FedOpt`、`MOON`、`PromptFL`
+
+当前已新增：
+
+- `scripts/distributed_scripts/ggeur_officehome_vit_fedprox`
+
+下一次验收目标：
+
+- 在远端运行 `GGEUR + FedProx` 样板
+- 至少完成 join、统计阶段、增强阶段和 1 个训练 round
+- 稳定后跑完整 5 round，并将结果回写到 `docs/分布式实施记录日志.md`
+
 ## 9. 本文档的使用方式
 
 后续推进时，建议始终按本文档分层执行：
