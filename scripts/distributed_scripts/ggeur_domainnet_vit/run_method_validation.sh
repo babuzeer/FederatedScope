@@ -192,9 +192,9 @@ base = {
         'embedding_dim': 512,
         'use_feature_cache': True,
         'feature_cache_dir': '',
-        'num_generated_per_sample': 1,
-        'num_generated_per_prototype': 1,
-        'target_size_per_class': 1,
+        'num_generated_per_sample': 0,
+        'num_generated_per_prototype': 0,
+        'target_size_per_class': 0,
         'mlp_hidden_dim': 0,
         'mlp_dropout': 0.0,
         'use_cross_client_prototypes': True,
@@ -281,23 +281,27 @@ validate_method_logs() {
     local method="$1"
     expect_log_contains "$LOG_DIR/$method/server.log" "Training finished"
     expect_log_contains "$LOG_DIR/$method/client_1.log" "Extracted"
-    expect_log_contains "$LOG_DIR/$method/client_1.log" "Augmented data"
 
     case "$method" in
         fedprox)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "FedProx enabled"
             ;;
         fedopt)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/server.log" "FedOpt enabled"
             expect_log_contains "$LOG_DIR/$method/server.log" "Performing FedOpt aggregation"
             ;;
         moon)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "MOON enabled"
             ;;
         fedproto)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "FedProto settings - use_fedproto=True"
             ;;
         promptfl)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "Augmented data"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "PromptLearner ready"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "prompt_loader built"
             ;;

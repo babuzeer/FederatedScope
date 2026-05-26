@@ -150,9 +150,9 @@ def apply_common(cfg, role, client_id=None):
     cfg.setdefault('train', {})['local_update_steps'] = 1
     cfg.setdefault('dataloader', {})['batch_size'] = 16
     cfg.setdefault('ggeur', {})['distributed_stage_timeout'] = 1800
-    cfg['ggeur']['num_generated_per_sample'] = 2
-    cfg['ggeur']['num_generated_per_prototype'] = 2
-    cfg['ggeur']['target_size_per_class'] = 2
+    cfg['ggeur']['num_generated_per_sample'] = 0
+    cfg['ggeur']['num_generated_per_prototype'] = 0
+    cfg['ggeur']['target_size_per_class'] = 0
     cfg['ggeur']['use_cross_client_prototypes'] = True
     cfg['ggeur']['use_fedproto'] = False
     cfg['ggeur']['use_moon'] = False
@@ -217,22 +217,28 @@ PY
 validate_method_logs() {
     local method="$1"
     expect_log_contains "$LOG_DIR/$method/server.log" "Training finished"
+    expect_log_contains "$LOG_DIR/$method/client_1.log" "Extracted"
 
     case "$method" in
         fedprox)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "FedProx enabled"
             ;;
         fedopt)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/server.log" "FedOpt enabled"
             expect_log_contains "$LOG_DIR/$method/server.log" "Performing FedOpt aggregation"
             ;;
         moon)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "MOON enabled"
             ;;
         fedproto)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "No augmentation mode"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "FedProto settings - use_fedproto=True"
             ;;
         promptfl)
+            expect_log_contains "$LOG_DIR/$method/client_1.log" "Augmented data"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "PromptLearner ready"
             expect_log_contains "$LOG_DIR/$method/client_1.log" "prompt_loader built"
             ;;
