@@ -139,6 +139,13 @@ class GGEURClient(Client):
             return
 
         self.ggeur_cfg = config.ggeur
+        self.head_only_mode = getattr(self.ggeur_cfg, 'head_only_mode', False)
+        if self.head_only_mode:
+            logger.info(
+                f"Client {self.ID}: GGEUR HeadOnly system mode active. "
+                "Round 0 uses the real backbone for feature statistics and "
+                "augmentation; later rounds train the MLP head on augmented "
+                "feature cache.")
 
         # ===== Feature Extractor Mode =====
         # 'clip': Use CLIP (ViT-based, original method)
@@ -764,6 +771,10 @@ class GGEURClient(Client):
             'counts': self.local_counts,
             'prototypes': self._serialize_array_payload(prototypes)
         }
+        payload_bytes = self._sizeof_content(content)
+        logger.info(
+            f"Client {self.ID}: Local statistics payload bytes={payload_bytes} "
+            f"(classes={len(self.local_means)}, embedding_dim={self.embedding_dim})")
 
         self.comm_manager.send(
             Message(
@@ -810,6 +821,26 @@ class GGEURClient(Client):
         np.save(buffer, array, allow_pickle=False)
         compressed = zlib.compress(buffer.getvalue(), level=3)
         return 'znp:' + base64.b64encode(compressed).decode('ascii')
+
+    @staticmethod
+    def _sizeof_content(content) -> int:
+        """Best-effort serialized payload size estimate for system logs."""
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return len(content.encode('utf-8'))
+        if isinstance(content, bytes):
+            return len(content)
+        if isinstance(content, np.ndarray):
+            return content.nbytes
+        if isinstance(content, torch.Tensor):
+            return content.numel() * content.element_size()
+        if isinstance(content, dict):
+            return sum(GGEURClient._sizeof_content(v)
+                       for v in content.values())
+        if isinstance(content, (list, tuple)):
+            return sum(GGEURClient._sizeof_content(v) for v in content)
+        return 0
 
     def callback_for_global_covariances(self, message: Message):
         """Handle receiving global covariance matrices from server"""
@@ -1074,6 +1105,13 @@ class GGEURClient(Client):
 
     def _perform_augmentation(self):
         """Perform GGEUR_Clip feature augmentation"""
+        augmentation_start = time.time()
+        if self._try_load_augmented_feature_cache():
+            self.augmentation_done = True
+            self.local_features = {}
+            self.local_labels = {}
+            return
+
         target_size = self.ggeur_cfg.target_size_per_class
         num_per_sample = self.ggeur_cfg.num_generated_per_sample
         num_per_prototype = self.ggeur_cfg.num_generated_per_prototype
@@ -1183,6 +1221,17 @@ class GGEURClient(Client):
             else:
                 logger.info(f"Client {self.ID}: Augmented data - {self.augmented_features.shape[0]} samples, "
                             f"{len(np.unique(self.augmented_labels))} classes")
+            augmentation_elapsed = time.time() - augmentation_start
+            aug_qps = (
+                self.augmented_features.shape[0] / augmentation_elapsed
+                if augmentation_elapsed > 0 else 0.0
+            )
+            logger.info(
+                f"Client {self.ID}: Augmentation timing - "
+                f"samples={self.augmented_features.shape[0]}, "
+                f"time={augmentation_elapsed:.4f}s, "
+                f"qps={aug_qps:.2f} samples/s")
+            self._save_augmented_feature_cache()
 
         self.augmentation_done = True
 
@@ -1212,6 +1261,133 @@ class GGEURClient(Client):
 
         self.mlp_classifier = self.mlp_classifier.to(self.device)
         logger.info(f"Client {self.ID}: Built MLP classifier with {num_classes} classes")
+
+    def _augmented_cache_metadata(self):
+        splits = getattr(self._cfg.data, 'splits', [])
+        try:
+            splits = list(splits)
+        except Exception:
+            splits = []
+        return {
+            'source': 'real_dataset',
+            'mode': 'ggeur_headonly_augmented_features',
+            'client_id': int(self.ID),
+            'client_num': int(self._cfg.federate.client_num),
+            'dataset': str(self._cfg.data.type),
+            'data_root': str(self._cfg.data.root),
+            'splits': splits,
+            'seed': int(getattr(self._cfg, 'seed', 0)),
+            'feature_extractor': str(self.feature_extractor_type),
+            'embedding_dim': int(self.embedding_dim),
+            'num_classes': int(self._cfg.model.num_classes),
+            'num_generated_per_sample':
+                int(self.ggeur_cfg.num_generated_per_sample),
+            'num_generated_per_prototype':
+                int(self.ggeur_cfg.num_generated_per_prototype),
+            'target_size_per_class':
+                int(self.ggeur_cfg.target_size_per_class),
+            'headonly_cache_version':
+                str(getattr(self.ggeur_cfg, 'headonly_cache_version',
+                            'fcache_v1')),
+        }
+
+    def _get_augmented_feature_cache_path(self):
+        if not getattr(self.ggeur_cfg, 'head_only_mode', False):
+            return None
+        cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+        if not cache_dir:
+            return None
+        version = str(getattr(self.ggeur_cfg, 'headonly_cache_version',
+                              'fcache_v1')).replace('/', '_')
+        dataset = str(self._cfg.data.type).replace('/', '_')
+        path = os.path.join(
+            cache_dir,
+            'headonly_augmented',
+            version,
+            f'{dataset}_client_{int(self.ID):06d}.pt',
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def _try_load_augmented_feature_cache(self):
+        path = self._get_augmented_feature_cache_path()
+        if path is None or not os.path.exists(path):
+            return False
+        try:
+            cached = torch.load(path, map_location='cpu')
+            metadata = cached.get('metadata', {})
+            expected = self._augmented_cache_metadata()
+            if metadata != expected:
+                logger.info(
+                    f"Client {self.ID}: Ignore augmented cache metadata "
+                    f"mismatch at {path}")
+                return False
+            features = cached['features']
+            labels = cached['labels']
+            self.augmented_features = (
+                features.numpy() if isinstance(features, torch.Tensor)
+                else np.asarray(features)
+            )
+            self.augmented_labels = (
+                labels.numpy() if isinstance(labels, torch.Tensor)
+                else np.asarray(labels)
+            )
+            dataset = AugmentedFeatureDataset(
+                self.augmented_features, self.augmented_labels)
+            self.augmented_loader = DataLoader(
+                dataset,
+                batch_size=self._cfg.dataloader.batch_size,
+                shuffle=True,
+            )
+            logger.info(
+                f"Client {self.ID}: Loaded augmented HeadOnly feature cache "
+                f"from {path} ({len(self.augmented_labels)} samples)")
+            return True
+        except Exception as error:
+            logger.warning(
+                f"Client {self.ID}: Failed to load augmented cache {path}: "
+                f"{error}")
+            return False
+
+    def _save_augmented_feature_cache(self):
+        path = self._get_augmented_feature_cache_path()
+        if path is None or self.augmented_features is None:
+            return
+        try:
+            torch.save({
+                'features': torch.as_tensor(self.augmented_features).float(),
+                'labels': torch.as_tensor(self.augmented_labels).long(),
+                'metadata': self._augmented_cache_metadata(),
+            }, path)
+            logger.info(
+                f"Client {self.ID}: Saved augmented HeadOnly feature cache "
+                f"to {path} ({len(self.augmented_labels)} samples)")
+        except Exception as error:
+            logger.warning(
+                f"Client {self.ID}: Failed to save augmented cache {path}: "
+                f"{error}")
+
+    def _try_start_from_augmented_cache(self):
+        """Load generated HeadOnly samples and skip round-0 generation."""
+        if not getattr(self.ggeur_cfg,
+                       'headonly_skip_round0_if_augmented_cache_exists',
+                       False):
+            return False
+        if not getattr(self.ggeur_cfg, 'head_only_mode', False):
+            return False
+        if not self._try_load_augmented_feature_cache():
+            return False
+
+        self._build_mlp_classifier()
+        self.augmentation_done = True
+        self.statistics_uploaded = True
+        self.local_features = {}
+        self.local_labels = {}
+        logger.info(
+            f"Client {self.ID}: HeadOnly cache-hot mode active; skip "
+            "round-0 feature extraction/statistics/augmentation and train "
+            "on cached generated samples.")
+        return True
 
     def _should_skip_statistics_phase(self):
         """Whether baseline mode can skip server-side statistics exchange."""
@@ -1246,6 +1422,18 @@ class GGEURClient(Client):
         # Statistics collection round
         if round_idx == self.ggeur_cfg.statistics_round and not self.statistics_uploaded:
             logger.info(f"Client {self.ID}: Round {round_idx} - Statistics collection phase")
+
+            if self._try_start_from_augmented_cache():
+                self.comm_manager.send(
+                    Message(
+                        msg_type='augmentation_ready',
+                        sender=self.ID,
+                        receiver=[self.server_id],
+                        state=self.state,
+                        content='ready'
+                    )
+                )
+                return
 
             # Extract CLIP features
             self._extract_clip_features()

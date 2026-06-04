@@ -57,6 +57,12 @@ class GGEURServer(Server):
             return
 
         self.ggeur_cfg = config.ggeur
+        self.head_only_mode = getattr(self.ggeur_cfg, 'head_only_mode', False)
+        if self.head_only_mode:
+            logger.info(
+                "Server: GGEUR HeadOnly system mode active. Round 0 keeps "
+                "statistics/covariance/prototype/augmentation; later rounds "
+                "aggregate MLP-head parameters only.")
 
         # Statistics collection buffers
         self.local_statistics_buffer = {}  # {client_id: statistics}
@@ -140,6 +146,7 @@ class GGEURServer(Server):
         # Per-round timing
         self._round_start_time = None
         self._round_durations = []   # seconds per round
+        self._round_system_metrics = []
 
         # Communication volume (bytes)
         self._bytes_sent = 0      # server → clients
@@ -1420,9 +1427,22 @@ class GGEURServer(Server):
         if self._round_start_time is not None:
             round_elapsed = time.time() - self._round_start_time
             self._round_durations.append(round_elapsed)
+            train_qps = total_samples / round_elapsed if round_elapsed > 0 else 0.0
+            self._round_system_metrics.append({
+                'round': int(round_idx),
+                'total_samples': int(total_samples),
+                'round_time_sec': float(round_elapsed),
+                'train_qps_samples_per_sec': float(train_qps),
+                'valid_client_updates': len(valid_params),
+                'received_client_updates': len(all_params),
+                'bytes_sent_total': int(self._bytes_sent),
+                'bytes_recv_total': int(self._bytes_recv),
+            })
             logger.info(f"Server: Round {round_idx} aggregation complete, "
                         f"total samples: {total_samples}, "
-                        f"round time: {round_elapsed:.1f}s")
+                        f"round time: {round_elapsed:.1f}s, "
+                        f"train_qps={train_qps:.2f} samples/s, "
+                        f"valid_updates={len(valid_params)}/{self._client_num}")
 
         # Move to next round
         self.state = round_idx + 1
@@ -1807,6 +1827,28 @@ class GGEURServer(Server):
                         f"(min={min(self._round_durations):.1f}s, "
                         f"max={max(self._round_durations):.1f}s, "
                         f"rounds={len(self._round_durations)})")
+
+        if self._round_system_metrics:
+            qps_values = [
+                item['train_qps_samples_per_sec']
+                for item in self._round_system_metrics
+            ]
+            stable_qps_values = qps_values[1:] if len(qps_values) > 1 else qps_values
+            total_samples = sum(
+                item['total_samples'] for item in self._round_system_metrics
+            )
+            total_round_time = sum(
+                item['round_time_sec'] for item in self._round_system_metrics
+            )
+            logger.info(
+                "Server: HeadOnly/System QPS Summary - "
+                f"rounds={len(qps_values)}, "
+                f"total_samples={total_samples}, "
+                f"overall_train_qps={total_samples / total_round_time if total_round_time > 0 else 0.0:.2f} samples/s, "
+                f"avg_train_qps={sum(qps_values) / len(qps_values):.2f} samples/s, "
+                f"stable_avg_train_qps={sum(stable_qps_values) / len(stable_qps_values):.2f} samples/s, "
+                f"min_train_qps={min(qps_values):.2f} samples/s, "
+                f"max_train_qps={max(qps_values):.2f} samples/s")
 
         def _fmt_bytes(n):
             for unit in ('B', 'KB', 'MB', 'GB'):

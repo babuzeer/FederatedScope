@@ -93,6 +93,17 @@ def extend_ggeur_cfg(cfg):
 
     # ========== Training Settings ==========
     cfg.ggeur.statistics_round = 0  # Round to collect statistics (usually 0)
+    # HeadOnly system mode keeps the full GGEUR round-0 statistics and
+    # augmentation flow, then trains and communicates only the MLP head.
+    cfg.ggeur.head_only_mode = False
+    cfg.ggeur.head_only_after_round0 = True
+    cfg.ggeur.headonly_cache_version = 'fcache_v1'
+    cfg.ggeur.headonly_eval_mode = 'server'
+    # Cache-hot rerun mode for HeadOnly experiments. If True and the
+    # per-client augmented feature cache exists, clients skip round-0 feature
+    # statistics/augmentation and immediately train on cached generated samples.
+    # Keep False for full first-pass system validation.
+    cfg.ggeur.headonly_skip_round0_if_augmented_cache_exists = False
     # Timeout in seconds for GGEUR-specific distributed phases. Set <= 0 to
     # disable the watchdog.
     cfg.ggeur.distributed_stage_timeout = 1800

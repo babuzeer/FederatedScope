@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1120" viewBox="0 0 1500 1120">
+  <defs>
+    <style>
+      .title { font: 700 30px "Microsoft YaHei", Arial, sans-serif; fill: #1b1f24; }
+      .subtitle { font: 500 17px "Microsoft YaHei", Arial, sans-serif; fill: #57606a; }
+      .lane-title { font: 700 18px "Microsoft YaHei", Arial, sans-serif; fill: #1b1f24; }
+      .step-title { font: 700 17px "Microsoft YaHei", Arial, sans-serif; fill: #1b1f24; }
+      .step-text { font: 14px "Microsoft YaHei", Arial, sans-serif; fill: #3b434b; }
+      .small { font: 13px "Microsoft YaHei", Arial, sans-serif; fill: #57606a; }
+      .phase { font: 700 20px "Microsoft YaHei", Arial, sans-serif; fill: #064e3b; }
+      .client { fill: #eef6ff; stroke: #3578c6; stroke-width: 1.8; }
+      .subserver { fill: #fff7e6; stroke: #d18616; stroke-width: 1.8; }
+      .root { fill: #f0f7ef; stroke: #2f8f46; stroke-width: 1.8; }
+      .param { fill: #f5f0ff; stroke: #7b61c9; stroke-width: 1.8; }
+      .phasebox { fill: #ecfdf5; stroke: #2f8f46; stroke-width: 1.5; }
+      .arrow { stroke: #24292f; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+      .arrow-blue { stroke: #3578c6; stroke-width: 2; fill: none; marker-end: url(#arrowhead-blue); }
+      .arrow-orange { stroke: #d18616; stroke-width: 2; fill: none; marker-end: url(#arrowhead-orange); }
+      .arrow-purple { stroke: #7b61c9; stroke-width: 2; fill: none; marker-end: url(#arrowhead-purple); }
+      .separator { stroke: #d0d7de; stroke-width: 2; stroke-dasharray: 8 8; }
+    </style>
+    <marker id="arrowhead" markerWidth="12" markerHeight="10" refX="10" refY="5" orient="auto">
+      <path d="M 0 0 L 12 5 L 0 10 z" fill="#24292f"/>
+    </marker>
+    <marker id="arrowhead-blue" markerWidth="12" markerHeight="10" refX="10" refY="5" orient="auto">
+      <path d="M 0 0 L 12 5 L 0 10 z" fill="#3578c6"/>
+    </marker>
+    <marker id="arrowhead-orange" markerWidth="12" markerHeight="10" refX="10" refY="5" orient="auto">
+      <path d="M 0 0 L 12 5 L 0 10 z" fill="#d18616"/>
+    </marker>
+    <marker id="arrowhead-purple" markerWidth="12" markerHeight="10" refX="10" refY="5" orient="auto">
+      <path d="M 0 0 L 12 5 L 0 10 z" fill="#7b61c9"/>
+    </marker>
+  </defs>
+
+  <rect width="1500" height="1120" fill="#ffffff"/>
+  <text x="60" y="58" class="title">GGEUR Head-only 训练流程</text>
+  <text x="60" y="88" class="subtitle">第 0 轮使用预训练模型完成特征与增强；第 1 轮以后只进行 MLP 参数通信和聚合</text>
+
+  <rect x="60" y="130" width="1380" height="56" rx="10" class="phasebox"/>
+  <text x="88" y="166" class="phase">阶段 A：第 0 轮特征提取与 GGEUR 增强</text>
+
+  <rect x="80" y="225" width="260" height="74" rx="10" class="client"/>
+  <text x="106" y="254" class="step-title">1. Client 加载数据与 backbone</text>
+  <text x="106" y="280" class="step-text">本地数据 + ViT / ConvNeXt / Mixer</text>
+
+  <rect x="400" y="225" width="250" height="74" rx="10" class="client"/>
+  <text x="426" y="254" class="step-title">2. 提取本地 feature</text>
+  <text x="426" y="280" class="step-text">z = F_pretrained(x)</text>
+
+  <rect x="710" y="225" width="250" height="74" rx="10" class="client"/>
+  <text x="736" y="254" class="step-title">3. 计算本地统计</text>
+  <text x="736" y="280" class="step-text">mean / covariance / count</text>
+
+  <rect x="1020" y="225" width="250" height="74" rx="10" class="subserver"/>
+  <text x="1046" y="254" class="step-title">4. 上传 statistics</text>
+  <text x="1046" y="280" class="step-text">发送到 sub-server / root</text>
+
+  <path d="M 340 262 L 400 262" class="arrow-blue"/>
+  <path d="M 650 262 L 710 262" class="arrow-blue"/>
+  <path d="M 960 262 L 1020 262" class="arrow-orange"/>
+
+  <rect x="210" y="355" width="300" height="88" rx="10" class="root"/>
+  <text x="238" y="386" class="step-title">5. Root 聚合全局统计</text>
+  <text x="238" y="412" class="step-text">global covariance / global prototypes</text>
+  <text x="238" y="434" class="small">可经 sub-server 汇总后上报</text>
+
+  <rect x="610" y="355" width="300" height="88" rx="10" class="client"/>
+  <text x="638" y="386" class="step-title">6. Client 执行 GGEUR 增强</text>
+  <text x="638" y="412" class="step-text">在 feature 空间生成增强样本</text>
+  <text x="638" y="434" class="small">不上传原始图像</text>
+
+  <rect x="1010" y="355" width="300" height="88" rx="10" class="client"/>
+  <text x="1038" y="386" class="step-title">7. 保存增强 feature cache</text>
+  <text x="1038" y="412" class="step-text">augmented_features + labels</text>
+  <text x="1038" y="434" class="small">第 1 轮以后直接读取</text>
+
+  <path d="M 1145 299 C 1080 340, 820 340, 510 390" class="arrow"/>
+  <path d="M 510 400 L 610 400" class="arrow-blue"/>
+  <path d="M 910 400 L 1010 400" class="arrow-blue"/>
+
+  <rect x="500" y="500" width="500" height="74" rx="10" fill="#fff1f2" stroke="#d1242f" stroke-width="1.8"/>
+  <text x="536" y="530" class="step-title">8. Client 释放预训练模型</text>
+  <text x="536" y="556" class="step-text">释放 CLIP / ViT / ConvNeXt / Mixer，只保留 feature cache 与 MLP</text>
+  <path d="M 1160 443 C 1110 493, 980 520, 1000 537" class="arrow"/>
+
+  <line x1="60" y1="620" x2="1440" y2="620" class="separator"/>
+
+  <rect x="60" y="655" width="1380" height="56" rx="10" class="phasebox"/>
+  <text x="88" y="691" class="phase">阶段 B：第 1 轮以后 MLP-only 高并发训练</text>
+
+  <rect x="100" y="755" width="260" height="88" rx="10" class="param"/>
+  <text x="128" y="786" class="step-title">1. Client 拉取全局 MLP</text>
+  <text x="128" y="812" class="step-text">Parameter Service: global_mlp@vN</text>
+  <text x="128" y="834" class="small">download QPS 主要发生在这里</text>
+
+  <rect x="430" y="755" width="250" height="88" rx="10" class="client"/>
+  <text x="458" y="786" class="step-title">2. 本地训练 MLP</text>
+  <text x="458" y="812" class="step-text">输入：增强 feature cache</text>
+  <text x="458" y="834" class="small">不再运行 backbone forward</text>
+
+  <rect x="750" y="755" width="250" height="88" rx="10" class="subserver"/>
+  <text x="778" y="786" class="step-title">3. 上传 MLP update</text>
+  <text x="778" y="812" class="step-text">base_version + sample_size</text>
+  <text x="778" y="834" class="small">upload QPS 主要发生在这里</text>
+
+  <rect x="1070" y="755" width="250" height="88" rx="10" class="subserver"/>
+  <text x="1098" y="786" class="step-title">4. Sub-server 局部聚合</text>
+  <text x="1098" y="812" class="step-text">weighted average / quorum</text>
+  <text x="1098" y="834" class="small">减少 root server 压力</text>
+
+  <path d="M 360 800 L 430 800" class="arrow-purple"/>
+  <path d="M 680 800 L 750 800" class="arrow-orange"/>
+  <path d="M 1000 800 L 1070 800" class="arrow-orange"/>
+
+  <rect x="315" y="910" width="300" height="88" rx="10" class="root"/>
+  <text x="343" y="942" class="step-title">5. Root 全局聚合</text>
+  <text x="343" y="968" class="step-text">合并多个 sub-server 的结果</text>
+  <text x="343" y="990" class="small">FedAvg / FedOpt 等全局更新</text>
+
+  <rect x="760" y="910" width="330" height="88" rx="10" class="param"/>
+  <text x="788" y="942" class="step-title">6. 发布新版本全局 MLP</text>
+  <text x="788" y="968" class="step-text">Parameter Service: global_mlp@vN+1</text>
+  <text x="788" y="990" class="small">下一轮 client 再拉取新版本</text>
+
+  <path d="M 1195 843 C 1130 905, 790 930, 615 950" class="arrow"/>
+  <path d="M 615 954 L 760 954" class="arrow-purple"/>
+  <path d="M 925 910 C 870 870, 525 870, 230 843" class="arrow-purple"/>
+
+  <rect x="80" y="1034" width="1340" height="54" rx="27" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="112" y="1068" class="subtitle">验证重点：第 0 轮是否能稳定生成并缓存 feature；第 1 轮以后是否能严格保证只训练、上传和聚合 MLP 参数。</text>
+</svg>
