@@ -233,7 +233,8 @@ def get_trainer(model=None,
         trainer = wrap_benignTrainer(trainer)
 
     if is_attacker:
-        if 'backdoor' in config.attack.attack_method:
+        if 'backdoor' in config.attack.attack_method or \
+                config.attack.attack_method.lower() == 'a3fl':
             logger.info('--------This client is a backdoor attacker --------')
         else:
             logger.info('-------- This client is an privacy attacker --------')

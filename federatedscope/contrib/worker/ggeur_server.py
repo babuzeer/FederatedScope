@@ -26,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from federatedscope.attack.auxiliary.a3fl_utils import \
+    get_a3fl_active_attacker_ids
 from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.workers import Server
 from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
@@ -159,6 +161,11 @@ class GGEURServer(Server):
             getattr(self.ggeur_cfg, 'distributed_stage_timeout', 1800))
         self._stage_name = None
         self._stage_start_time = None
+        self.current_round_clients = list(range(1, self._client_num + 1))
+        self.a3fl_enabled = str(getattr(config.attack, 'attack_method', '')).lower() == 'a3fl'
+        self.latest_a3fl_meta = None
+        self.a3fl_test_loaders = {}
+        self.a3fl_test_loaded = False
 
     def _mark_stage(self, stage_name):
         self._stage_name = stage_name
@@ -967,11 +974,13 @@ class GGEURServer(Server):
                 model_para = {'mlp': model_para}
             model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
-        # Broadcast to all clients
+        # Broadcast to selected clients
+        receiver = self._select_round_receivers()
+        self.current_round_clients = list(receiver)
         send_bytes = self._sizeof_content(model_para)
-        self._bytes_sent += send_bytes * self._client_num
+        self._bytes_sent += send_bytes * len(receiver)
         self._round_start_time = time.time()
-        for client_id in range(1, self._client_num + 1):
+        for client_id in receiver:
             self.comm_manager.send(
                 Message(
                     msg_type='model_para',
@@ -981,7 +990,32 @@ class GGEURServer(Server):
                     content=model_para
                 )
             )
+        logger.info(f"Server: Round {self.state} receivers={receiver}")
         self._mark_stage(f'round_{self.state}_model_updates')
+
+    def _select_round_receivers(self):
+        sample_num = int(self.sample_client_num)
+        all_clients = list(range(1, self._client_num + 1))
+        if sample_num <= 0 or sample_num >= self._client_num:
+            return all_clients
+
+        if self.a3fl_enabled:
+            active_attackers = get_a3fl_active_attacker_ids(
+                self._cfg, self.state, sample_num)
+            active_attackers = [cid for cid in active_attackers if cid in all_clients]
+            benign_pool = [cid for cid in all_clients if cid not in active_attackers]
+            benign_needed = max(0, sample_num - len(active_attackers))
+            if benign_needed > 0:
+                benign_selected = np.random.choice(benign_pool,
+                                                   size=benign_needed,
+                                                   replace=False).tolist()
+            else:
+                benign_selected = []
+            receiver = active_attackers + benign_selected
+            if len(receiver) == sample_num:
+                return receiver
+
+        return self.sampler.sample(size=sample_num)
 
     def _prepare_separated_training_params(self):
         """Prepare model parameters for separated training mode"""
@@ -1308,11 +1342,12 @@ class GGEURServer(Server):
 
         self.msg_buffer['train'][round_idx].append((sample_size, model_para, sender))
 
+        expected_num = len(getattr(self, 'current_round_clients', [])) or self._client_num
         logger.info(f"Server: Received model from client {sender} for round {round_idx} "
-                    f"({len(self.msg_buffer['train'][round_idx])}/{self._client_num})")
+                    f"({len(self.msg_buffer['train'][round_idx])}/{expected_num})")
 
         # Check if all clients have responded
-        if len(self.msg_buffer['train'][round_idx]) >= self._client_num:
+        if len(self.msg_buffer['train'][round_idx]) >= expected_num:
             self._perform_fedavg(round_idx)
 
     def _perform_fedavg(self, round_idx):
@@ -1344,6 +1379,28 @@ class GGEURServer(Server):
         # Compute sample weights
         sample_sizes = [s for s, p in valid_params]
         total_samples = sum(sample_sizes)
+
+        a3fl_updates = []
+        cleaned_valid_params = []
+        for sample_size, params in valid_params:
+            cleaned_params = params
+            if isinstance(params, dict) and 'a3fl' in params:
+                a3fl_updates.append(params.get('a3fl'))
+                if 'mlp' not in params:
+                    cleaned_params = copy.deepcopy(params)
+                    cleaned_params.pop('a3fl', None)
+            cleaned_valid_params.append((sample_size, cleaned_params))
+        valid_params = cleaned_valid_params
+
+        active_a3fl = [
+            meta for meta in a3fl_updates
+            if isinstance(meta, dict) and meta.get('active', False)
+        ]
+        self.latest_a3fl_meta = active_a3fl[0] if active_a3fl else None
+        if self.a3fl_enabled:
+            logger.info(
+                f"Server: Round {round_idx} received {len(a3fl_updates)} A3FL metadata payloads, "
+                f"active={len(active_a3fl)}")
 
         # Handle separated training mode
         if self.use_separated_training:
@@ -1380,6 +1437,7 @@ class GGEURServer(Server):
                         self.global_cnn.load_state_dict(cnn_aggregated)
                     except Exception as e:
                         logger.debug(f"Server: Could not load CNN params: {e}")
+
             else:
                 # Standard mode: only MLP
                 mlp_aggregated = self._aggregate_model_params(valid_params, total_samples)
@@ -1401,6 +1459,15 @@ class GGEURServer(Server):
             if test_results:
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
                 logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+            if self.a3fl_enabled and self.latest_a3fl_meta is not None:
+                poison_results = self._evaluate_a3fl_on_test_sets()
+                if poison_results:
+                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
+                    logger.info(f"Server: Round {round_idx} A3FL Poison Accuracy - {poison_str}")
+                else:
+                    logger.info(
+                        f"Server: Round {round_idx} skipped A3FL Poison Accuracy logging "
+                        f"because evaluation returned no results")
 
         # Aggregate and evaluate PromptFL if enabled
         if self.use_promptfl:
@@ -1442,7 +1509,7 @@ class GGEURServer(Server):
                         f"total samples: {total_samples}, "
                         f"round time: {round_elapsed:.1f}s, "
                         f"train_qps={train_qps:.2f} samples/s, "
-                        f"valid_updates={len(valid_params)}/{self._client_num}")
+                        f"valid_updates={len(valid_params)}/{len(self.current_round_clients)}")
 
         # Move to next round
         self.state = round_idx + 1
@@ -1745,6 +1812,128 @@ class GGEURServer(Server):
                 self.best_cnn_avg_accuracy = avg_accuracy
                 self.best_cnn_model_state = copy.deepcopy(self.global_cnn.state_dict())
 
+        return results
+
+    def _load_a3fl_test_loaders(self):
+        if self.a3fl_test_loaded:
+            return
+
+        logger.info("Server: Loading raw test loaders for A3FL evaluation...")
+        data_type = self._cfg.data.type.lower()
+        data_root = self._cfg.data.root
+        splits = tuple(self._cfg.data.splits) if hasattr(self._cfg.data, 'splits') else (0.7, 0.0, 0.3)
+        train_ratio, val_ratio = splits[0], splits[1]
+        seed = self._cfg.seed if hasattr(self._cfg, 'seed') else 123
+
+        if 'office' in data_type and 'home' in data_type:
+            domains = ['Art', 'Clipart', 'Product', 'Real_World']
+            from federatedscope.cv.dataset.office_home import OfficeHome
+            dataset_class = OfficeHome
+            dataset_kwargs = {}
+        elif 'pacs' in data_type:
+            domains = ['photo', 'art_painting', 'cartoon', 'sketch']
+            from federatedscope.cv.dataset.pacs import PACS
+            dataset_class = PACS
+            dataset_kwargs = {}
+        else:
+            self.a3fl_test_loaded = True
+            return
+
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711])
+        ])
+
+        for domain in domains:
+            dataset = dataset_class(root=data_root,
+                                    domain=domain,
+                                    split='test',
+                                    transform=transform,
+                                    train_ratio=train_ratio,
+                                    val_ratio=val_ratio,
+                                    seed=seed,
+                                    **dataset_kwargs)
+            if len(dataset) == 0:
+                continue
+            self.a3fl_test_loaders[domain] = DataLoader(dataset,
+                                                        batch_size=32,
+                                                        shuffle=False,
+                                                        num_workers=0)
+        self.a3fl_test_loaded = True
+
+    @staticmethod
+    def _restore_a3fl_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value
+        try:
+            restored = param2tensor(value)
+        except Exception:
+            restored = value
+        if isinstance(restored, torch.Tensor):
+            return restored
+        if isinstance(restored, np.ndarray):
+            return torch.from_numpy(restored)
+        if isinstance(restored, list):
+            return torch.tensor(restored)
+        return restored
+
+    def _evaluate_a3fl_on_test_sets(self):
+        if self.global_mlp is None or self.latest_a3fl_meta is None:
+            return {}
+        trigger = self._restore_a3fl_tensor(
+            self.latest_a3fl_meta.get('trigger'))
+        mask = self._restore_a3fl_tensor(self.latest_a3fl_meta.get('mask'))
+        if trigger is None or mask is None:
+            return {}
+        if not isinstance(trigger, torch.Tensor) or \
+                not isinstance(mask, torch.Tensor):
+            logger.info("Server: A3FL metadata received but trigger/mask could not be restored")
+            return {}
+
+        self._load_a3fl_test_loaders()
+        if not self.a3fl_test_loaders:
+            return {}
+
+        self._load_feature_extractor()
+        trigger = trigger.to(self.device).float()
+        mask = mask.to(self.device).float()
+        target_label = int(self.latest_a3fl_meta.get(
+            'target_label', self._cfg.attack.target_label_ind))
+
+        self.global_mlp.eval()
+        if self.feature_extractor_type == 'clip' and self.clip_model is not None:
+            self.clip_model.eval()
+        if self.feature_extractor_type == 'cnn' and self.cnn_extractor is not None:
+            self.cnn_extractor.eval()
+        if self.feature_extractor_type == 'timm' and self.timm_extractor is not None:
+            self.timm_extractor.eval()
+
+        results = {}
+        with torch.no_grad():
+            for domain, dataloader in self.a3fl_test_loaders.items():
+                correct = 0
+                total = 0
+                for images, _ in dataloader:
+                    images = images.to(self.device)
+                    poisoned_images = trigger * mask + images * (1.0 - mask)
+                    if self.feature_extractor_type == 'cnn':
+                        features = self.cnn_extractor(poisoned_images)
+                    elif self.feature_extractor_type == 'timm':
+                        features = self.timm_extractor(poisoned_images)
+                    else:
+                        features = self.clip_model.encode_image(poisoned_images)
+                    logits = self.global_mlp(features.float())
+                    preds = torch.argmax(logits, dim=1)
+                    targets = torch.full_like(preds, target_label)
+                    correct += preds.eq(targets).sum().item()
+                    total += preds.shape[0]
+                results[domain] = correct / total if total > 0 else 0.0
+
+        if results:
+            results['average'] = sum(results.values()) / len(results)
         return results
 
     @staticmethod

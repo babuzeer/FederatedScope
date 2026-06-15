@@ -37,6 +37,23 @@ def extend_attack_cfg(cfg):
     cfg.attack.self_epoch = 6
     # Note: the mean and std should be the list type.
 
+    # for A3FL
+    cfg.attack.a3fl = CN()
+    cfg.attack.a3fl.poison_epochs = 10
+    cfg.attack.a3fl.sample_method = 'random'
+    cfg.attack.a3fl.sample_poison_ratio = 0.2
+    cfg.attack.a3fl.start_round = -1
+    cfg.attack.a3fl.trigger_size = 5
+    cfg.attack.a3fl.trigger_offset = 2
+    cfg.attack.a3fl.trigger_init = 0.5
+    cfg.attack.a3fl.trigger_outer_epochs = 20
+    cfg.attack.a3fl.trigger_search_batches = 2
+    cfg.attack.a3fl.trigger_lr = 0.01
+    cfg.attack.a3fl.trigger_clip_min = -2.0
+    cfg.attack.a3fl.trigger_clip_max = 2.0
+    cfg.attack.a3fl.save_trigger_samples = False
+    cfg.attack.a3fl.save_trigger_max_samples = 4
+
     # for reconstruct_opt
     cfg.attack.reconstruct_lr = 0.01
     cfg.attack.reconstruct_optim = 'Adam'

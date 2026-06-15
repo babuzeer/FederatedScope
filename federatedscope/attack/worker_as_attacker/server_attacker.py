@@ -1,5 +1,7 @@
 from federatedscope.core.workers import Server
 from federatedscope.core.message import Message
+from federatedscope.attack.auxiliary.a3fl_utils import \
+    get_a3fl_active_attacker_ids
 
 from federatedscope.core.auxiliaries.criterion_builder import get_criterion
 import copy
@@ -44,6 +46,21 @@ class BackdoorServer(Server):
                                              strategy=strategy,
                                              **kwargs)
 
+    def _sample_a3fl_receiver(self, sample_client_num):
+        active_attackers = get_a3fl_active_attacker_ids(
+            self._cfg, self.state, sample_client_num)
+        if len(active_attackers) == 0:
+            return self.sampler.sample(size=sample_client_num)
+
+        candidate_clients = np.arange(1, self.client_num + 1)
+        benign_pool = np.array(
+            [x for x in candidate_clients if x not in active_attackers])
+        benign_num = max(0, sample_client_num - len(active_attackers))
+        benign_receivers = np.random.choice(benign_pool,
+                                            size=benign_num,
+                                            replace=False).tolist()
+        return active_attackers + benign_receivers
+
     def broadcast_model_para(self,
                              msg_type='model_para',
                              sample_client_num=-1,
@@ -69,64 +86,67 @@ class BackdoorServer(Server):
             self.sampler.change_state(self.unseen_clients_id, 'unseen')
 
         if sample_client_num > 0:  # only activated at training process
-            attacker_id = self._cfg.attack.attacker_id
-            setting = self._cfg.attack.setting
-            insert_round = self._cfg.attack.insert_round
+            if self._cfg.attack.attack_method.lower() == 'a3fl':
+                receiver = self._sample_a3fl_receiver(sample_client_num)
+            else:
+                attacker_id = self._cfg.attack.attacker_id
+                setting = self._cfg.attack.setting
+                insert_round = self._cfg.attack.insert_round
 
-            if attacker_id == -1 or self._cfg.attack.attack_method == '':
+                if attacker_id == -1 or self._cfg.attack.attack_method == '':
 
-                receiver = np.random.choice(np.arange(1, self.client_num + 1),
-                                            size=sample_client_num,
-                                            replace=False).tolist()
+                    receiver = np.random.choice(np.arange(1, self.client_num + 1),
+                                                size=sample_client_num,
+                                                replace=False).tolist()
 
-            elif setting == 'fix':
-                if self.state % self._cfg.attack.freq == 0:
+                elif setting == 'fix':
+                    if self.state % self._cfg.attack.freq == 0:
+                        client_list = np.delete(np.arange(1, self.client_num + 1),
+                                                self._cfg.attack.attacker_id - 1)
+                        receiver = np.random.choice(client_list,
+                                                    size=sample_client_num - 1,
+                                                    replace=False).tolist()
+                        receiver.insert(0, self._cfg.attack.attacker_id)
+                        logger.info('starting the fix-frequency poisoning attack')
+                        logger.info(
+                            'starting poisoning round: {:d}, the attacker ID: {:d}'
+                            .format(self.state, self._cfg.attack.attacker_id))
+                    else:
+                        client_list = np.delete(np.arange(1, self.client_num + 1),
+                                                self._cfg.attack.attacker_id - 1)
+                        receiver = np.random.choice(client_list,
+                                                    size=sample_client_num,
+                                                    replace=False).tolist()
+
+                elif setting == 'single' and self.state == insert_round:
                     client_list = np.delete(np.arange(1, self.client_num + 1),
                                             self._cfg.attack.attacker_id - 1)
                     receiver = np.random.choice(client_list,
                                                 size=sample_client_num - 1,
                                                 replace=False).tolist()
                     receiver.insert(0, self._cfg.attack.attacker_id)
-                    logger.info('starting the fix-frequency poisoning attack')
+                    logger.info('starting the single-shot poisoning attack')
                     logger.info(
-                        'starting poisoning round: {:d}, the attacker ID: {:d}'
-                        .format(self.state, self._cfg.attack.attacker_id))
-                else:
+                        'starting poisoning round: {:d}, the attacker ID: {:d}'.
+                        format(self.state, self._cfg.attack.attacker_id))
+
+                elif self._cfg.attack.setting == 'all':
+
                     client_list = np.delete(np.arange(1, self.client_num + 1),
                                             self._cfg.attack.attacker_id - 1)
                     receiver = np.random.choice(client_list,
+                                                size=sample_client_num - 1,
+                                                replace=False).tolist()
+                    receiver.insert(0, self._cfg.attack.attacker_id)
+                    logger.info('starting the all-round poisoning attack')
+                    logger.info(
+                        'starting poisoning round: {:d}, the attacker ID: {:d}'.
+                        format(self.state, self._cfg.attack.attacker_id))
+
+                else:
+                    receiver = np.random.choice(np.arange(1, self.client_num + 1),
                                                 size=sample_client_num,
                                                 replace=False).tolist()
-
-            elif setting == 'single' and self.state == insert_round:
-                client_list = np.delete(np.arange(1, self.client_num + 1),
-                                        self._cfg.attack.attacker_id - 1)
-                receiver = np.random.choice(client_list,
-                                            size=sample_client_num - 1,
-                                            replace=False).tolist()
-                receiver.insert(0, self._cfg.attack.attacker_id)
-                logger.info('starting the single-shot poisoning attack')
-                logger.info(
-                    'starting poisoning round: {:d}, the attacker ID: {:d}'.
-                    format(self.state, self._cfg.attack.attacker_id))
-
-            elif self._cfg.attack.setting == 'all':
-
-                client_list = np.delete(np.arange(1, self.client_num + 1),
-                                        self._cfg.attack.attacker_id - 1)
-                receiver = np.random.choice(client_list,
-                                            size=sample_client_num - 1,
-                                            replace=False).tolist()
-                receiver.insert(0, self._cfg.attack.attacker_id)
-                logger.info('starting the all-round poisoning attack')
-                logger.info(
-                    'starting poisoning round: {:d}, the attacker ID: {:d}'.
-                    format(self.state, self._cfg.attack.attacker_id))
-
-            else:
-                receiver = np.random.choice(np.arange(1, self.client_num + 1),
-                                            size=sample_client_num,
-                                            replace=False).tolist()
 
         else:
             # broadcast to all clients

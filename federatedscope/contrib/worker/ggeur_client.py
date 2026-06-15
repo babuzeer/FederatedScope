@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from federatedscope.attack.auxiliary.a3fl_utils import \
+    parse_attacker_ids, should_a3fl_attack
 from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.auxiliaries.utils import param2tensor
 from federatedscope.core.workers import Client
@@ -188,6 +190,8 @@ class GGEURClient(Client):
         self.augmented_features = None
         self.augmented_labels = None
         self.augmented_loader = None
+        self.base_augmented_features = None
+        self.base_augmented_labels = None
 
         # Real local features saved before augmentation (for PromptFL training)
         self.real_local_features = {}
@@ -228,6 +232,16 @@ class GGEURClient(Client):
         self.hf_clip_model = None      # HuggingFace CLIPModel (separate from open_clip)
         self.global_prompt_ctx = None  # Latest global PromptFL context
 
+        # ===== A3FL Mode =====
+        attack_method = str(getattr(config.attack, 'attack_method', '')).lower()
+        self.a3fl_enabled = attack_method == 'a3fl'
+        self.a3fl_cfg = getattr(config.attack, 'a3fl', None)
+        self.a3fl_attacker_ids = set(parse_attacker_ids(config.attack.attacker_id))
+        self.a3fl_is_attacker = self.a3fl_enabled and self.ID in self.a3fl_attacker_ids
+        self.a3fl_trigger = None
+        self.a3fl_mask = None
+        self.a3fl_latest_meta = {'active': False, 'client_id': int(self.ID)}
+
     def _register_default_handlers(self):
         """Register message handlers"""
         super()._register_default_handlers()
@@ -266,6 +280,332 @@ class GGEURClient(Client):
         if unloaded:
             torch.cuda.empty_cache()
             logger.info(f"Client {self.ID}: Feature extractor unloaded from GPU")
+
+    def _extractor_forward(self, images):
+        if self.feature_extractor_type == 'cnn':
+            return self.cnn_extractor(images)
+        if self.feature_extractor_type == 'timm':
+            return self.timm_extractor(images)
+        return self.clip_model.encode_image(images)
+
+    def _get_train_dataset_base(self):
+        train_data = self.trainer.ctx.data.get('train', None)
+        if train_data is None:
+            train_data = self.data.get('train', None)
+        if train_data is None:
+            return None, None
+
+        dataset = train_data.dataset if hasattr(train_data, 'dataset') else train_data
+        from torch.utils.data import Subset
+        if isinstance(dataset, Subset):
+            return dataset.dataset, list(dataset.indices)
+        return dataset, list(range(len(dataset)))
+
+    def _ensure_a3fl_trigger(self, sample_image):
+        if self.a3fl_trigger is not None and self.a3fl_mask is not None:
+            return
+        if sample_image.dim() != 3:
+            raise ValueError('A3FL requires image tensor with shape [C, H, W].')
+
+        _, height, width = sample_image.shape
+        trigger_size = max(1, int(getattr(self.a3fl_cfg, 'trigger_size', 5)))
+        trigger_offset = max(0, int(getattr(self.a3fl_cfg, 'trigger_offset', 2)))
+        patch_h = min(trigger_size, height)
+        patch_w = min(trigger_size, width)
+        start_h = min(trigger_offset, max(0, height - patch_h))
+        start_w = min(trigger_offset, max(0, width - patch_w))
+
+        self.a3fl_trigger = torch.full(
+            (1, sample_image.shape[0], height, width),
+            float(getattr(self.a3fl_cfg, 'trigger_init', 0.5)),
+            device=self.device)
+        self.a3fl_mask = torch.zeros_like(self.a3fl_trigger)
+        self.a3fl_mask[:, :, start_h:start_h + patch_h,
+                       start_w:start_w + patch_w] = 1.0
+
+    def _apply_a3fl_trigger(self, images):
+        if self.a3fl_trigger is None or self.a3fl_mask is None:
+            return images
+        return self.a3fl_trigger * self.a3fl_mask + images * (1.0 -
+                                                              self.a3fl_mask)
+
+    def _a3fl_to_visual_tensor(self, images):
+        images = images.detach().cpu().float()
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        if self.feature_extractor_type == 'clip':
+            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
+                                dtype=images.dtype).view(1, 3, 1, 1)
+            std = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                               dtype=images.dtype).view(1, 3, 1, 1)
+            images = images * std + mean
+        elif images.shape[1] == 3:
+            mean = torch.tensor([0.485, 0.456, 0.406],
+                                dtype=images.dtype).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225],
+                               dtype=images.dtype).view(1, 3, 1, 1)
+            if images.min() < 0.0 or images.max() > 1.0:
+                images = images * std + mean
+
+        return torch.clamp(images, 0.0, 1.0)
+
+    def _save_a3fl_trigger_visuals(self, round_idx, clean_images,
+                                   poisoned_images):
+        if not bool(getattr(self.a3fl_cfg, 'save_trigger_samples', False)):
+            return
+        if clean_images is None or poisoned_images is None or \
+                clean_images.numel() == 0 or poisoned_images.numel() == 0:
+            return
+
+        from torchvision.utils import save_image
+
+        max_samples = max(
+            1, int(getattr(self.a3fl_cfg, 'save_trigger_max_samples', 4)))
+        clean_images = clean_images[:max_samples]
+        poisoned_images = poisoned_images[:max_samples]
+
+        clean_vis = self._a3fl_to_visual_tensor(clean_images)
+        poisoned_vis = self._a3fl_to_visual_tensor(poisoned_images)
+        delta_vis = torch.clamp(
+            (poisoned_vis - clean_vis).abs() * 4.0, 0.0, 1.0)
+        trigger_vis = self._a3fl_to_visual_tensor(
+            self.a3fl_trigger * self.a3fl_mask)
+        mask_vis = self.a3fl_mask.detach().cpu().float()
+        if mask_vis.dim() == 4 and mask_vis.shape[1] > 1:
+            mask_vis = mask_vis[:, :1, :, :]
+
+        round_dir = os.path.join(self._cfg.outdir, 'a3fl_samples',
+                                 f'client_{self.ID}', f'round_{int(round_idx)}')
+        os.makedirs(round_dir, exist_ok=True)
+
+        save_image(clean_vis,
+                   os.path.join(round_dir, 'clean_grid.png'),
+                   nrow=min(max_samples, clean_vis.shape[0]))
+        save_image(poisoned_vis,
+                   os.path.join(round_dir, 'poisoned_grid.png'),
+                   nrow=min(max_samples, poisoned_vis.shape[0]))
+        save_image(delta_vis,
+                   os.path.join(round_dir, 'delta_grid.png'),
+                   nrow=min(max_samples, delta_vis.shape[0]))
+        save_image(trigger_vis,
+                   os.path.join(round_dir, 'trigger.png'))
+        save_image(mask_vis,
+                   os.path.join(round_dir, 'mask.png'))
+        logger.info(
+            f"Client {self.ID}: Saved A3FL trigger visualizations to {round_dir}")
+
+    def _evaluate_a3fl_target_rate(self,
+                                   base_dataset,
+                                   subset_indices,
+                                   max_batches=None):
+        if self.mlp_classifier is None or not subset_indices:
+            return 0.0, 0
+
+        batch_size = max(1, int(getattr(self.ggeur_cfg, 'extract_batch_size', 64)))
+        target_label = int(self._cfg.attack.target_label_ind)
+        max_batches = max_batches or len(subset_indices)
+
+        self.mlp_classifier.eval()
+        self._load_feature_extractor()
+        if self.feature_extractor_type == 'clip' and self.clip_model is not None:
+            self.clip_model.eval()
+        if self.feature_extractor_type == 'cnn' and self.cnn_extractor is not None:
+            self.cnn_extractor.eval()
+        if self.feature_extractor_type == 'timm' and self.timm_extractor is not None:
+            self.timm_extractor.eval()
+
+        total = 0
+        target_hits = 0
+        processed_batches = 0
+        with torch.no_grad():
+            for batch_start in range(0, len(subset_indices), batch_size):
+                batch_indices = subset_indices[batch_start:batch_start + batch_size]
+                if not batch_indices:
+                    continue
+                images = []
+                for base_idx in batch_indices:
+                    image, _ = base_dataset[base_idx]
+                    images.append(image)
+                images = torch.stack(images).to(self.device)
+                poisoned_images = self._apply_a3fl_trigger(images)
+                features = self._extractor_forward(poisoned_images).float()
+                logits = self.mlp_classifier(features)
+                preds = torch.argmax(logits, dim=1)
+                target_hits += preds.eq(target_label).sum().item()
+                total += preds.shape[0]
+                processed_batches += 1
+                if processed_batches >= max_batches:
+                    break
+
+        return (target_hits / total if total > 0 else 0.0), total
+
+    def _run_a3fl_trigger_search(self):
+        if not self.a3fl_enabled or not self.a3fl_is_attacker or \
+                self.mlp_classifier is None:
+            return False
+
+        base_dataset, subset_indices = self._get_train_dataset_base()
+        if base_dataset is None or not subset_indices:
+            logger.warning(f"Client {self.ID}: No dataset available for A3FL trigger search")
+            return False
+
+        self._load_feature_extractor()
+        first_image, _ = base_dataset[subset_indices[0]]
+        self._ensure_a3fl_trigger(first_image.to(self.device))
+
+        batch_size = max(1, int(getattr(self.ggeur_cfg, 'extract_batch_size', 64)))
+        outer_epochs = max(1, int(getattr(self.a3fl_cfg, 'trigger_outer_epochs', 5)))
+        batch_limit = max(1, int(getattr(self.a3fl_cfg, 'trigger_search_batches', 1)))
+        trigger_lr = float(getattr(self.a3fl_cfg, 'trigger_lr', 0.01))
+        clip_min = float(getattr(self.a3fl_cfg, 'trigger_clip_min', -2.0))
+        clip_max = float(getattr(self.a3fl_cfg, 'trigger_clip_max', 2.0))
+        target_label = int(self._cfg.attack.target_label_ind)
+        criterion = nn.CrossEntropyLoss()
+
+        self.mlp_classifier.eval()
+        if self.feature_extractor_type == 'clip' and self.clip_model is not None:
+            self.clip_model.eval()
+        if self.feature_extractor_type == 'cnn' and self.cnn_extractor is not None:
+            self.cnn_extractor.eval()
+        if self.feature_extractor_type == 'timm' and self.timm_extractor is not None:
+            self.timm_extractor.eval()
+
+        trigger = self.a3fl_trigger.detach().clone()
+        processed_batches = 0
+        max_batches = outer_epochs * batch_limit
+        for _ in range(outer_epochs):
+            for batch_start in range(0, len(subset_indices), batch_size):
+                batch_indices = subset_indices[batch_start:batch_start + batch_size]
+                if not batch_indices:
+                    continue
+                images = []
+                for base_idx in batch_indices:
+                    image, _ = base_dataset[base_idx]
+                    images.append(image)
+                images = torch.stack(images).to(self.device)
+                labels = torch.full((images.shape[0], ),
+                                    target_label,
+                                    dtype=torch.long,
+                                    device=self.device)
+
+                trigger.requires_grad_()
+                poisoned_images = trigger * self.a3fl_mask + images * (
+                    1.0 - self.a3fl_mask)
+                features = self._extractor_forward(poisoned_images).float()
+                logits = self.mlp_classifier(features)
+                loss = criterion(logits, labels)
+                grad = torch.autograd.grad(loss, trigger)[0]
+                trigger = trigger.detach() - trigger_lr * grad.sign()
+                trigger = torch.clamp(trigger, clip_min, clip_max)
+                processed_batches += 1
+                if processed_batches >= max_batches:
+                    break
+            if processed_batches >= max_batches:
+                break
+
+        self.a3fl_trigger = trigger.detach()
+        target_rate, target_total = self._evaluate_a3fl_target_rate(
+            base_dataset, subset_indices, max_batches=batch_limit)
+        logger.info(
+            f"Client {self.ID}: A3FL trigger search finished using {processed_batches} batches, "
+            f"target_hit_rate={target_rate:.4f} on {target_total} samples")
+        return processed_batches > 0
+
+    def _restore_base_augmented_dataset(self):
+        if self.base_augmented_features is None or self.base_augmented_labels is None:
+            return
+        self.augmented_features = self.base_augmented_features.copy()
+        self.augmented_labels = self.base_augmented_labels.copy()
+        dataset = AugmentedFeatureDataset(self.augmented_features,
+                                          self.augmented_labels)
+        self.augmented_loader = DataLoader(dataset,
+                                           batch_size=self._cfg.dataloader.batch_size,
+                                           shuffle=True)
+
+    def _inject_a3fl_poison_features(self, round_idx):
+        if not self.a3fl_enabled:
+            return
+
+        self._restore_base_augmented_dataset()
+        active = self.a3fl_is_attacker and should_a3fl_attack(
+            self._cfg, round_idx, self.ID, self._cfg.federate.sample_client_num)
+        self.a3fl_latest_meta = {
+            'active': bool(active),
+            'client_id': int(self.ID),
+            'round': int(round_idx),
+            'target_label': int(self._cfg.attack.target_label_ind),
+        }
+        if not active:
+            return
+
+        if not self._run_a3fl_trigger_search():
+            return
+
+        base_dataset, subset_indices = self._get_train_dataset_base()
+        if base_dataset is None or not subset_indices:
+            return
+
+        poison_count = max(1, int(len(subset_indices) * float(self._cfg.attack.poison_ratio)))
+        poison_count = min(poison_count, len(subset_indices))
+        rng = np.random.RandomState(int(self._cfg.seed) + int(round_idx) + int(self.ID) * 997)
+        selected_indices = rng.choice(subset_indices, size=poison_count, replace=False).tolist()
+
+        self._load_feature_extractor()
+        poison_features = []
+        sample_clean_images = []
+        sample_poisoned_images = []
+        batch_size = max(1, int(getattr(self.ggeur_cfg, 'extract_batch_size', 64)))
+        sample_budget = max(
+            1, int(getattr(self.a3fl_cfg, 'save_trigger_max_samples', 4)))
+        with torch.no_grad():
+            for start in range(0, len(selected_indices), batch_size):
+                batch_indices = selected_indices[start:start + batch_size]
+                images = []
+                for base_idx in batch_indices:
+                    image, _ = base_dataset[base_idx]
+                    images.append(image)
+                images = torch.stack(images).to(self.device)
+                poisoned_images = self._apply_a3fl_trigger(images)
+                saved_samples = sum(
+                    tensor.shape[0] for tensor in sample_clean_images)
+                if saved_samples < sample_budget:
+                    remain = sample_budget - saved_samples
+                    sample_clean_images.append(images[:remain].detach().cpu())
+                    sample_poisoned_images.append(
+                        poisoned_images[:remain].detach().cpu())
+                features = self._extractor_forward(poisoned_images).float()
+                poison_features.append(features.cpu().numpy())
+
+        if not poison_features:
+            return
+
+        poison_features = np.vstack(poison_features)
+        poison_labels = np.full(poison_features.shape[0],
+                                int(self._cfg.attack.target_label_ind),
+                                dtype=np.int64)
+
+        self.augmented_features = np.vstack(
+            [self.augmented_features, poison_features]).astype(np.float32)
+        self.augmented_labels = np.concatenate(
+            [self.augmented_labels, poison_labels]).astype(np.int64)
+        dataset = AugmentedFeatureDataset(self.augmented_features,
+                                          self.augmented_labels)
+        self.augmented_loader = DataLoader(dataset,
+                                           batch_size=self._cfg.dataloader.batch_size,
+                                           shuffle=True)
+
+        self.a3fl_latest_meta.update({
+            'trigger': self.a3fl_trigger.detach().cpu(),
+            'mask': self.a3fl_mask.detach().cpu(),
+            'poisoned_samples': int(poison_features.shape[0]),
+        })
+        if sample_clean_images and sample_poisoned_images:
+            self._save_a3fl_trigger_visuals(
+                round_idx, torch.cat(sample_clean_images, dim=0),
+                torch.cat(sample_poisoned_images, dim=0))
+        logger.info(
+            f"Client {self.ID}: Injected {poison_features.shape[0]} A3FL poisoned feature samples in round {round_idx}")
 
     def _load_cnn_extractor(self):
         """Load CNN feature extractor"""
@@ -1232,6 +1572,8 @@ class GGEURClient(Client):
                 f"time={augmentation_elapsed:.4f}s, "
                 f"qps={aug_qps:.2f} samples/s")
             self._save_augmented_feature_cache()
+            self.base_augmented_features = self.augmented_features.copy()
+            self.base_augmented_labels = self.augmented_labels.copy()
 
         self.augmentation_done = True
 
@@ -1332,6 +1674,8 @@ class GGEURClient(Client):
                 labels.numpy() if isinstance(labels, torch.Tensor)
                 else np.asarray(labels)
             )
+            self.base_augmented_features = self.augmented_features.copy()
+            self.base_augmented_labels = self.augmented_labels.copy()
             dataset = AugmentedFeatureDataset(
                 self.augmented_features, self.augmented_labels)
             self.augmented_loader = DataLoader(
@@ -1544,6 +1888,9 @@ class GGEURClient(Client):
             except Exception as e:
                 logger.debug(f"Client {self.ID}: Could not load CNN state dict: {e}")
 
+        # Apply A3FL poisoning on the GGEUR augmented feature training set.
+        self._inject_a3fl_poison_features(round_idx)
+
         # Train MLP on augmented features
         mlp_sample_size, mlp_model_para, mlp_results = self._train_on_augmented_data()
 
@@ -1600,6 +1947,15 @@ class GGEURClient(Client):
             # Standard mode: only MLP
             combined_para = mlp_model_para
             sample_size = mlp_sample_size
+
+        if self.a3fl_enabled:
+            if isinstance(combined_para, dict) and 'mlp' in combined_para:
+                combined_para['a3fl'] = copy.deepcopy(self.a3fl_latest_meta)
+            else:
+                combined_para = {
+                    'mlp': combined_para,
+                    'a3fl': copy.deepcopy(self.a3fl_latest_meta)
+                }
 
         # PromptFL: train soft prompts on augmented features and attach to combined_para
         if self.use_promptfl:

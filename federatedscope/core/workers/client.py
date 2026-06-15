@@ -12,6 +12,7 @@ from federatedscope.core.secret_sharing import AdditiveSecretSharing
 from federatedscope.core.auxiliaries.utils import merge_dict_of_results, \
     calculate_time_cost
 from federatedscope.core.workers.base_client import BaseClient
+from federatedscope.attack.auxiliary.a3fl_utils import should_a3fl_attack
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -109,6 +110,7 @@ class Client(BaseClient):
                                    config=self._cfg,
                                    is_attacker=self.is_attacker,
                                    monitor=self._monitor)
+        self.trainer.ctx.client_ID = self.ID
         self.device = device
 
         # For client-side evaluation
@@ -359,6 +361,9 @@ class Client(BaseClient):
                         f"early stopped. "
                         f"The next FL update may result in negative effect")
                     self._monitor.local_converged()
+                self.trainer.ctx.a3fl_should_attack = should_a3fl_attack(
+                    self._cfg, round, self.ID,
+                    self._cfg.federate.sample_client_num)
                 sample_size, model_para_all, results = self.trainer.train()
                 if self._cfg.federate.share_local_model and not \
                         self._cfg.federate.online_aggr:
