@@ -1840,11 +1840,17 @@ class GGEURServer(Server):
             return
 
         from torchvision import transforms
+        if self.feature_extractor_type == 'clip':
+            mean = [0.48145466, 0.4578275, 0.40821073]
+            std = [0.26862954, 0.26130258, 0.27577711]
+        else:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                 std=[0.26862954, 0.26130258, 0.27577711])
+            transforms.Normalize(mean=mean, std=std)
         ])
 
         for domain in domains:
@@ -1912,10 +1918,13 @@ class GGEURServer(Server):
             self.timm_extractor.eval()
 
         results = {}
+        domain_debug = {}
         with torch.no_grad():
             for domain, dataloader in self.a3fl_test_loaders.items():
                 correct = 0
                 total = 0
+                target_logit_sum = 0.0
+                batch_count = 0
                 for images, _ in dataloader:
                     images = images.to(self.device)
                     poisoned_images = trigger * mask + images * (1.0 - mask)
@@ -1930,10 +1939,36 @@ class GGEURServer(Server):
                     targets = torch.full_like(preds, target_label)
                     correct += preds.eq(targets).sum().item()
                     total += preds.shape[0]
+                    target_logit_sum += logits[:, target_label].mean().item()
+                    batch_count += 1
                 results[domain] = correct / total if total > 0 else 0.0
+                domain_debug[domain] = {
+                    'target_rate': results[domain],
+                    'target_logit': (
+                        target_logit_sum / batch_count if batch_count > 0
+                        else 0.0),
+                    'samples': int(total),
+                }
 
         if results:
             results['average'] = sum(results.values()) / len(results)
+        if domain_debug:
+            avg_target_logit = sum(
+                item['target_logit'] for item in domain_debug.values()
+            ) / len(domain_debug)
+            avg_target_rate = sum(
+                item['target_rate'] for item in domain_debug.values()
+            ) / len(domain_debug)
+            meta_parts = []
+            for domain, metrics in domain_debug.items():
+                meta_parts.append(
+                    f"{domain}: rate={metrics['target_rate']:.4f}, "
+                    f"logit={metrics['target_logit']:.4f}, "
+                    f"n={metrics['samples']}")
+            logger.info(
+                f"Server: A3FL eval debug - avg_target_rate={avg_target_rate:.4f}, "
+                f"avg_target_logit={avg_target_logit:.4f}; "
+                + '; '.join(meta_parts))
         return results
 
     @staticmethod

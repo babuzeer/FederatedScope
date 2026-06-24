@@ -53,6 +53,9 @@ def extend_attack_cfg(cfg):
     cfg.attack.a3fl.trigger_clip_max = 2.0
     cfg.attack.a3fl.save_trigger_samples = False
     cfg.attack.a3fl.save_trigger_max_samples = 4
+    cfg.attack.a3fl.poison_feature_repeat = 1
+    cfg.attack.a3fl.update_scale = 1.0
+    cfg.attack.a3fl.target_row_scale = 1.0
 
     # for reconstruct_opt
     cfg.attack.reconstruct_lr = 0.01
