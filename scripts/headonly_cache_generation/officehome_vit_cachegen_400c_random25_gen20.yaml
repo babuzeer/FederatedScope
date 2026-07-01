@@ -1,0 +1,92 @@
+# OfficeHome ViT-B/16 HeadOnly cache generation for 400 logical clients.
+# Split design: 4 OfficeHome domains, 100 clients/domain, 25 train samples/client.
+# Clients sample independently from their own domain; overlap across clients is allowed.
+
+use_gpu: True
+device: 0
+seed: 42
+verbose: 1
+
+federate:
+  method: 'ggeur'
+  mode: 'standalone'
+  client_num: 400
+  total_round_num: 20
+  sample_client_num: 400
+  make_global_eval: False
+
+data:
+  type: 'office-home'
+  root: '/root/autodl-tmp/datasets/OfficeHomeDataset_10072016'
+  splits: [0.7, 0.0, 0.3]
+
+dataloader:
+  batch_size: 32
+  num_workers: 0
+
+model:
+  type: 'ggeur_mlp'
+  num_classes: 65
+
+train:
+  local_update_steps: 1
+  optimizer:
+    type: 'Adam'
+    lr: 0.0001
+
+eval:
+  freq: 1
+  metrics: ['acc']
+  split: ['test']
+  best_res_update_round_wise_key: 'test_acc'
+
+trainer:
+  type: 'ggeur'
+
+ggeur:
+  use: True
+  head_only_mode: True
+  head_only_after_round0: True
+  headonly_cache_version: 'officehome_vitb16_400c_random25_gen20_fcache_v1'
+  headonly_eval_mode: 'server'
+
+  feature_extractor: 'clip'
+  clip_model: 'ViT-B-16'
+  clip_pretrained: 'openai'
+  clip_model_path: '/root/model/open_clip_vitb16.bin'
+  embedding_dim: 512
+  freeze_backbone: True
+  use_feature_cache: True
+  unload_extractor_after_cache: True
+  use_fp16_extraction: True
+  extract_batch_size: 64
+  feature_cache_dir: '/root/autodl-tmp/FederatedScope/exp/ggeur_headonly_real_cache/officehome_vitb16_400c_random25_gen20_fcache_v1'
+
+  num_generated_per_sample: 20
+  num_generated_per_prototype: 20
+  target_size_per_class: 20
+
+  mlp_hidden_dim: 0
+  mlp_dropout: 0.0
+
+  use_cross_client_prototypes: True
+  statistics_round: 0
+  distributed_stage_timeout: 3600
+
+  use_fedproto: False
+  use_lds: False
+  officehome_split_strategy: 'random_fixed_per_domain'
+  officehome_random_clients_per_domain: 100
+  officehome_random_samples_per_client: 25
+  officehome_random_sample_with_replacement: False
+
+  use_cnn_distillation: False
+  use_feature_alignment: False
+  use_separated_training: False
+  use_end_to_end_finetune: False
+  use_promptfl: False
+
+  headonly_skip_round0_if_augmented_cache_exists: False
+
+outdir: '/root/autodl-tmp/FederatedScope/exp/headonly_cache_generation/direct_400c_random25_20r_gen20'
+expname: 'officehome_vit_cachegen_400c_random25_20r_gen20'

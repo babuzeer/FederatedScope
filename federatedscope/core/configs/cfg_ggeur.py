@@ -85,6 +85,13 @@ def extend_ggeur_cfg(cfg):
     # ========== Multi-domain Settings ==========
     # Whether to use cross-client prototypes for augmentation
     cfg.ggeur.use_cross_client_prototypes = True
+    # Limit how many other-client prototypes per class are sent to each
+    # client. 0 means unlimited, preserving the original behavior. For
+    # large-client cache-generation runs this should be set to a small value
+    # because target_size_per_class is usually much smaller than all available
+    # cross-client prototypes.
+    cfg.ggeur.max_cross_client_prototypes_per_class = 0
+    cfg.ggeur.cross_client_prototype_seed = 42
     # Optional selected domains for DomainNet. Empty = auto-discover extracted domains.
     cfg.ggeur.domainnet_domains = []
     # If True, keep only classes present in every selected DomainNet domain.
@@ -99,6 +106,24 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.head_only_after_round0 = True
     cfg.ggeur.headonly_cache_version = 'fcache_v1'
     cfg.ggeur.headonly_eval_mode = 'server'
+    # Optional OfficeHome domain filter for real distributed clients that only
+    # mount their own local data. Empty means all OfficeHome domains.
+    cfg.ggeur.officehome_domains = []
+    # OfficeHome client split strategy.
+    # - standard: split each domain uniformly, or use LDS when use_lds=True.
+    # - random_fixed_per_domain: each domain owns a fixed number of clients,
+    #   and each client independently samples a fixed number of train samples
+    #   from that domain. Clients may overlap with each other; samples are
+    #   unique within a client unless replacement is explicitly enabled or the
+    #   domain has fewer samples than requested.
+    cfg.ggeur.officehome_split_strategy = 'standard'
+    cfg.ggeur.officehome_random_clients_per_domain = 0
+    cfg.ggeur.officehome_random_samples_per_client = 0
+    cfg.ggeur.officehome_random_sample_with_replacement = False
+    # Optional exact per-client OfficeHome manifest. When set, the client
+    # loads train/val/test image lists from the manifest and does not re-split
+    # data at runtime.
+    cfg.ggeur.officehome_manifest_path = ''
     # Cache-hot rerun mode for HeadOnly experiments. If True and the
     # per-client augmented feature cache exists, clients skip round-0 feature
     # statistics/augmentation and immediately train on cached generated samples.
@@ -107,6 +132,17 @@ def extend_ggeur_cfg(cfg):
     # Timeout in seconds for GGEUR-specific distributed phases. Set <= 0 to
     # disable the watchdog.
     cfg.ggeur.distributed_stage_timeout = 1800
+    # Minimum number of clients required to move through GGEUR distributed
+    # phases. The default 0 means all configured clients, preserving strict FL
+    # semantics. Set lower values only for fault-tolerance scenario tests.
+    cfg.ggeur.min_statistics_clients = 0
+    cfg.ggeur.min_augmentation_clients = 0
+    cfg.ggeur.min_train_updates = 0
+    # Fault injection for distributed validation scripts. Empty disables it.
+    # Supported stages: after_statistics_upload, after_augmentation_ready,
+    # before_train_round.
+    cfg.ggeur.fail_after_stage = ''
+    cfg.ggeur.fail_on_round = -1
 
     # ========== FedProto Integration Settings ==========
     # Whether to use FedProto-style prototype regularization during MLP training

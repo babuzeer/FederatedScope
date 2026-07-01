@@ -64,6 +64,11 @@ def extend_fl_setting_cfg(cfg):
     cfg.distribute.server_port = 50050
     cfg.distribute.client_host = '0.0.0.0'
     cfg.distribute.client_port = 50050
+    # Optional address advertised by a distributed client in join_in. This is
+    # useful when a client process binds to 0.0.0.0/private IP but the server
+    # must connect back through a public IP or port mapping.
+    cfg.distribute.client_advertise_host = ''
+    cfg.distribute.client_advertise_port = 0
     cfg.distribute.role = 'client'
     cfg.distribute.data_file = 'data'
     cfg.distribute.data_idx = -1  # data_idx is used to specify the data
@@ -76,6 +81,10 @@ def extend_fl_setting_cfg(cfg):
     cfg.distribute.grpc_max_receive_message_length = 300 * 1024 * 1024  # 300M
     cfg.distribute.grpc_enable_http_proxy = False
     cfg.distribute.grpc_compression = 'nocompression'  # [deflate, gzip]
+    # Seconds since the first join request before a distributed server fails
+    # fast if fewer than federate.client_num clients have joined. Set <= 0 to
+    # disable the watchdog.
+    cfg.distribute.join_timeout_seconds = 60
 
     # ---------------------------------------------------------------------- #
     # Vertical FL related options (for demo)

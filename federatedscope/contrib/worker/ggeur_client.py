@@ -227,6 +227,24 @@ class GGEURClient(Client):
         self.custom_clip = None        # CustomCLIP (HuggingFace-based) for PromptFL
         self.hf_clip_model = None      # HuggingFace CLIPModel (separate from open_clip)
         self.global_prompt_ctx = None  # Latest global PromptFL context
+        self.fail_after_stage = str(
+            getattr(self.ggeur_cfg, 'fail_after_stage', '') or '')
+        self.fail_on_round = int(getattr(self.ggeur_cfg, 'fail_on_round', -1))
+
+    def _maybe_fail_for_distributed_validation(self, stage, round_idx=None):
+        """Intentional process exit hook for distributed scenario tests."""
+        if not self.fail_after_stage:
+            return
+        if self.fail_after_stage != stage:
+            return
+        if round_idx is not None and self.fail_on_round >= 0 and \
+                int(round_idx) != int(self.fail_on_round):
+            return
+        logger.error(
+            f"Client {self.ID}: Fault injection exit at stage={stage}, "
+            f"round={round_idx}")
+        raise SystemExit(
+            f"GGEUR distributed validation fault injection: {stage}")
 
     def _register_default_handlers(self):
         """Register message handlers"""
@@ -235,6 +253,8 @@ class GGEURClient(Client):
         # Register handler for receiving global covariance matrices
         self.register_handlers('global_covariances',
                                self.callback_for_global_covariances)
+        self.register_handlers('client_eval',
+                               self.callback_for_client_eval)
 
     def _load_feature_extractor(self):
         """Load feature extractor (CLIP / CNN / timm based on config)"""
@@ -440,8 +460,14 @@ class GGEURClient(Client):
         try:
             paths = list(feature_cache.keys())
             features = np.array([feature_cache[p] for p in paths])
-            np.savez(cache_path, paths=np.array(paths), features=features)
-            logger.info(f"Client {self.ID}: Saved {len(paths)} features to cache {cache_path}")
+            tmp_path = (
+                f"{cache_path}.client{int(self.ID)}."
+                f"pid{os.getpid()}.tmp.npz")
+            np.savez(tmp_path, paths=np.array(paths), features=features)
+            os.replace(tmp_path, cache_path)
+            logger.info(
+                f"Client {self.ID}: Saved {len(paths)} features to cache "
+                f"{cache_path}")
         except Exception as e:
             logger.warning(f"Client {self.ID}: Failed to save cache: {e}")
 
@@ -787,6 +813,7 @@ class GGEURClient(Client):
         )
 
         self.statistics_uploaded = True
+        self._release_round0_stat_buffers()
         logger.info(f"Client {self.ID}: Statistics uploaded")
 
     @staticmethod
@@ -849,9 +876,15 @@ class GGEURClient(Client):
         content = message.content
         self.global_cov_matrices = self._normalize_covariance_mapping(
             content.get('cov_matrices', {}))
-        other_prototypes = content.get('other_prototypes', {})
-        self.other_prototypes = self._normalize_prototype_mapping(
-            self._get_class_value(other_prototypes, self.ID) or {})
+        all_prototypes_by_client = content.get('all_prototypes_by_client', {})
+        if all_prototypes_by_client:
+            self.other_prototypes = (
+                self._normalize_other_prototypes_from_client_pool(
+                    all_prototypes_by_client))
+        else:
+            other_prototypes = content.get('other_prototypes', {})
+            self.other_prototypes = self._normalize_prototype_mapping(
+                self._get_class_value(other_prototypes, self.ID) or {})
         self.global_prototypes = self._normalize_prototype_mapping(
             content.get('global_prototypes', {}))  # For feature alignment
 
@@ -870,6 +903,7 @@ class GGEURClient(Client):
 
         # Perform augmentation
         self._perform_augmentation()
+        self._release_round0_stat_buffers()
 
         # Build MLP classifier
         self._build_mlp_classifier()
@@ -895,6 +929,8 @@ class GGEURClient(Client):
             logger.info(f"Client {self.ID}: CNN distillation ready - CLIP: {self.clip_model is not None}, "
                        f"MLP: {self.mlp_classifier is not None}, CNN: {self.cnn_model is not None}")
 
+        self._release_round0_broadcast_buffers_if_unused()
+
         # Notify server that augmentation is complete
         logger.info(f"Client {self.ID}: Notifying server that augmentation is ready")
         self.comm_manager.send(
@@ -906,6 +942,54 @@ class GGEURClient(Client):
                 content='ready'
             )
         )
+        self._maybe_fail_for_distributed_validation(
+            'after_augmentation_ready', self.state)
+
+    def _normalize_other_prototypes_from_client_pool(self,
+                                                     all_prototypes_by_client):
+        """Keep all prototypes except this client's own prototypes."""
+        normalized = {}
+        if not isinstance(all_prototypes_by_client, dict):
+            return normalized
+
+        for client_id, prototypes in all_prototypes_by_client.items():
+            try:
+                if int(client_id) == int(self.ID):
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+            client_prototypes = self._normalize_prototype_mapping(prototypes)
+            for class_idx, value in client_prototypes.items():
+                if isinstance(value, list):
+                    normalized.setdefault(class_idx, []).extend(value)
+                else:
+                    normalized.setdefault(class_idx, []).append(value)
+
+        logger.info(
+            f"Client {self.ID}: Prepared other_prototypes from shared pool "
+            f"with {len(normalized)} classes")
+        return normalized
+
+    def _release_round0_stat_buffers(self):
+        """Drop per-client round-0 statistics after augmented cache is built."""
+        self.local_means = {}
+        self.local_covs = {}
+        self.local_counts = {}
+        if hasattr(self, '_cov_factor_cache'):
+            self._cov_factor_cache.clear()
+
+    def _release_round0_broadcast_buffers_if_unused(self):
+        """Drop broadcast payloads after HeadOnly augmentation when unused."""
+        keep_global_prototypes = (
+            getattr(self, 'use_fedproto', False)
+            or getattr(self, 'use_feature_alignment', False)
+            or getattr(self, 'use_cnn_distillation', False)
+            or getattr(self, 'use_promptfl', False))
+        if not keep_global_prototypes:
+            self.global_prototypes = {}
+        self.global_cov_matrices = {}
+        self.other_prototypes = {}
 
     @staticmethod
     def _get_class_value(mapping, class_idx):
@@ -1309,45 +1393,103 @@ class GGEURClient(Client):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
 
-    def _try_load_augmented_feature_cache(self):
+    def _get_augmented_feature_cache_candidates(self):
         path = self._get_augmented_feature_cache_path()
-        if path is None or not os.path.exists(path):
+        if path is None:
+            return []
+
+        paths = [path]
+        cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+        if cache_dir:
+            legacy_ids = [int(self.ID) - 1, int(self.ID)]
+            for legacy_id in legacy_ids:
+                if legacy_id < 0:
+                    continue
+                legacy_path = os.path.join(
+                    cache_dir, f'client_{legacy_id:06d}.pt')
+                if legacy_path not in paths:
+                    paths.append(legacy_path)
+        return paths
+
+    def _is_augmented_cache_metadata_compatible(self, metadata):
+        """Check cache metadata while allowing moved legacy cache dirs."""
+        if not isinstance(metadata, dict):
             return False
-        try:
-            cached = torch.load(path, map_location='cpu')
-            metadata = cached.get('metadata', {})
-            expected = self._augmented_cache_metadata()
-            if metadata != expected:
-                logger.info(
-                    f"Client {self.ID}: Ignore augmented cache metadata "
-                    f"mismatch at {path}")
-                return False
-            features = cached['features']
-            labels = cached['labels']
-            self.augmented_features = (
-                features.numpy() if isinstance(features, torch.Tensor)
-                else np.asarray(features)
-            )
-            self.augmented_labels = (
-                labels.numpy() if isinstance(labels, torch.Tensor)
-                else np.asarray(labels)
-            )
-            dataset = AugmentedFeatureDataset(
-                self.augmented_features, self.augmented_labels)
-            self.augmented_loader = DataLoader(
-                dataset,
-                batch_size=self._cfg.dataloader.batch_size,
-                shuffle=True,
-            )
-            logger.info(
-                f"Client {self.ID}: Loaded augmented HeadOnly feature cache "
-                f"from {path} ({len(self.augmented_labels)} samples)")
+
+        expected = self._augmented_cache_metadata()
+        if metadata == expected:
             return True
-        except Exception as error:
-            logger.warning(
-                f"Client {self.ID}: Failed to load augmented cache {path}: "
-                f"{error}")
-            return False
+
+        expected_version = expected.get('headonly_cache_version')
+        cached_version = (
+            metadata.get('headonly_cache_version') or
+            metadata.get('feature_cache_version')
+        )
+        checks = [
+            (str(metadata.get('dataset', '')) == expected['dataset']),
+            (str(metadata.get('feature_extractor', '')) ==
+             expected['feature_extractor']),
+            (int(metadata.get('embedding_dim', -1)) ==
+             expected['embedding_dim']),
+            (int(metadata.get('num_classes', -1)) == expected['num_classes']),
+            (int(metadata.get('num_generated_per_sample', -1)) ==
+             expected['num_generated_per_sample']),
+            (int(metadata.get('num_generated_per_prototype', -1)) ==
+             expected['num_generated_per_prototype']),
+            (int(metadata.get('target_size_per_class', -1)) ==
+             expected['target_size_per_class']),
+            (str(cached_version) == str(expected_version)),
+        ]
+        if metadata.get('client_num') is not None:
+            checks.append(
+                int(metadata.get('client_num')) == expected['client_num'])
+
+        cached_client_id = metadata.get('client_id')
+        if cached_client_id is not None:
+            valid_ids = {int(self.ID), int(self.ID) - 1}
+            checks.append(int(cached_client_id) in valid_ids)
+
+        return all(checks)
+
+    def _try_load_augmented_feature_cache(self):
+        for path in self._get_augmented_feature_cache_candidates():
+            if not os.path.exists(path):
+                continue
+            try:
+                cached = torch.load(path, map_location='cpu')
+                metadata = cached.get('metadata', {})
+                if not self._is_augmented_cache_metadata_compatible(metadata):
+                    logger.info(
+                        f"Client {self.ID}: Ignore augmented cache metadata "
+                        f"mismatch at {path}")
+                    continue
+                features = cached['features']
+                labels = cached['labels']
+                self.augmented_features = (
+                    features.numpy() if isinstance(features, torch.Tensor)
+                    else np.asarray(features)
+                )
+                self.augmented_labels = (
+                    labels.numpy() if isinstance(labels, torch.Tensor)
+                    else np.asarray(labels)
+                )
+                dataset = AugmentedFeatureDataset(
+                    self.augmented_features, self.augmented_labels)
+                self.augmented_loader = DataLoader(
+                    dataset,
+                    batch_size=self._cfg.dataloader.batch_size,
+                    shuffle=True,
+                )
+                logger.info(
+                    f"Client {self.ID}: Loaded augmented HeadOnly feature "
+                    f"cache from {path} ({len(self.augmented_labels)} "
+                    f"samples)")
+                return True
+            except Exception as error:
+                logger.warning(
+                    f"Client {self.ID}: Failed to load augmented cache "
+                    f"{path}: {error}")
+        return False
 
     def _save_augmented_feature_cache(self):
         path = self._get_augmented_feature_cache_path()
@@ -1433,6 +1575,8 @@ class GGEURClient(Client):
                         content='ready'
                     )
                 )
+                self._maybe_fail_for_distributed_validation(
+                    'after_augmentation_ready', round_idx)
                 return
 
             # Extract CLIP features
@@ -1458,6 +1602,8 @@ class GGEURClient(Client):
                         content='ready'
                     )
                 )
+                self._maybe_fail_for_distributed_validation(
+                    'after_augmentation_ready', round_idx)
                 return
 
             # Compute local statistics
@@ -1465,6 +1611,8 @@ class GGEURClient(Client):
 
             # Upload to server
             self._upload_local_statistics()
+            self._maybe_fail_for_distributed_validation(
+                'after_statistics_upload', round_idx)
 
             # Unload extractor to free VRAM (features are cached to disk)
             if getattr(self.ggeur_cfg, 'unload_extractor_after_cache', True):
@@ -1491,11 +1639,15 @@ class GGEURClient(Client):
 
         # Handle Separated Training Mode
         if self.use_separated_training:
+            self._maybe_fail_for_distributed_validation(
+                'before_train_round', round_idx)
             self._handle_separated_training(message)
             return
 
         # Normal training round on augmented data
         logger.info(f"Client {self.ID}: Round {round_idx} - Training on augmented data")
+        self._maybe_fail_for_distributed_validation(
+            'before_train_round', round_idx)
 
         # Parse content - may contain both MLP and CNN parameters
         mlp_para = None
@@ -1620,6 +1772,202 @@ class GGEURClient(Client):
                 content=(sample_size, combined_para)
             )
         )
+
+    def callback_for_client_eval(self, message: Message):
+        """Evaluate the aggregated MLP on this client's local test split."""
+        round_idx = int(message.state)
+        model_para = message.content
+        self.state = round_idx
+
+        if self.mlp_classifier is None:
+            self._build_mlp_classifier()
+        if model_para is not None and self.mlp_classifier is not None:
+            try:
+                self.mlp_classifier.load_state_dict(model_para)
+            except Exception as error:
+                logger.warning(
+                    f"Client {self.ID}: Could not load MLP for local eval: "
+                    f"{error}")
+
+        metrics = self._evaluate_mlp_on_local_test(round_idx)
+        self.comm_manager.send(
+            Message(
+                msg_type='client_eval_metrics',
+                sender=self.ID,
+                receiver=[message.sender],
+                state=round_idx,
+                timestamp=message.timestamp,
+                content=metrics
+            )
+        )
+
+    def _get_local_test_loader(self):
+        test_data = None
+        try:
+            test_data = self.trainer.ctx.data.get('test', None)
+        except Exception:
+            test_data = None
+        if test_data is None and isinstance(self.data, dict):
+            test_data = self.data.get('test', None)
+        return test_data
+
+    def _extract_eval_features(self, dataloader):
+        dataset = dataloader.dataset if hasattr(dataloader, 'dataset') \
+            else dataloader
+
+        from torch.utils.data import Subset
+        is_subset = isinstance(dataset, Subset)
+        if is_subset:
+            base_dataset = dataset.dataset
+            subset_indices = dataset.indices
+            domain = getattr(base_dataset, 'domain', None)
+        else:
+            base_dataset = dataset
+            subset_indices = None
+            domain = getattr(dataset, 'domain', None)
+
+        self._load_feature_extractor()
+        cache_path = self._get_feature_cache_path(domain)
+        feature_cache = self._load_feature_cache(cache_path)
+        feature_cache = {
+            path: feat
+            for path, feat in feature_cache.items()
+            if self._is_valid_feature_vector(feat)
+        }
+
+        has_paths = hasattr(base_dataset, 'data') and \
+            len(base_dataset.data) > 0 and isinstance(base_dataset.data[0], str)
+        features = []
+        labels = []
+        paths_to_extract = []
+        base_indices_to_extract = []
+
+        if has_paths:
+            num_samples = len(subset_indices) if is_subset else len(base_dataset)
+            for local_idx in range(num_samples):
+                base_idx = subset_indices[local_idx] if is_subset else local_idx
+                img_path = base_dataset.data[base_idx]
+                label = int(base_dataset.targets[base_idx])
+                cached = feature_cache.get(img_path)
+                if cached is not None and self._is_valid_feature_vector(cached):
+                    features.append(cached)
+                    labels.append(label)
+                else:
+                    paths_to_extract.append(img_path)
+                    base_indices_to_extract.append(base_idx)
+
+            if paths_to_extract:
+                batch_size = getattr(self.ggeur_cfg, 'extract_batch_size', 64)
+                use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction',
+                                   True) and torch.cuda.is_available()
+                cache_updated = False
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_fp16):
+                    for i in range(0, len(base_indices_to_extract), batch_size):
+                        batch_indices = base_indices_to_extract[i:i + batch_size]
+                        batch_paths = paths_to_extract[i:i + batch_size]
+                        images = []
+                        batch_labels = []
+                        for base_idx in batch_indices:
+                            image, label = base_dataset[base_idx]
+                            images.append(image)
+                            batch_labels.append(int(label))
+                        images = torch.stack(images).to(self.device)
+                        if self.feature_extractor_type == 'cnn':
+                            batch_features = self.cnn_extractor(images)
+                        elif self.feature_extractor_type == 'timm':
+                            batch_features = self.timm_extractor(images)
+                        else:
+                            batch_features = self.clip_model.encode_image(images)
+                        batch_features = batch_features.cpu().numpy()
+                        for feat, label, path in zip(batch_features,
+                                                     batch_labels,
+                                                     batch_paths):
+                            if not self._is_valid_feature_vector(feat):
+                                continue
+                            feature_cache[path] = feat
+                            cache_updated = True
+                            features.append(feat)
+                            labels.append(label)
+                if cache_updated:
+                    self._save_feature_cache(cache_path, feature_cache)
+        else:
+            use_fp16 = getattr(self.ggeur_cfg, 'use_fp16_extraction',
+                               True) and torch.cuda.is_available()
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=use_fp16):
+                for batch in dataloader:
+                    if len(batch) < 2:
+                        continue
+                    images, batch_labels = batch[0].to(self.device), batch[1]
+                    if self.feature_extractor_type == 'cnn':
+                        batch_features = self.cnn_extractor(images)
+                    elif self.feature_extractor_type == 'timm':
+                        batch_features = self.timm_extractor(images)
+                    else:
+                        batch_features = self.clip_model.encode_image(images)
+                    features.extend(batch_features.cpu().numpy())
+                    labels.extend([int(x) for x in batch_labels.cpu().numpy()])
+
+        if not features:
+            return None, None
+        return (
+            torch.as_tensor(np.asarray(features), dtype=torch.float32),
+            torch.as_tensor(np.asarray(labels), dtype=torch.long),
+        )
+
+    def _evaluate_mlp_on_local_test(self, round_idx):
+        dataloader = self._get_local_test_loader()
+        if dataloader is None or self.mlp_classifier is None:
+            logger.warning(
+                f"Client {self.ID}: No local test data or MLP for eval")
+            return {
+                'accuracy': 0.0,
+                'loss': 0.0,
+                'correct': 0,
+                'total': 0,
+            }
+
+        features, labels = self._extract_eval_features(dataloader)
+        if features is None:
+            return {
+                'accuracy': 0.0,
+                'loss': 0.0,
+                'correct': 0,
+                'total': 0,
+            }
+
+        self.mlp_classifier.eval()
+        criterion = nn.CrossEntropyLoss(reduction='sum')
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        eval_loader = DataLoader(
+            AugmentedFeatureDataset(features, labels),
+            batch_size=getattr(self._cfg.dataloader, 'batch_size', 32),
+            shuffle=False,
+            num_workers=0)
+
+        with torch.no_grad():
+            for batch_features, batch_labels in eval_loader:
+                batch_features = batch_features.to(self.device)
+                batch_labels = batch_labels.to(self.device)
+                outputs = self.mlp_classifier(batch_features)
+                total_loss += criterion(outputs, batch_labels).item()
+                predicted = torch.argmax(outputs, dim=1)
+                total_correct += (predicted == batch_labels).sum().item()
+                total_samples += int(batch_labels.numel())
+
+        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        avg_loss = total_loss / total_samples if total_samples > 0 else 0.0
+        logger.info(
+            f"Client {self.ID}: Round {round_idx} local MLP eval - "
+            f"acc={accuracy:.4f}, loss={avg_loss:.4f}, "
+            f"correct={total_correct}, total={total_samples}")
+        return {
+            'accuracy': float(accuracy),
+            'loss': float(avg_loss),
+            'correct': int(total_correct),
+            'total': int(total_samples),
+        }
 
     def _handle_separated_training(self, message: Message):
         """Handle training in separated training mode"""

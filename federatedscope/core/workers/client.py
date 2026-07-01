@@ -177,10 +177,20 @@ class Client(BaseClient):
                                                 'host': server_host,
                                                 'port': server_port
                                             })
+            advertise_host = getattr(self._cfg.distribute,
+                                     'client_advertise_host', '')
+            advertise_port = int(getattr(self._cfg.distribute,
+                                         'client_advertise_port', 0) or 0)
             self.local_address = {
-                'host': self.comm_manager.host,
-                'port': self.comm_manager.port
+                'host': advertise_host or self.comm_manager.host,
+                'port': advertise_port or self.comm_manager.port
             }
+            if advertise_host or advertise_port:
+                logger.info(
+                    'Client: Advertise address {}:{} for server callback '
+                    '(bind {}:{})'.format(self.local_address['host'],
+                                          self.local_address['port'], host,
+                                          port))
 
     def _gen_timestamp(self, init_timestamp, instance_number):
         if init_timestamp is None:

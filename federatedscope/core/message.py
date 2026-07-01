@@ -264,8 +264,11 @@ class Message(object):
             calculate the message bytes to be sent/received
         :return: tuple of bytes of the message to be sent and received
         """
-        from pympler import asizeof
-        download_bytes = asizeof.asizeof(self.content)
+        try:
+            from pympler import asizeof
+            download_bytes = asizeof.asizeof(self.content)
+        except ImportError:
+            download_bytes = len(pickle.dumps(self.content))
         upload_cnt = len(self.receiver) if isinstance(self.receiver,
                                                       list) else 1
         upload_bytes = download_bytes * upload_cnt

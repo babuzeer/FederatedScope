@@ -102,6 +102,8 @@ class GGEURServer(Server):
         self.best_avg_accuracy = 0.0
         self.best_model_state = None
         self.test_accuracies_history = {}  # {domain: [acc_per_round]}
+        self.client_eval_buffer = {}
+        self.pending_client_eval_round = None
 
         # ===== CNN Mode =====
         self.use_cnn_distillation = getattr(self.ggeur_cfg, 'use_cnn_distillation', False)
@@ -159,6 +161,36 @@ class GGEURServer(Server):
             getattr(self.ggeur_cfg, 'distributed_stage_timeout', 1800))
         self._stage_name = None
         self._stage_start_time = None
+        self.min_statistics_clients = self._resolve_min_clients(
+            'min_statistics_clients')
+        self.min_augmentation_clients = self._resolve_min_clients(
+            'min_augmentation_clients')
+        self.min_train_updates = self._resolve_min_clients(
+            'min_train_updates')
+        self.active_client_ids = set()
+        self.training_client_ids = set()
+
+    def _resolve_min_clients(self, name):
+        value = int(getattr(self.ggeur_cfg, name, 0))
+        if value <= 0:
+            return int(self._client_num)
+        return max(1, min(value, int(self._client_num)))
+
+    def _active_clients_for_broadcast(self):
+        if self.training_client_ids:
+            return sorted(self.training_client_ids)
+        if self.active_client_ids:
+            return sorted(self.active_client_ids)
+        return list(range(1, self._client_num + 1))
+
+    def _expected_augmentation_clients(self):
+        base = len(self.active_client_ids) if self.active_client_ids else self._client_num
+        return max(1, min(int(self.min_augmentation_clients), int(base)))
+
+    def _expected_train_updates(self):
+        base = len(self.training_client_ids) if self.training_client_ids else len(
+            self._active_clients_for_broadcast())
+        return max(1, min(int(self.min_train_updates), int(base)))
 
     def _mark_stage(self, stage_name):
         self._stage_name = stage_name
@@ -262,6 +294,8 @@ class GGEURServer(Server):
         # Register handler for augmentation ready signal
         self.register_handlers('augmentation_ready',
                                self.callback_for_augmentation_ready)
+        self.register_handlers('client_eval_metrics',
+                               self.callback_for_client_eval_metrics)
 
     def _build_global_mlp(self, num_classes):
         """Build global MLP classifier"""
@@ -708,6 +742,13 @@ class GGEURServer(Server):
         content = message.content
         self._bytes_recv += self._sizeof_content(content)
 
+        if self.statistics_collected:
+            logger.warning(
+                f"Server: Ignore late local_statistics from client "
+                f"{client_id}; statistics phase already completed with "
+                f"active_clients={sorted(self.active_client_ids)}")
+            return
+
         logger.info(f"Server: Received local statistics from client {client_id}")
 
         # Infer embedding dimension from client-reported value (preferred) or from means later
@@ -742,9 +783,14 @@ class GGEURServer(Server):
         # Store prototypes for cross-client sharing
         self.all_prototypes[client_id] = content['prototypes']
 
-        # Check if all clients have uploaded statistics
-        if len(self.local_statistics_buffer) >= self._client_num:
-            logger.info(f"Server: Received statistics from all {self._client_num} clients")
+        # Check if the configured statistics quorum has uploaded statistics.
+        if len(self.local_statistics_buffer) >= self.min_statistics_clients:
+            self.active_client_ids = set(self.local_statistics_buffer.keys())
+            logger.info(
+                "Server: Received statistics quorum "
+                f"{len(self.local_statistics_buffer)}/{self._client_num}; "
+                f"required={self.min_statistics_clients}; "
+                f"active_clients={sorted(self.active_client_ids)}")
 
             # Aggregate covariance matrices
             self._aggregate_covariances()
@@ -752,8 +798,16 @@ class GGEURServer(Server):
             # Compute global prototypes (aggregated means for each class)
             self._compute_global_prototypes()
 
-            # Prepare other client prototypes for each client
-            other_prototypes = self._prepare_other_prototypes()
+            # For large standalone runs, avoid materializing O(N^2)
+            # per-client prototype payloads unless explicit down-sampling is
+            # requested. The broadcast path can share the full prototype pool
+            # and let each client filter out its own entries.
+            max_cross_prototypes = int(getattr(
+                self.ggeur_cfg, 'max_cross_client_prototypes_per_class', 0))
+            other_prototypes = (
+                self._prepare_other_prototypes()
+                if max_cross_prototypes > 0 else None
+            )
 
             # Build global MLP
             # IMPORTANT: Use config's num_classes, not the number of classes in covariance matrices
@@ -918,12 +972,31 @@ class GGEURServer(Server):
     def callback_for_augmentation_ready(self, message: Message):
         """Handle client signaling augmentation is complete"""
         client_id = message.sender
+        if self.active_client_ids and client_id not in self.active_client_ids:
+            logger.warning(
+                f"Server: Ignore augmentation_ready from inactive client "
+                f"{client_id}; active_clients={sorted(self.active_client_ids)}")
+            return
+        if self.training_client_ids:
+            logger.warning(
+                f"Server: Ignore late augmentation_ready from client "
+                f"{client_id}; training already started with "
+                f"clients={sorted(self.training_client_ids)}")
+            return
         self.augmentation_ready_clients.add(client_id)
 
-        logger.info(f"Server: Client {client_id} augmentation ready ({len(self.augmentation_ready_clients)}/{self._client_num})")
+        expected_ready = self._expected_augmentation_clients()
+        logger.info(
+            f"Server: Client {client_id} augmentation ready "
+            f"({len(self.augmentation_ready_clients)}/{expected_ready}; "
+            f"configured_clients={self._client_num})")
 
-        # When all clients are ready, start training
-        if len(self.augmentation_ready_clients) >= self._client_num:
+        # When the configured augmentation quorum is ready, start training.
+        if len(self.augmentation_ready_clients) >= expected_ready:
+            self.training_client_ids = set(self.augmentation_ready_clients)
+            logger.info(
+                "Server: Augmentation quorum reached; training_clients="
+                f"{sorted(self.training_client_ids)}")
             if self.global_mlp is None:
                 num_classes = self._cfg.model.num_classes
                 if num_classes > 0:
@@ -967,11 +1040,17 @@ class GGEURServer(Server):
                 model_para = {'mlp': model_para}
             model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
-        # Broadcast to all clients
+        # Broadcast to active training clients only. In strict mode this is all
+        # configured clients; in fault-tolerance validation it is the quorum
+        # that completed statistics and augmentation.
+        receivers = self._active_clients_for_broadcast()
         send_bytes = self._sizeof_content(model_para)
-        self._bytes_sent += send_bytes * self._client_num
+        self._bytes_sent += send_bytes * len(receivers)
         self._round_start_time = time.time()
-        for client_id in range(1, self._client_num + 1):
+        logger.info(
+            f"Server: Broadcasting round {self.state} model to "
+            f"{len(receivers)} clients: {receivers}")
+        for client_id in receivers:
             self.comm_manager.send(
                 Message(
                     msg_type='model_para',
@@ -1204,6 +1283,50 @@ class GGEURServer(Server):
 
     def _prepare_other_prototypes(self):
         """Prepare prototypes from other clients for each client"""
+        max_per_class = int(getattr(
+            self.ggeur_cfg, 'max_cross_client_prototypes_per_class', 0))
+        if max_per_class > 0:
+            seed = int(getattr(self.ggeur_cfg, 'cross_client_prototype_seed',
+                               42))
+            prototypes_by_class = {}
+            for other_client_id, prototypes in self.all_prototypes.items():
+                for class_idx, prototype in prototypes.items():
+                    class_idx = int(class_idx)
+                    prototypes_by_class.setdefault(class_idx, []).append(
+                        (int(other_client_id), prototype))
+
+            other_prototypes = {}
+            total_selected = 0
+            for client_id in self.all_prototypes.keys():
+                client_id = int(client_id)
+                other_prototypes[client_id] = {}
+                rng = np.random.RandomState(seed + client_id * 1009)
+
+                for class_idx, candidates in prototypes_by_class.items():
+                    available = [
+                        prototype for other_id, prototype in candidates
+                        if int(other_id) != client_id
+                    ]
+                    if not available:
+                        continue
+                    if len(available) > max_per_class:
+                        picked = rng.choice(len(available),
+                                            size=max_per_class,
+                                            replace=False)
+                        selected = [available[int(idx)] for idx in picked]
+                    else:
+                        selected = available
+                    other_prototypes[client_id][int(class_idx)] = selected
+                    total_selected += len(selected)
+
+            logger.info(
+                "Server: Prepared limited other-client prototypes: "
+                f"clients={len(other_prototypes)}, "
+                f"classes={len(prototypes_by_class)}, "
+                f"max_per_class={max_per_class}, "
+                f"selected_prototypes={total_selected}")
+            return other_prototypes
+
         other_prototypes = {}
 
         for client_id in self.all_prototypes.keys():
@@ -1225,18 +1348,49 @@ class GGEURServer(Server):
         """Broadcast global covariance matrices and prototypes to all clients"""
         logger.info("Server: Broadcasting global covariances to clients...")
 
-        for client_id in self.local_statistics_buffer.keys():
+        receivers = sorted(self.active_client_ids or self.local_statistics_buffer.keys())
+        serialized_cov_matrices = self._serialize_array_payload(
+            self.global_cov_matrices)
+        serialized_global_prototypes = self._serialize_array_payload(
+            self.global_prototypes)
+        serialized_all_prototypes = None
+        if other_prototypes is None:
+            serialized_all_prototypes = self._serialize_array_payload(
+                self.all_prototypes)
+
+        shared_payload = {
+            'cov_matrices': serialized_cov_matrices,
+            'global_prototypes': serialized_global_prototypes,
+        }
+        if serialized_all_prototypes is not None:
+            shared_payload['all_prototypes_by_client'] = serialized_all_prototypes
+        shared_content_size = self._sizeof_content(shared_payload)
+        logger.info(
+            "Server: Prepared shared covariance broadcast payload: "
+            f"classes={len(self.global_cov_matrices)}, "
+            f"global_prototypes={len(self.global_prototypes)}, "
+            f"all_client_prototypes="
+            f"{len(self.all_prototypes) if serialized_all_prototypes is not None else 0}, "
+            f"shared_bytes={shared_content_size}")
+
+        for client_id in receivers:
             content = {
-                'cov_matrices': self._serialize_array_payload(
-                    self.global_cov_matrices),
-                'other_prototypes': {
+                'cov_matrices': serialized_cov_matrices,
+                'global_prototypes': serialized_global_prototypes,
+            }
+            if serialized_all_prototypes is not None:
+                content['all_prototypes_by_client'] = serialized_all_prototypes
+                content['other_prototypes'] = {}
+                self._bytes_sent += shared_content_size
+            else:
+                client_other_prototypes = {
                     client_id: self._serialize_array_payload(
                         other_prototypes.get(client_id, {}))
-                },
-                'global_prototypes': self._serialize_array_payload(
-                    self.global_prototypes)  # For feature alignment
-            }
-            self._bytes_sent += self._sizeof_content(content)
+                }
+                content['other_prototypes'] = client_other_prototypes
+                self._bytes_sent += shared_content_size + self._sizeof_content({
+                    'other_prototypes': client_other_prototypes
+                })
             logger.info(
                 f"Server: Sending global covariances to client {client_id}")
             self.comm_manager.send(
@@ -1251,7 +1405,9 @@ class GGEURServer(Server):
             logger.info(
                 f"Server: Sent global covariances to client {client_id}")
 
-        logger.info(f"Server: Broadcasted global covariances to {len(self.local_statistics_buffer)} clients")
+        logger.info(
+            f"Server: Broadcasted global covariances to {len(receivers)} "
+            f"active clients: {receivers}")
         self._mark_stage('augmentation_ready')
 
     @staticmethod
@@ -1297,6 +1453,20 @@ class GGEURServer(Server):
         content = message.content
         self._bytes_recv += self._sizeof_content(content)
 
+        expected_senders = set(self._active_clients_for_broadcast())
+        if sender not in expected_senders:
+            logger.warning(
+                f"Server: Ignore model update from inactive client "
+                f"{sender} for round {round_idx}; expected_clients="
+                f"{sorted(expected_senders)}")
+            return
+        if round_idx != self.state:
+            logger.warning(
+                f"Server: Ignore stale/future model update from client "
+                f"{sender}: message_round={round_idx}, server_round="
+                f"{self.state}")
+            return
+
         if isinstance(content, (tuple, list)) and len(content) == 2:
             sample_size, model_para = content
         else:
@@ -1306,13 +1476,24 @@ class GGEURServer(Server):
         if round_idx not in self.msg_buffer['train']:
             self.msg_buffer['train'][round_idx] = []
 
+        received_senders = {
+            item[2] for item in self.msg_buffer['train'][round_idx]
+        }
+        if sender in received_senders:
+            logger.warning(
+                f"Server: Ignore duplicate model update from client "
+                f"{sender} for round {round_idx}")
+            return
+
         self.msg_buffer['train'][round_idx].append((sample_size, model_para, sender))
 
+        expected_updates = self._expected_train_updates()
         logger.info(f"Server: Received model from client {sender} for round {round_idx} "
-                    f"({len(self.msg_buffer['train'][round_idx])}/{self._client_num})")
+                    f"({len(self.msg_buffer['train'][round_idx])}/{expected_updates}; "
+                    f"configured_clients={self._client_num})")
 
-        # Check if all clients have responded
-        if len(self.msg_buffer['train'][round_idx]) >= self._client_num:
+        # Check if the configured training-update quorum has responded.
+        if len(self.msg_buffer['train'][round_idx]) >= expected_updates:
             self._perform_fedavg(round_idx)
 
     def _perform_fedavg(self, round_idx):
@@ -1393,19 +1574,23 @@ class GGEURServer(Server):
                     except Exception as e:
                         logger.debug(f"Server: Could not load MLP params: {e}")
 
-        should_eval = self._should_run_server_eval()
+        should_eval = self._should_run_eval(round_idx)
+        client_eval_requested = False
 
         # Evaluate MLP on test sets (using CLIP features)
-        if should_eval:
+        if should_eval and self._eval_mode() == 'server':
             test_results = self._evaluate_on_test_sets()
             if test_results:
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
                 logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
+        elif should_eval and self._eval_mode() == 'client':
+            self._request_client_eval(round_idx)
+            client_eval_requested = True
 
         # Aggregate and evaluate PromptFL if enabled
         if self.use_promptfl:
             self._aggregate_prompt(valid_params, total_samples)
-            if should_eval:
+            if should_eval and self._eval_mode() == 'server':
                 prompt_results = self._evaluate_prompt_on_test_sets()
                 if prompt_results:
                     acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in prompt_results.items()])
@@ -1417,7 +1602,8 @@ class GGEURServer(Server):
             (self.use_cnn_distillation or self.use_feature_alignment) or
             (self.use_separated_training and self.training_phase == 'cnn_backbone')
         )
-        if should_eval and should_eval_cnn and self.global_cnn is not None:
+        if should_eval and self._eval_mode() == 'server' and \
+                should_eval_cnn and self.global_cnn is not None:
             cnn_test_results = self._evaluate_cnn_on_test_sets()
             if cnn_test_results:
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in cnn_test_results.items()])
@@ -1435,6 +1621,7 @@ class GGEURServer(Server):
                 'train_qps_samples_per_sec': float(train_qps),
                 'valid_client_updates': len(valid_params),
                 'received_client_updates': len(all_params),
+                'expected_train_updates': int(self._expected_train_updates()),
                 'bytes_sent_total': int(self._bytes_sent),
                 'bytes_recv_total': int(self._bytes_recv),
             })
@@ -1442,8 +1629,14 @@ class GGEURServer(Server):
                         f"total samples: {total_samples}, "
                         f"round time: {round_elapsed:.1f}s, "
                         f"train_qps={train_qps:.2f} samples/s, "
-                        f"valid_updates={len(valid_params)}/{self._client_num}")
+                        f"valid_updates={len(valid_params)}/{self._expected_train_updates()}")
 
+        if client_eval_requested:
+            return
+
+        self._complete_training_round(round_idx)
+
+    def _complete_training_round(self, round_idx):
         # Move to next round
         self.state = round_idx + 1
 
@@ -1452,13 +1645,114 @@ class GGEURServer(Server):
         else:
             self._finish()
 
-    def _should_run_server_eval(self):
-        """Whether this GGEUR server should run server-side evaluation."""
+    def _eval_mode(self):
+        return str(getattr(self.ggeur_cfg, 'headonly_eval_mode',
+                           'server') or 'server').lower()
+
+    def _should_run_eval(self, round_idx):
+        """Whether this GGEUR server should run evaluation this round."""
         eval_freq = getattr(getattr(self._cfg, 'eval', None), 'freq', 1)
         try:
-            return int(eval_freq) > 0
+            eval_freq = int(eval_freq)
         except Exception:
-            return True
+            eval_freq = 1
+        return eval_freq > 0 and int(round_idx) % eval_freq == 0
+
+    def _request_client_eval(self, round_idx):
+        if self.global_mlp is None:
+            self._complete_training_round(round_idx)
+            return
+
+        receivers = self._active_clients_for_broadcast()
+        model_para = copy.deepcopy(self.global_mlp.state_dict())
+        send_bytes = self._sizeof_content(model_para)
+        self._bytes_sent += send_bytes * len(receivers)
+        self.client_eval_buffer[round_idx] = {}
+        self.pending_client_eval_round = round_idx
+        logger.info(
+            f"Server: Requesting client-side MLP evaluation for round "
+            f"{round_idx} from {len(receivers)} clients: {receivers}")
+        self._mark_stage(f'round_{round_idx}_client_eval')
+        for client_id in receivers:
+            self.comm_manager.send(
+                Message(
+                    msg_type='client_eval',
+                    sender=self.ID,
+                    receiver=[client_id],
+                    state=round_idx,
+                    content=model_para
+                )
+            )
+
+    def callback_for_client_eval_metrics(self, message: Message):
+        round_idx = int(message.state)
+        sender = message.sender
+        content = message.content
+        self._bytes_recv += self._sizeof_content(content)
+
+        if round_idx != self.pending_client_eval_round:
+            logger.warning(
+                f"Server: Ignore client_eval_metrics from client {sender}: "
+                f"message_round={round_idx}, pending_round="
+                f"{self.pending_client_eval_round}")
+            return
+        expected_senders = set(self._active_clients_for_broadcast())
+        if sender not in expected_senders:
+            logger.warning(
+                f"Server: Ignore client_eval_metrics from inactive client "
+                f"{sender}; expected_clients={sorted(expected_senders)}")
+            return
+
+        if round_idx not in self.client_eval_buffer:
+            self.client_eval_buffer[round_idx] = {}
+        self.client_eval_buffer[round_idx][sender] = content
+
+        expected = self._expected_train_updates()
+        logger.info(
+            f"Server: Received client-side eval metrics from client "
+            f"{sender} for round {round_idx} "
+            f"({len(self.client_eval_buffer[round_idx])}/{expected})")
+
+        if len(self.client_eval_buffer[round_idx]) >= expected:
+            self._aggregate_client_eval_metrics(round_idx)
+            self.pending_client_eval_round = None
+            self._clear_stage()
+            self._complete_training_round(round_idx)
+
+    def _aggregate_client_eval_metrics(self, round_idx):
+        metrics = self.client_eval_buffer.get(round_idx, {})
+        total = 0
+        correct = 0
+        loss_sum = 0.0
+        clients = []
+        for client_id, item in sorted(metrics.items()):
+            client_total = int(item.get('total', 0))
+            client_correct = int(item.get('correct', 0))
+            client_loss = float(item.get('loss', 0.0))
+            total += client_total
+            correct += client_correct
+            loss_sum += client_loss * client_total
+            clients.append(client_id)
+
+        accuracy = correct / total if total > 0 else 0.0
+        avg_loss = loss_sum / total if total > 0 else 0.0
+        results = {
+            'client_weighted_average': accuracy,
+            'average': accuracy,
+        }
+        for key, value in results.items():
+            self.test_accuracies_history.setdefault(key, []).append(value)
+        if accuracy > self.best_avg_accuracy:
+            self.best_avg_accuracy = accuracy
+            if self.global_mlp is not None:
+                self.best_model_state = copy.deepcopy(
+                    self.global_mlp.state_dict())
+
+        logger.info(
+            f"Server: Round {round_idx} MLP Test Accuracy - "
+            f"client_weighted_average: {accuracy:.4f}, "
+            f"average: {accuracy:.4f}, loss: {avg_loss:.4f}, "
+            f"correct: {correct}, total: {total}, clients: {clients}")
 
     def _apply_fedopt_update(self, averaged_state_dict):
         """
@@ -1864,7 +2158,8 @@ class GGEURServer(Server):
                     f"total={_fmt_bytes(total_comm)}")
         logger.info("="*60)
 
-        for client_id in range(1, self._client_num + 1):
+        receivers = self._active_clients_for_broadcast()
+        for client_id in receivers:
             self.comm_manager.send(
                 Message(
                     msg_type='finish',

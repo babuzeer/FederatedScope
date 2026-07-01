@@ -58,7 +58,7 @@ ggeur:
   use_feature_cache: True
   feature_cache_dir: ''
 
-  # ===== Feature Augmentation =====
+  # ===== Feature Augmentation (disabled to isolate PromptFL) =====
   num_generated_per_sample: 50
   num_generated_per_prototype: 50
   target_size_per_class: 50
@@ -68,7 +68,7 @@ ggeur:
   mlp_dropout: 0.0
 
   # ===== Multi-domain Settings =====
-  use_cross_client_prototypes: True
+  use_cross_client_prototypes: False
   statistics_round: 0
 
   # ===== LDS Settings =====
@@ -84,14 +84,10 @@ ggeur:
   # ===== PromptFL Settings =====
   use_promptfl: True
   prompt_length: 16
-  prompt_lr: 0.0005
+  prompt_lr: 0.0002
   prompt_local_epochs: 1
-  # Temperature for cosine similarity logits (replaces CLIP's logit_scale ~100)
+  # Temperature for cosine similarity logits
   prompt_temperature: 0.07
-  # FedProx proximal term to reduce client drift (0.0 = disabled)
-  prompt_proximal_mu: 0.1
-  # Gaussian samples per prototype class in prompt_loader (cross-domain coverage)
-  prompt_samples_per_proto: 4
   # Optional: override class names (leave empty to auto-detect from dataset)
   prompt_class_names: []
   # Text prompt template
