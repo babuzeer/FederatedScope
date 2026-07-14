@@ -62,6 +62,21 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.feature_cache_dir = ''
     # Whether to use cached features if available
     cfg.ggeur.use_feature_cache = True
+    # Whether to reuse generated/augmented feature files when the cache
+    # metadata matches the current dataset split, client count, feature
+    # extractor, and GGEUR generation parameters. This is enabled by default
+    # for fast third-party reruns; set False to force regeneration.
+    cfg.ggeur.reuse_augmented_feature_cache = True
+    # Whether to persist generated/augmented feature files for later reruns.
+    cfg.ggeur.save_augmented_feature_cache = True
+    # Optional dedicated cache dir for generated/augmented feature files.
+    # Empty = use feature_cache_dir; if that is also empty, use the default
+    # cache directory next to data.root.
+    cfg.ggeur.augmented_feature_cache_dir = ''
+    # Version namespace for generated/augmented feature files. Bump this when
+    # changing the cache format or intentionally invalidating old generated
+    # features.
+    cfg.ggeur.augmented_feature_cache_version = 'aug_fcache_v1'
     # Unload feature extractor from GPU after extraction (saves VRAM in standalone mode)
     # Only applies when CNN distillation/alignment modes are disabled
     cfg.ggeur.unload_extractor_after_cache = True

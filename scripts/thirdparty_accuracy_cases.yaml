@@ -1,0 +1,225 @@
+version: 1
+name: thirdparty_accuracy_cases
+description: >
+  Per-case launch matrix for third-party cross-domain heterogeneous accuracy
+  tests. PACS is intentionally excluded for the current test round.
+
+defaults:
+  python_bin: /root/miniconda3/envs/fs/bin/python
+  output_root: exp/ggeur_accuracy_reruns
+  run_id: thirdparty_accuracy_manual
+  cuda_visible_devices: "0"
+  opts:
+    device: 0
+    ggeur.use_feature_cache: true
+    ggeur.reuse_augmented_feature_cache: true
+    ggeur.save_augmented_feature_cache: true
+
+methods:
+  - ggeur
+  - fedavg
+  - fedprox
+  - fedproto
+  - fedopt
+  - moon
+
+plot_groups:
+  - dataset: officehome
+    model: cnn
+  - dataset: officehome
+    model: mixer
+  - dataset: officehome
+    model: vit
+  - dataset: domainnet
+    model: cnn
+  - dataset: domainnet
+    model: mlp
+  - dataset: domainnet
+    model: vit
+
+cases:
+  - name: officehome__cnn__ggeur
+    dataset: officehome
+    model: cnn
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_ggeur_fedavg.yaml
+  - name: officehome__cnn__fedavg
+    dataset: officehome
+    model: cnn
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_fedavg.yaml
+  - name: officehome__cnn__fedprox
+    dataset: officehome
+    model: cnn
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_fedprox.yaml
+  - name: officehome__cnn__fedproto
+    dataset: officehome
+    model: cnn
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_fedproto.yaml
+  - name: officehome__cnn__fedopt
+    dataset: officehome
+    model: cnn
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_fedopt.yaml
+  - name: officehome__cnn__moon
+    dataset: officehome
+    model: cnn
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_cnn/officehome_lds_cnn_moon.yaml
+
+  - name: officehome__mixer__ggeur
+    dataset: officehome
+    model: mixer
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_ggeur_fedavg_local_weights.yaml
+  - name: officehome__mixer__fedavg
+    dataset: officehome
+    model: mixer
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_fedavg_baseline_local_weights.yaml
+  - name: officehome__mixer__fedprox
+    dataset: officehome
+    model: mixer
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_fedprox.yaml
+  - name: officehome__mixer__fedproto
+    dataset: officehome
+    model: mixer
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_fedproto.yaml
+  - name: officehome__mixer__fedopt
+    dataset: officehome
+    model: mixer
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_fedopt.yaml
+  - name: officehome__mixer__moon
+    dataset: officehome
+    model: mixer
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_mixer/officehome_lds_mixer_moon.yaml
+
+  - name: officehome__vit__ggeur
+    dataset: officehome
+    model: vit
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_ggeur_fedavg.yaml
+  - name: officehome__vit__fedavg
+    dataset: officehome
+    model: vit
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_fedavg.yaml
+  - name: officehome__vit__fedprox
+    dataset: officehome
+    model: vit
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_fedprox.yaml
+  - name: officehome__vit__fedproto
+    dataset: officehome
+    model: vit
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_fedproto.yaml
+  - name: officehome__vit__fedopt
+    dataset: officehome
+    model: vit
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_fedopt.yaml
+  - name: officehome__vit__moon
+    dataset: officehome
+    model: vit
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_vit/officehome_lds_vit_moon.yaml
+
+  - name: domainnet__cnn__ggeur
+    dataset: domainnet
+    model: cnn
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_ggeur_fedavg.yaml
+  - name: domainnet__cnn__fedavg
+    dataset: domainnet
+    model: cnn
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_fedavg.yaml
+  - name: domainnet__cnn__fedprox
+    dataset: domainnet
+    model: cnn
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_fedprox.yaml
+  - name: domainnet__cnn__fedproto
+    dataset: domainnet
+    model: cnn
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_fedproto.yaml
+  - name: domainnet__cnn__fedopt
+    dataset: domainnet
+    model: cnn
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_fedopt.yaml
+  - name: domainnet__cnn__moon
+    dataset: domainnet
+    model: cnn
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_cnn_domainnet/domainnet_4domains_cnn_moon.yaml
+
+  - name: domainnet__mlp__ggeur
+    dataset: domainnet
+    model: mlp
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_ggeur_fedavg.yaml
+  - name: domainnet__mlp__fedavg
+    dataset: domainnet
+    model: mlp
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_fedavg.yaml
+  - name: domainnet__mlp__fedprox
+    dataset: domainnet
+    model: mlp
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_fedprox.yaml
+  - name: domainnet__mlp__fedproto
+    dataset: domainnet
+    model: mlp
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_fedproto.yaml
+  - name: domainnet__mlp__fedopt
+    dataset: domainnet
+    model: mlp
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_fedopt.yaml
+  - name: domainnet__mlp__moon
+    dataset: domainnet
+    model: mlp
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_mlp_domainnet/domainnet_4domains_mlp_moon.yaml
+
+  - name: domainnet__vit__ggeur
+    dataset: domainnet
+    model: vit
+    method: ggeur
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_ggeur_fedavg.yaml
+  - name: domainnet__vit__fedavg
+    dataset: domainnet
+    model: vit
+    method: fedavg
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedavg.yaml
+  - name: domainnet__vit__fedprox
+    dataset: domainnet
+    model: vit
+    method: fedprox
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedprox.yaml
+  - name: domainnet__vit__fedproto
+    dataset: domainnet
+    model: vit
+    method: fedproto
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedproto.yaml
+  - name: domainnet__vit__fedopt
+    dataset: domainnet
+    model: vit
+    method: fedopt
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedopt.yaml
+  - name: domainnet__vit__moon
+    dataset: domainnet
+    model: vit
+    method: moon
+    config: scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_moon.yaml

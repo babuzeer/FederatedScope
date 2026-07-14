@@ -15,7 +15,9 @@ import time
 import logging
 import copy
 import base64
+import hashlib
 import io
+import json
 import zlib
 import numpy as np
 import torch
@@ -493,6 +495,16 @@ class GGEURClient(Client):
         Extract features from local data using either CLIP or CNN.
         Supports caching for both modes.
         """
+        timing_total_start = time.time()
+        timing_load_extractor = 0.0
+        timing_load_cache = 0.0
+        timing_scan_cache = 0.0
+        timing_image_load = 0.0
+        timing_forward = 0.0
+        timing_cache_save = 0.0
+        samples_total = 0
+        samples_cached = 0
+        samples_need_extract = 0
         if self.feature_extractor_type == 'cnn':
             extractor_name = 'CNN'
         elif self.feature_extractor_type == 'timm':
@@ -527,12 +539,16 @@ class GGEURClient(Client):
 
         # Load before cache lookup so embedding_dim reflects the real extractor
         # output, not the config default from a previous backbone.
+        _timing_t0 = time.time()
         self._load_feature_extractor()
+        timing_load_extractor += time.time() - _timing_t0
 
         cache_path = self._get_feature_cache_path(domain)
 
         # Load existing cache
+        _timing_t0 = time.time()
         feature_cache = self._load_feature_cache(cache_path)
+        timing_load_cache += time.time() - _timing_t0
         if feature_cache:
             valid_cache = {
                 path: feat
@@ -560,6 +576,7 @@ class GGEURClient(Client):
         if has_paths:
             # Dataset with image paths - can use caching
             num_samples = len(subset_indices) if is_subset else len(base_dataset)
+            samples_total = int(num_samples)
             logger.info(f"Client {self.ID}: Dataset has {num_samples} samples with paths")
 
             # Collect samples that need feature extraction
@@ -567,6 +584,7 @@ class GGEURClient(Client):
             indices_to_extract = []  # Indices into the current dataset (Subset or base)
             base_indices_to_extract = []  # Indices into base_dataset for loading
 
+            _timing_t0 = time.time()
             for local_idx in range(num_samples):
                 # Get the index into the base dataset
                 if is_subset:
@@ -601,8 +619,11 @@ class GGEURClient(Client):
                     paths_to_extract.append(img_path)
                     indices_to_extract.append(local_idx)
                     base_indices_to_extract.append(base_idx)
+            timing_scan_cache += time.time() - _timing_t0
 
             cached_count = num_samples - len(paths_to_extract)
+            samples_cached = int(cached_count)
+            samples_need_extract = int(len(paths_to_extract))
             logger.info(f"Client {self.ID}: {cached_count} samples from cache, {len(paths_to_extract)} need extraction")
 
             # Extract features for non-cached samples
@@ -618,10 +639,12 @@ class GGEURClient(Client):
                         # Load images from base dataset
                         images = []
                         labels = []
+                        _timing_t0 = time.time()
                         for base_idx in batch_base_indices:
                             img, lbl = base_dataset[base_idx]
                             images.append(img)
                             labels.append(lbl)
+                        timing_image_load += time.time() - _timing_t0
 
                         images = torch.stack(images).to(self.device)
 
@@ -633,8 +656,10 @@ class GGEURClient(Client):
                             features = self.timm_extractor(images)
                         else:
                             features = self.clip_model.encode_image(images)
+                        _forward_elapsed = time.time() - _t0
                         _qps_samples += len(images)
-                        _qps_time += time.time() - _t0
+                        _qps_time += _forward_elapsed
+                        timing_forward += _forward_elapsed
                         features = features.cpu().numpy()
 
                         for feat, label, path in zip(features, labels, batch_paths):
@@ -659,7 +684,9 @@ class GGEURClient(Client):
 
                 # Save updated cache
                 if cache_updated:
+                    _timing_t0 = time.time()
                     self._save_feature_cache(cache_path, feature_cache)
+                    timing_cache_save += time.time() - _timing_t0
 
         else:
             # Fallback: Dataset without paths - cannot use caching
@@ -676,6 +703,8 @@ class GGEURClient(Client):
                         continue
 
                     images = images.to(self.device)
+                    samples_total += int(images.shape[0])
+                    samples_need_extract += int(images.shape[0])
 
                     # Skip invalid images
                     if images.shape[1] != 3:
@@ -689,8 +718,10 @@ class GGEURClient(Client):
                         features = self.timm_extractor(images)
                     else:
                         features = self.clip_model.encode_image(images)
+                    _forward_elapsed = time.time() - _t0
                     _qps_samples += len(images)
-                    _qps_time += time.time() - _t0
+                    _qps_time += _forward_elapsed
+                    timing_forward += _forward_elapsed
                     features = features.cpu().numpy()
                     labels = labels.cpu().numpy()
 
@@ -718,6 +749,22 @@ class GGEURClient(Client):
             logger.info(f"Client {self.ID}: Feature extraction QPS={qps:.1f} img/s "
                         f"({_qps_samples} samples in {_qps_time:.2f}s)")
         logger.info(f"Client {self.ID}: Extracted {total_samples} {extractor_name} features from {len(self.local_features)} classes")
+        timing_total = time.time() - timing_total_start
+        logger.info(
+            "GGEUR_TIMING_CLIENT "
+            f"client={int(self.ID)} stage=feature_extraction "
+            f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+            f"total_sec={timing_total:.6f} "
+            f"load_extractor_sec={timing_load_extractor:.6f} "
+            f"load_cache_sec={timing_load_cache:.6f} "
+            f"scan_cache_sec={timing_scan_cache:.6f} "
+            f"image_load_sec={timing_image_load:.6f} "
+            f"forward_sec={timing_forward:.6f} "
+            f"cache_save_sec={timing_cache_save:.6f} "
+            f"samples_total={samples_total} samples_cached={samples_cached} "
+            f"samples_need_extract={samples_need_extract} "
+            f"samples_forward={_qps_samples} output_samples={total_samples} "
+            f"classes={len(self.local_features)} feature_dim={self.embedding_dim}")
 
     def _extract_clip_features(self):
         """Legacy method - now calls _extract_features()"""
@@ -726,10 +773,15 @@ class GGEURClient(Client):
     def _compute_local_statistics(self):
         """Compute local mean and covariance for each class"""
         logger.info(f"Client {self.ID}: Computing local statistics...")
+        timing_total_start = time.time()
+        timing_mean = 0.0
+        timing_center = 0.0
+        timing_cov = 0.0
 
         self.local_means = {}
         self.local_covs = {}
         self.local_counts = {}
+        sample_count = 0
 
         for class_idx, features in self.local_features.items():
             if features.shape[0] == 0:
@@ -746,17 +798,33 @@ class GGEURClient(Client):
                 continue
 
             n = features.shape[0]
+            sample_count += int(n)
+            _timing_t0 = time.time()
             mean = np.mean(features, axis=0)
+            timing_mean += time.time() - _timing_t0
 
             # Compute covariance
+            _timing_t0 = time.time()
             centered = features - mean
+            timing_center += time.time() - _timing_t0
+            _timing_t0 = time.time()
             cov = (1.0 / n) * np.dot(centered.T, centered)
+            timing_cov += time.time() - _timing_t0
 
             self.local_means[class_idx] = mean
             self.local_covs[class_idx] = cov
             self.local_counts[class_idx] = n
 
         logger.info(f"Client {self.ID}: Computed statistics for {len(self.local_means)} classes")
+        timing_total = time.time() - timing_total_start
+        logger.info(
+            "GGEUR_TIMING_CLIENT "
+            f"client={int(self.ID)} stage=local_statistics "
+            f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+            f"total_sec={timing_total:.6f} mean_sec={timing_mean:.6f} "
+            f"center_sec={timing_center:.6f} cov_dot_sec={timing_cov:.6f} "
+            f"classes={len(self.local_means)} samples={sample_count} "
+            f"feature_dim={self.embedding_dim}")
 
     def _validate_local_statistics(self):
         """Validate statistics dimensions before sending them to the server."""
@@ -782,13 +850,19 @@ class GGEURClient(Client):
     def _upload_local_statistics(self):
         """Upload local statistics to server"""
         logger.info(f"Client {self.ID}: Uploading local statistics to server...")
+        timing_total_start = time.time()
+        _timing_t0 = time.time()
         self._validate_local_statistics()
+        timing_validate = time.time() - _timing_t0
 
         # Also send prototypes for cross-client augmentation
+        _timing_t0 = time.time()
         prototypes = {}
         for class_idx, mean in self.local_means.items():
             prototypes[class_idx] = mean
+        timing_prototype_prepare = time.time() - _timing_t0
 
+        _timing_t0 = time.time()
         content = {
             'client_id': self.ID,
             'embedding_dim': int(self.embedding_dim),
@@ -798,10 +872,13 @@ class GGEURClient(Client):
             'prototypes': self._serialize_array_payload(prototypes)
         }
         payload_bytes = self._sizeof_content(content)
+        stats_class_count = len(self.local_means)
+        timing_serialize = time.time() - _timing_t0
         logger.info(
             f"Client {self.ID}: Local statistics payload bytes={payload_bytes} "
-            f"(classes={len(self.local_means)}, embedding_dim={self.embedding_dim})")
+            f"(classes={stats_class_count}, embedding_dim={self.embedding_dim})")
 
+        _timing_t0 = time.time()
         self.comm_manager.send(
             Message(
                 msg_type='local_statistics',
@@ -811,10 +888,21 @@ class GGEURClient(Client):
                 content=content
             )
         )
+        timing_send = time.time() - _timing_t0
 
         self.statistics_uploaded = True
         self._release_round0_stat_buffers()
         logger.info(f"Client {self.ID}: Statistics uploaded")
+        timing_total = time.time() - timing_total_start
+        logger.info(
+            "GGEUR_TIMING_CLIENT "
+            f"client={int(self.ID)} stage=statistics_upload "
+            f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+            f"total_sec={timing_total:.6f} validate_sec={timing_validate:.6f} "
+            f"prototype_prepare_sec={timing_prototype_prepare:.6f} "
+            f"serialize_sec={timing_serialize:.6f} send_sec={timing_send:.6f} "
+            f"payload_bytes={payload_bytes} classes={stats_class_count} "
+            f"feature_dim={self.embedding_dim}")
 
     @staticmethod
     def _serialize_array_payload(payload):
@@ -872,11 +960,15 @@ class GGEURClient(Client):
     def callback_for_global_covariances(self, message: Message):
         """Handle receiving global covariance matrices from server"""
         logger.info(f"Client {self.ID}: Received global covariances from server")
+        timing_total_start = time.time()
 
         content = message.content
+        _timing_t0 = time.time()
         self.global_cov_matrices = self._normalize_covariance_mapping(
             content.get('cov_matrices', {}))
+        timing_cov_decode = time.time() - _timing_t0
         all_prototypes_by_client = content.get('all_prototypes_by_client', {})
+        _timing_t0 = time.time()
         if all_prototypes_by_client:
             self.other_prototypes = (
                 self._normalize_other_prototypes_from_client_pool(
@@ -885,8 +977,11 @@ class GGEURClient(Client):
             other_prototypes = content.get('other_prototypes', {})
             self.other_prototypes = self._normalize_prototype_mapping(
                 self._get_class_value(other_prototypes, self.ID) or {})
+        timing_other_proto_decode = time.time() - _timing_t0
+        _timing_t0 = time.time()
         self.global_prototypes = self._normalize_prototype_mapping(
             content.get('global_prototypes', {}))  # For feature alignment
+        timing_global_proto_decode = time.time() - _timing_t0
 
         # Debug logging for received prototypes
         logger.info(f"Client {self.ID}: Received global_prototypes with {len(self.global_prototypes)} classes")
@@ -929,10 +1024,24 @@ class GGEURClient(Client):
             logger.info(f"Client {self.ID}: CNN distillation ready - CLIP: {self.clip_model is not None}, "
                        f"MLP: {self.mlp_classifier is not None}, CNN: {self.cnn_model is not None}")
 
+        cov_classes = len(self.global_cov_matrices)
+        other_proto_classes = len(self.other_prototypes)
+        global_proto_classes = len(self.global_prototypes)
         self._release_round0_broadcast_buffers_if_unused()
 
         # Notify server that augmentation is complete
         logger.info(f"Client {self.ID}: Notifying server that augmentation is ready")
+        logger.info(
+            "GGEUR_TIMING_CLIENT "
+            f"client={int(self.ID)} stage=global_covariance_callback "
+            f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+            f"total_sec={time.time() - timing_total_start:.6f} "
+            f"cov_decode_sec={timing_cov_decode:.6f} "
+            f"other_proto_decode_sec={timing_other_proto_decode:.6f} "
+            f"global_proto_decode_sec={timing_global_proto_decode:.6f} "
+            f"cov_classes={cov_classes} "
+            f"other_proto_classes={other_proto_classes} "
+            f"global_proto_classes={global_proto_classes}")
         self.comm_manager.send(
             Message(
                 msg_type='augmentation_ready',
@@ -1190,12 +1299,40 @@ class GGEURClient(Client):
     def _perform_augmentation(self):
         """Perform GGEUR_Clip feature augmentation"""
         augmentation_start = time.time()
+        timing_cache_load = 0.0
+        timing_init = 0.0
+        timing_original_collect = 0.0
+        timing_cov_lookup = 0.0
+        timing_sample_generation = 0.0
+        timing_prototype_generation = 0.0
+        timing_stack_select = 0.0
+        timing_dataset_build = 0.0
+        timing_cache_save = 0.0
+        original_samples = 0
+        generated_sample_count = 0
+        generated_prototype_count = 0
+        selected_samples = 0
+        sample_generation_calls = 0
+        prototype_generation_calls = 0
+        _timing_t0 = time.time()
         if self._try_load_augmented_feature_cache():
+            timing_cache_load = time.time() - _timing_t0
             self.augmentation_done = True
             self.local_features = {}
             self.local_labels = {}
+            logger.info(
+                "GGEUR_TIMING_CLIENT "
+                f"client={int(self.ID)} stage=augmentation "
+                f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+                f"cache_hit=1 total_sec={time.time() - augmentation_start:.6f} "
+                f"cache_load_sec={timing_cache_load:.6f} "
+                f"generated_per_sample={getattr(self.ggeur_cfg, 'num_generated_per_sample', 0)} "
+                f"generated_per_prototype={getattr(self.ggeur_cfg, 'num_generated_per_prototype', 0)} "
+                f"target_size_per_class={getattr(self.ggeur_cfg, 'target_size_per_class', 0)}")
             return
+        timing_cache_load = time.time() - _timing_t0
 
+        _timing_t0 = time.time()
         target_size = self.ggeur_cfg.target_size_per_class
         num_per_sample = self.ggeur_cfg.num_generated_per_sample
         num_per_prototype = self.ggeur_cfg.num_generated_per_prototype
@@ -1220,6 +1357,7 @@ class GGEURClient(Client):
             all_classes.update(self.other_prototypes.keys())
 
         total_classes = len(all_classes)
+        timing_init += time.time() - _timing_t0
 
         # 获取特征维度用于日志
         feature_dim = self.embedding_dim
@@ -1241,38 +1379,55 @@ class GGEURClient(Client):
 
             # 1. Original features from this client (always include)
             if class_idx in self.local_features:
+                _timing_t0 = time.time()
                 original = self.local_features[class_idx]
                 class_features.append(original)
+                original_samples += int(original.shape[0])
+                timing_original_collect += time.time() - _timing_t0
 
             # Skip augmentation if disabled
             if no_augmentation:
                 if class_features:
+                    _timing_t0 = time.time()
                     combined = np.vstack(class_features)
                     all_features.append(combined)
                     all_labels.append(np.full(combined.shape[0], class_idx))
+                    selected_samples += int(combined.shape[0])
+                    timing_stack_select += time.time() - _timing_t0
                 continue
 
             # 2. Get global covariance matrix
+            _timing_t0 = time.time()
             if class_idx in self.global_cov_matrices:
                 cov_matrix = self.global_cov_matrices[class_idx]
             else:
                 cov_matrix = np.eye(self.embedding_dim) * 0.01
+            timing_cov_lookup += time.time() - _timing_t0
 
             # 3. Expand original features using global covariance
             if num_per_sample > 0 and class_idx in self.local_features and self.local_features[class_idx].shape[0] > 0:
                 for feat in self.local_features[class_idx]:
+                    _timing_t0 = time.time()
                     generated = self._generate_samples(feat, cov_matrix, num_per_sample)
+                    timing_sample_generation += time.time() - _timing_t0
+                    sample_generation_calls += 1
+                    generated_sample_count += int(generated.shape[0])
                     class_features.append(generated)
 
             # 4. Generate from other clients' prototypes
             if use_cross_client and num_per_prototype > 0 and self.other_prototypes:
                 if class_idx in self.other_prototypes:
                     for prototype in self.other_prototypes[class_idx]:
+                        _timing_t0 = time.time()
                         generated = self._generate_samples(prototype, cov_matrix, num_per_prototype)
+                        timing_prototype_generation += time.time() - _timing_t0
+                        prototype_generation_calls += 1
+                        generated_prototype_count += int(generated.shape[0])
                         class_features.append(generated)
 
             # Combine and sample to target size
             if class_features:
+                _timing_t0 = time.time()
                 combined = np.vstack(class_features)
 
                 # target_size = 0 means use all samples
@@ -1284,10 +1439,13 @@ class GGEURClient(Client):
 
                 all_features.append(selected)
                 all_labels.append(np.full(selected.shape[0], class_idx))
+                selected_samples += int(selected.shape[0])
+                timing_stack_select += time.time() - _timing_t0
 
         logger.info(f"Client {self.ID}: Augmentation complete, building dataset...")
 
         if all_features:
+            _timing_t0 = time.time()
             self.augmented_features = np.vstack(all_features)
             self.augmented_labels = np.concatenate(all_labels)
 
@@ -1298,6 +1456,7 @@ class GGEURClient(Client):
                 batch_size=self._cfg.dataloader.batch_size,
                 shuffle=True
             )
+            timing_dataset_build += time.time() - _timing_t0
 
             if no_augmentation:
                 logger.info(f"Client {self.ID}: Original data - {self.augmented_features.shape[0]} samples, "
@@ -1315,9 +1474,43 @@ class GGEURClient(Client):
                 f"samples={self.augmented_features.shape[0]}, "
                 f"time={augmentation_elapsed:.4f}s, "
                 f"qps={aug_qps:.2f} samples/s")
+            _timing_t0 = time.time()
             self._save_augmented_feature_cache()
+            timing_cache_save += time.time() - _timing_t0
 
         self.augmentation_done = True
+        output_samples = (
+            int(self.augmented_features.shape[0])
+            if self.augmented_features is not None else 0)
+        output_classes = (
+            int(len(np.unique(self.augmented_labels)))
+            if self.augmented_labels is not None else 0)
+        logger.info(
+            "GGEUR_TIMING_CLIENT "
+            f"client={int(self.ID)} stage=augmentation "
+            f"dataset={self._cfg.data.type} extractor={self.feature_extractor_type} "
+            f"cache_hit=0 no_augmentation={1 if no_augmentation else 0} "
+            f"total_sec={time.time() - augmentation_start:.6f} "
+            f"cache_load_sec={timing_cache_load:.6f} "
+            f"init_sec={timing_init:.6f} "
+            f"original_collect_sec={timing_original_collect:.6f} "
+            f"cov_lookup_sec={timing_cov_lookup:.6f} "
+            f"sample_generation_sec={timing_sample_generation:.6f} "
+            f"prototype_generation_sec={timing_prototype_generation:.6f} "
+            f"stack_select_sec={timing_stack_select:.6f} "
+            f"dataset_build_sec={timing_dataset_build:.6f} "
+            f"cache_save_sec={timing_cache_save:.6f} "
+            f"classes={total_classes} feature_dim={feature_dim} "
+            f"original_samples={original_samples} "
+            f"generated_from_samples={generated_sample_count} "
+            f"generated_from_prototypes={generated_prototype_count} "
+            f"selected_samples={selected_samples} output_samples={output_samples} "
+            f"output_classes={output_classes} "
+            f"sample_generation_calls={sample_generation_calls} "
+            f"prototype_generation_calls={prototype_generation_calls} "
+            f"generated_per_sample={num_per_sample} "
+            f"generated_per_prototype={num_per_prototype} "
+            f"target_size_per_class={target_size}")
 
         # Free raw features from memory - augmented_features/loader are all we need now
         self.local_features = {}
@@ -1352,9 +1545,13 @@ class GGEURClient(Client):
             splits = list(splits)
         except Exception:
             splits = []
+        version = str(getattr(
+            self.ggeur_cfg, 'augmented_feature_cache_version',
+            getattr(self.ggeur_cfg, 'headonly_cache_version',
+                    'aug_fcache_v1')))
         return {
             'source': 'real_dataset',
-            'mode': 'ggeur_headonly_augmented_features',
+            'mode': 'ggeur_augmented_features',
             'client_id': int(self.ID),
             'client_num': int(self._cfg.federate.client_num),
             'dataset': str(self._cfg.data.type),
@@ -1362,6 +1559,7 @@ class GGEURClient(Client):
             'splits': splits,
             'seed': int(getattr(self._cfg, 'seed', 0)),
             'feature_extractor': str(self.feature_extractor_type),
+            'feature_extractor_model': self._feature_extractor_cache_name(),
             'embedding_dim': int(self.embedding_dim),
             'num_classes': int(self._cfg.model.num_classes),
             'num_generated_per_sample':
@@ -1370,24 +1568,168 @@ class GGEURClient(Client):
                 int(self.ggeur_cfg.num_generated_per_prototype),
             'target_size_per_class':
                 int(self.ggeur_cfg.target_size_per_class),
+            'use_cross_client_prototypes':
+                bool(getattr(self.ggeur_cfg, 'use_cross_client_prototypes',
+                             True)),
+            'max_cross_client_prototypes_per_class':
+                int(getattr(
+                    self.ggeur_cfg,
+                    'max_cross_client_prototypes_per_class', 0)),
+            'cross_client_prototype_seed':
+                int(getattr(self.ggeur_cfg,
+                            'cross_client_prototype_seed', 42)),
+            'use_fedproto':
+                bool(getattr(self.ggeur_cfg, 'use_fedproto', False)),
+            'use_lds':
+                bool(getattr(self.ggeur_cfg, 'use_lds', False)),
+            'lds_alpha':
+                float(getattr(self.ggeur_cfg, 'lds_alpha', 0.1)),
+            'lds_seed':
+                int(getattr(self.ggeur_cfg, 'lds_seed', 42)),
+            'domainnet_domains':
+                self._jsonable_config_value(
+                    getattr(self.ggeur_cfg, 'domainnet_domains', [])),
+            'domainnet_shared_classes_only':
+                bool(getattr(self.ggeur_cfg,
+                             'domainnet_shared_classes_only', False)),
+            'officehome_domains':
+                self._jsonable_config_value(
+                    getattr(self.ggeur_cfg, 'officehome_domains', [])),
+            'officehome_split_strategy':
+                str(getattr(self.ggeur_cfg, 'officehome_split_strategy',
+                            'standard')),
+            'officehome_random_clients_per_domain':
+                int(getattr(
+                    self.ggeur_cfg,
+                    'officehome_random_clients_per_domain', 0)),
+            'officehome_random_samples_per_client':
+                int(getattr(
+                    self.ggeur_cfg,
+                    'officehome_random_samples_per_client', 0)),
+            'officehome_random_sample_with_replacement':
+                bool(getattr(
+                    self.ggeur_cfg,
+                    'officehome_random_sample_with_replacement', False)),
+            'officehome_manifest_path':
+                str(getattr(self.ggeur_cfg, 'officehome_manifest_path', '')),
+            'augmented_feature_cache_version': version,
             'headonly_cache_version':
                 str(getattr(self.ggeur_cfg, 'headonly_cache_version',
                             'fcache_v1')),
         }
 
-    def _get_augmented_feature_cache_path(self):
-        if not getattr(self.ggeur_cfg, 'head_only_mode', False):
-            return None
-        cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+    @staticmethod
+    def _jsonable_config_value(value):
+        if isinstance(value, (list, tuple)):
+            return [GGEURClient._jsonable_config_value(item)
+                    for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): GGEURClient._jsonable_config_value(val)
+                for key, val in value.items()
+            }
+        try:
+            if isinstance(value, np.generic):
+                return value.item()
+        except Exception:
+            pass
+        return value
+
+    @staticmethod
+    def _safe_cache_token(value):
+        token = str(value).replace('\\', '_').replace('/', '_')
+        token = token.replace(':', '_').replace(' ', '_')
+        return ''.join(ch if ch.isalnum() or ch in '._-' else '_'
+                       for ch in token)
+
+    def _feature_extractor_cache_name(self):
+        if self.feature_extractor_type == 'cnn':
+            return str(getattr(self.ggeur_cfg, 'cnn_backbone',
+                               'convnext_base'))
+        if self.feature_extractor_type == 'timm':
+            return str(getattr(self.ggeur_cfg, 'timm_model',
+                               'mixer_b16_224'))
+        clip_model = str(getattr(self.ggeur_cfg, 'clip_model', 'ViT-B-16'))
+        pretrained = str(getattr(self.ggeur_cfg, 'clip_pretrained',
+                                 'openai'))
+        return f'{clip_model}_{pretrained}'
+
+    def _augmented_cache_fingerprint(self, metadata):
+        keys = [
+            'client_num',
+            'dataset',
+            'splits',
+            'seed',
+            'feature_extractor',
+            'feature_extractor_model',
+            'embedding_dim',
+            'num_classes',
+            'num_generated_per_sample',
+            'num_generated_per_prototype',
+            'target_size_per_class',
+            'use_cross_client_prototypes',
+            'max_cross_client_prototypes_per_class',
+            'cross_client_prototype_seed',
+            'use_fedproto',
+            'use_lds',
+            'lds_alpha',
+            'lds_seed',
+            'domainnet_domains',
+            'domainnet_shared_classes_only',
+            'officehome_domains',
+            'officehome_split_strategy',
+            'officehome_random_clients_per_domain',
+            'officehome_random_samples_per_client',
+            'officehome_random_sample_with_replacement',
+            'officehome_manifest_path',
+            'augmented_feature_cache_version',
+        ]
+        payload = {key: metadata.get(key) for key in keys}
+        text = json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                          default=str)
+        return hashlib.sha1(text.encode('utf-8')).hexdigest()[:16]
+
+    def _get_augmented_feature_cache_base_dir(self):
+        cache_dir = getattr(self.ggeur_cfg,
+                            'augmented_feature_cache_dir', '')
         if not cache_dir:
+            cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+        if not cache_dir:
+            cache_dir = os.path.join(os.path.dirname(self._cfg.data.root),
+                                     'clip_feature_cache')
+        return cache_dir
+
+    def _get_augmented_feature_cache_path(self):
+        if not (getattr(self.ggeur_cfg, 'reuse_augmented_feature_cache',
+                        True) or
+                getattr(self.ggeur_cfg, 'save_augmented_feature_cache',
+                        True)):
             return None
-        version = str(getattr(self.ggeur_cfg, 'headonly_cache_version',
-                              'fcache_v1')).replace('/', '_')
-        dataset = str(self._cfg.data.type).replace('/', '_')
+        cache_dir = self._get_augmented_feature_cache_base_dir()
+        metadata = self._augmented_cache_metadata()
+        version = self._safe_cache_token(
+            metadata.get('augmented_feature_cache_version',
+                         metadata.get('headonly_cache_version',
+                                      'aug_fcache_v1')))
+        dataset = self._safe_cache_token(metadata['dataset'])
+        extractor = self._safe_cache_token(
+            f"{metadata['feature_extractor']}_"
+            f"{metadata['feature_extractor_model']}")
+        fingerprint = self._augmented_cache_fingerprint(metadata)
+        namespace = (
+            f"{dataset}_{extractor}_{metadata['client_num']}c_"
+            f"gps{metadata['num_generated_per_sample']}_"
+            f"gpp{metadata['num_generated_per_prototype']}_"
+            f"target{metadata['target_size_per_class']}_{fingerprint}")
+        subdir = (
+            'headonly_augmented'
+            if getattr(self.ggeur_cfg, 'head_only_mode', False)
+            else 'augmented_features')
         path = os.path.join(
             cache_dir,
-            'headonly_augmented',
+            subdir,
             version,
+            namespace,
             f'{dataset}_client_{int(self.ID):06d}.pt',
         )
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1399,7 +1741,7 @@ class GGEURClient(Client):
             return []
 
         paths = [path]
-        cache_dir = getattr(self.ggeur_cfg, 'feature_cache_dir', '')
+        cache_dir = self._get_augmented_feature_cache_base_dir()
         if cache_dir:
             legacy_ids = [int(self.ID) - 1, int(self.ID)]
             for legacy_id in legacy_ids:
@@ -1420,8 +1762,11 @@ class GGEURClient(Client):
         if metadata == expected:
             return True
 
-        expected_version = expected.get('headonly_cache_version')
+        expected_version = (
+            expected.get('augmented_feature_cache_version') or
+            expected.get('headonly_cache_version'))
         cached_version = (
+            metadata.get('augmented_feature_cache_version') or
             metadata.get('headonly_cache_version') or
             metadata.get('feature_cache_version')
         )
@@ -1440,6 +1785,28 @@ class GGEURClient(Client):
              expected['target_size_per_class']),
             (str(cached_version) == str(expected_version)),
         ]
+        if metadata.get('augmented_feature_cache_version') is not None:
+            checks[-1] = (
+                str(metadata.get('augmented_feature_cache_version')) ==
+                str(expected.get('augmented_feature_cache_version')))
+        if metadata.get('feature_extractor_model') is not None:
+            checks.append(
+                str(metadata.get('feature_extractor_model')) ==
+                str(expected['feature_extractor_model']))
+        if metadata.get('use_fedproto') is not None:
+            checks.append(
+                bool(metadata.get('use_fedproto')) ==
+                bool(expected['use_fedproto']))
+        if metadata.get('use_lds') is not None:
+            checks.append(
+                bool(metadata.get('use_lds')) == bool(expected['use_lds']))
+        if metadata.get('lds_alpha') is not None:
+            checks.append(
+                float(metadata.get('lds_alpha')) ==
+                float(expected['lds_alpha']))
+        if metadata.get('lds_seed') is not None:
+            checks.append(
+                int(metadata.get('lds_seed')) == int(expected['lds_seed']))
         if metadata.get('client_num') is not None:
             checks.append(
                 int(metadata.get('client_num')) == expected['client_num'])
@@ -1451,7 +1818,44 @@ class GGEURClient(Client):
 
         return all(checks)
 
-    def _try_load_augmented_feature_cache(self):
+    @staticmethod
+    def _copy_numpy_mapping(mapping, dtype=np.float32):
+        if not isinstance(mapping, dict):
+            return {}
+        copied = {}
+        for key, value in mapping.items():
+            try:
+                key = int(key)
+            except (TypeError, ValueError):
+                pass
+            copied[key] = np.asarray(value, dtype=dtype)
+        return copied
+
+    def _restore_cached_local_statistics(self, local_statistics):
+        if not isinstance(local_statistics, dict):
+            return False
+        means = self._copy_numpy_mapping(local_statistics.get('means', {}))
+        covs = self._copy_numpy_mapping(local_statistics.get('covs', {}))
+        counts = {}
+        for key, value in local_statistics.get('counts', {}).items():
+            try:
+                counts[int(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        if not means or not covs or not counts:
+            return False
+        prototypes = self._copy_numpy_mapping(
+            local_statistics.get('prototypes', means))
+        self.local_means = means
+        self.local_covs = covs
+        self.local_counts = counts
+        self.cached_local_prototypes = prototypes
+        return True
+
+    def _try_load_augmented_feature_cache(self, restore_statistics=False):
+        if not getattr(self.ggeur_cfg, 'reuse_augmented_feature_cache',
+                       True):
+            return False
         for path in self._get_augmented_feature_cache_candidates():
             if not os.path.exists(path):
                 continue
@@ -1473,6 +1877,14 @@ class GGEURClient(Client):
                     labels.numpy() if isinstance(labels, torch.Tensor)
                     else np.asarray(labels)
                 )
+                cached_global_prototypes = cached.get('global_prototypes', {})
+                if cached_global_prototypes:
+                    self.global_prototypes = self._copy_numpy_mapping(
+                        cached_global_prototypes)
+                restored_stats = False
+                if restore_statistics:
+                    restored_stats = self._restore_cached_local_statistics(
+                        cached.get('local_statistics', {}))
                 dataset = AugmentedFeatureDataset(
                     self.augmented_features, self.augmented_labels)
                 self.augmented_loader = DataLoader(
@@ -1481,9 +1893,9 @@ class GGEURClient(Client):
                     shuffle=True,
                 )
                 logger.info(
-                    f"Client {self.ID}: Loaded augmented HeadOnly feature "
-                    f"cache from {path} ({len(self.augmented_labels)} "
-                    f"samples)")
+                    f"Client {self.ID}: Loaded augmented feature cache "
+                    f"from {path} ({len(self.augmented_labels)} samples, "
+                    f"restored_statistics={restored_stats})")
                 return True
             except Exception as error:
                 logger.warning(
@@ -1492,17 +1904,28 @@ class GGEURClient(Client):
         return False
 
     def _save_augmented_feature_cache(self):
+        if not getattr(self.ggeur_cfg, 'save_augmented_feature_cache',
+                       True):
+            return
         path = self._get_augmented_feature_cache_path()
         if path is None or self.augmented_features is None:
             return
         try:
+            local_statistics = {
+                'means': copy.deepcopy(self.local_means),
+                'covs': copy.deepcopy(self.local_covs),
+                'counts': copy.deepcopy(self.local_counts),
+                'prototypes': copy.deepcopy(self.local_means),
+            }
             torch.save({
                 'features': torch.as_tensor(self.augmented_features).float(),
                 'labels': torch.as_tensor(self.augmented_labels).long(),
                 'metadata': self._augmented_cache_metadata(),
+                'local_statistics': local_statistics,
+                'global_prototypes': copy.deepcopy(self.global_prototypes or {}),
             }, path)
             logger.info(
-                f"Client {self.ID}: Saved augmented HeadOnly feature cache "
+                f"Client {self.ID}: Saved augmented feature cache "
                 f"to {path} ({len(self.augmented_labels)} samples)")
         except Exception as error:
             logger.warning(
@@ -1510,26 +1933,66 @@ class GGEURClient(Client):
                 f"{error}")
 
     def _try_start_from_augmented_cache(self):
-        """Load generated HeadOnly samples and skip round-0 generation."""
-        if not getattr(self.ggeur_cfg,
-                       'headonly_skip_round0_if_augmented_cache_exists',
-                       False):
-            return False
-        if not getattr(self.ggeur_cfg, 'head_only_mode', False):
-            return False
-        if not self._try_load_augmented_feature_cache():
-            return False
+        """Load generated samples and avoid repeated feature generation.
+
+        Returns:
+            - 'statistics_uploaded' when cached local statistics were restored
+              and sent to the server, so the normal covariance broadcast can
+              continue.
+            - 'augmentation_ready' when only generated features were restored
+              and the client can immediately join training.
+            - None on cache miss.
+        """
+        reuse_cache = getattr(self.ggeur_cfg,
+                              'reuse_augmented_feature_cache', True)
+        legacy_headonly_hot = getattr(
+            self.ggeur_cfg,
+            'headonly_skip_round0_if_augmented_cache_exists',
+            False)
+        if not (reuse_cache or legacy_headonly_hot):
+            return None
+        if self.use_cnn_distillation or self.use_feature_alignment:
+            logger.info(
+                f"Client {self.ID}: Augmented cache-hot mode disabled for "
+                "CNN distillation/feature-alignment because those modes "
+                "require original-image loaders.")
+            return None
+        if not self._try_load_augmented_feature_cache(
+                restore_statistics=True):
+            return None
+        has_restored_stats = bool(
+            self.local_means and self.local_covs and self.local_counts)
+        needs_server_context = (
+            bool(getattr(self.ggeur_cfg, 'use_fedproto', False)) or
+            bool(getattr(self.ggeur_cfg, 'use_promptfl', False)))
+        if needs_server_context and not has_restored_stats:
+            logger.info(
+                f"Client {self.ID}: Ignore augmented cache-hot direct start "
+                "because this method needs server-side prototypes/context "
+                "and the cache does not contain local statistics.")
+            self.augmented_features = None
+            self.augmented_labels = None
+            self.augmented_loader = None
+            return None
 
         self._build_mlp_classifier()
         self.augmentation_done = True
-        self.statistics_uploaded = True
         self.local_features = {}
         self.local_labels = {}
+        if has_restored_stats:
+            logger.info(
+                f"Client {self.ID}: Augmented cache-hot mode restored local "
+                "statistics; upload cached statistics and skip feature "
+                "extraction/generation.")
+            self._upload_local_statistics()
+            return 'statistics_uploaded'
+
+        self.statistics_uploaded = True
         logger.info(
-            f"Client {self.ID}: HeadOnly cache-hot mode active; skip "
-            "round-0 feature extraction/statistics/augmentation and train "
+            f"Client {self.ID}: Augmented cache-hot mode active; skip "
+            "round-0 feature extraction/statistics/generation and train "
             "on cached generated samples.")
-        return True
+        return 'augmentation_ready'
 
     def _should_skip_statistics_phase(self):
         """Whether baseline mode can skip server-side statistics exchange."""
@@ -1565,7 +2028,12 @@ class GGEURClient(Client):
         if round_idx == self.ggeur_cfg.statistics_round and not self.statistics_uploaded:
             logger.info(f"Client {self.ID}: Round {round_idx} - Statistics collection phase")
 
-            if self._try_start_from_augmented_cache():
+            cache_hot_status = self._try_start_from_augmented_cache()
+            if cache_hot_status == 'statistics_uploaded':
+                self._maybe_fail_for_distributed_validation(
+                    'after_statistics_upload', round_idx)
+                return
+            if cache_hot_status == 'augmentation_ready':
                 self.comm_manager.send(
                     Message(
                         msg_type='augmentation_ready',

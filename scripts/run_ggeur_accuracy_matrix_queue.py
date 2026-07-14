@@ -73,13 +73,34 @@ CASES: Sequence[Case] = (
     Case("domainnet", "vit", "fedproto", Path("scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedproto.yaml")),
     Case("domainnet", "vit", "fedopt", Path("scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_fedopt.yaml")),
     Case("domainnet", "vit", "moon", Path("scripts/example_configs/ggeur_baseline_vit_domainnet/domainnet_4domains_vit_moon.yaml")),
+    Case("pacs", "cnn", "ggeur", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_ggeur_fedavg.yaml")),
+    Case("pacs", "cnn", "fedavg", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_fedavg.yaml")),
+    Case("pacs", "cnn", "fedprox", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_fedprox.yaml")),
+    Case("pacs", "cnn", "fedproto", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_fedproto.yaml")),
+    Case("pacs", "cnn", "fedopt", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_fedopt.yaml")),
+    Case("pacs", "cnn", "moon", Path("scripts/example_configs/ggeur_baseline_cnn_pacs/pacs_lds_cnn_moon.yaml")),
+    Case("pacs", "mixer", "ggeur", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_ggeur_fedavg.yaml")),
+    Case("pacs", "mixer", "fedavg", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_fedavg.yaml")),
+    Case("pacs", "mixer", "fedprox", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_fedprox.yaml")),
+    Case("pacs", "mixer", "fedproto", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_fedproto.yaml")),
+    Case("pacs", "mixer", "fedopt", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_fedopt.yaml")),
+    Case("pacs", "mixer", "moon", Path("scripts/example_configs/ggeur_baseline_mixer_pacs/pacs_lds_mixer_moon.yaml")),
+    Case("pacs", "vit", "ggeur", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_ggeur_fedavg.yaml")),
+    Case("pacs", "vit", "fedavg", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_fedavg.yaml")),
+    Case("pacs", "vit", "fedprox", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_fedprox.yaml")),
+    Case("pacs", "vit", "fedproto", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_fedproto.yaml")),
+    Case("pacs", "vit", "fedopt", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_fedopt.yaml")),
+    Case("pacs", "vit", "moon", Path("scripts/example_configs/ggeur_baseline_vit_pacs/pacs_lds_vit_moon.yaml")),
 )
 
 
 ACCURACY_PATTERNS = (
+    re.compile(
+        r"Round\s+\d+\s+(?:MLP|CNN|Prompt)?\s*Test\s+Accuracy\s+-.*?\baverage:\s*(\d+(?:\.\d+)?)",
+        re.IGNORECASE,
+    ),
     re.compile(r"test[_ ]acc(?:uracy)?[^0-9]*(\d+(?:\.\d+)?)", re.IGNORECASE),
     re.compile(r"best[_ ]result[^0-9]*(\d+(?:\.\d+)?)", re.IGNORECASE),
-    re.compile(r"accuracy[^0-9]*(\d+(?:\.\d+)?)", re.IGNORECASE),
 )
 
 
@@ -158,6 +179,7 @@ def parse_last_accuracy(log_path: Path) -> Optional[float]:
             match = pattern.search(line)
             if match:
                 value = float(match.group(1))
+                break
     return value
 
 
@@ -349,7 +371,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", action="store_false", dest="resume")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--dataset", action="append", choices=("officehome", "domainnet"))
+    parser.add_argument("--dataset", action="append", choices=("officehome", "domainnet", "pacs"))
     parser.add_argument("--model", action="append", choices=("cnn", "mixer", "mlp", "vit"))
     parser.add_argument("--method", action="append", choices=METHODS)
     parser.add_argument("--only", action="append", default=[], help="Substring filter")

@@ -738,9 +738,12 @@ class GGEURServer(Server):
 
     def callback_for_local_statistics(self, message: Message):
         """Handle receiving local statistics from a client"""
+        timing_total_start = time.time()
         client_id = message.sender
         content = message.content
+        _timing_t0 = time.time()
         self._bytes_recv += self._sizeof_content(content)
+        timing_sizeof_recv = time.time() - _timing_t0
 
         if self.statistics_collected:
             logger.warning(
@@ -769,10 +772,15 @@ class GGEURServer(Server):
                     f"server_inferred={self.inferred_embedding_dim}, client_{client_id}={client_embedding_dim}"
                 )
 
+        _timing_t0 = time.time()
         self._validate_received_statistics(client_id, content)
+        timing_validate = time.time() - _timing_t0
+        _timing_t0 = time.time()
         content = self._normalize_received_statistics(client_id, content)
+        timing_normalize = time.time() - _timing_t0
 
         # Store statistics
+        _timing_t0 = time.time()
         self.local_statistics_buffer[client_id] = {
             'means': content['means'],
             'covs': content['covs'],
@@ -782,9 +790,22 @@ class GGEURServer(Server):
 
         # Store prototypes for cross-client sharing
         self.all_prototypes[client_id] = content['prototypes']
+        timing_store = time.time() - _timing_t0
+        logger.info(
+            "GGEUR_TIMING_SERVER "
+            f"stage=receive_local_statistics client={int(client_id)} "
+            f"total_sec={time.time() - timing_total_start:.6f} "
+            f"sizeof_recv_sec={timing_sizeof_recv:.6f} "
+            f"validate_sec={timing_validate:.6f} "
+            f"normalize_sec={timing_normalize:.6f} "
+            f"store_sec={timing_store:.6f} "
+            f"buffer_clients={len(self.local_statistics_buffer)} "
+            f"classes={len(content['means'])} "
+            f"payload_bytes={self._sizeof_content(message.content)}")
 
         # Check if the configured statistics quorum has uploaded statistics.
         if len(self.local_statistics_buffer) >= self.min_statistics_clients:
+            quorum_t0 = time.time()
             self.active_client_ids = set(self.local_statistics_buffer.keys())
             logger.info(
                 "Server: Received statistics quorum "
@@ -793,10 +814,14 @@ class GGEURServer(Server):
                 f"active_clients={sorted(self.active_client_ids)}")
 
             # Aggregate covariance matrices
+            _timing_t0 = time.time()
             self._aggregate_covariances()
+            timing_aggregate = time.time() - _timing_t0
 
             # Compute global prototypes (aggregated means for each class)
+            _timing_t0 = time.time()
             self._compute_global_prototypes()
+            timing_global_proto = time.time() - _timing_t0
 
             # For large standalone runs, avoid materializing O(N^2)
             # per-client prototype payloads unless explicit down-sampling is
@@ -804,15 +829,18 @@ class GGEURServer(Server):
             # and let each client filter out its own entries.
             max_cross_prototypes = int(getattr(
                 self.ggeur_cfg, 'max_cross_client_prototypes_per_class', 0))
+            _timing_t0 = time.time()
             other_prototypes = (
                 self._prepare_other_prototypes()
                 if max_cross_prototypes > 0 else None
             )
+            timing_prepare_other = time.time() - _timing_t0
 
             # Build global MLP
             # IMPORTANT: Use config's num_classes, not the number of classes in covariance matrices
             # In LDS mode, some classes may have no data across all clients
             num_classes = self._cfg.model.num_classes
+            _timing_t0 = time.time()
             if num_classes > 0:
                 self._build_global_mlp(num_classes)
 
@@ -823,11 +851,25 @@ class GGEURServer(Server):
                 # Initialize global prompt ctx if PromptFL enabled
                 if self.use_promptfl:
                     self._init_global_prompt(num_classes)
+            timing_build_models = time.time() - _timing_t0
 
             # Broadcast global covariances to all clients
+            _timing_t0 = time.time()
             self._broadcast_global_covariances(other_prototypes)
+            timing_broadcast = time.time() - _timing_t0
 
             self.statistics_collected = True
+            logger.info(
+                "GGEUR_TIMING_SERVER "
+                f"stage=statistics_quorum total_sec={time.time() - quorum_t0:.6f} "
+                f"aggregate_covariances_sec={timing_aggregate:.6f} "
+                f"global_prototypes_sec={timing_global_proto:.6f} "
+                f"prepare_other_prototypes_sec={timing_prepare_other:.6f} "
+                f"build_models_sec={timing_build_models:.6f} "
+                f"broadcast_sec={timing_broadcast:.6f} "
+                f"clients={len(self.local_statistics_buffer)} "
+                f"cov_classes={len(self.global_cov_matrices)} "
+                f"global_proto_classes={len(self.global_prototypes)}")
 
     def _validate_received_statistics(self, client_id, content):
         """Fail early when a client uploads statistics with wrong dimensions."""
@@ -1175,13 +1217,22 @@ class GGEURServer(Server):
     def _aggregate_covariances(self):
         """Aggregate covariance matrices using parallel axis theorem"""
         logger.info("Server: Aggregating covariance matrices...")
+        timing_total_start = time.time()
+        timing_collect_classes = 0.0
+        timing_collect_stats = 0.0
+        timing_mean = 0.0
+        timing_cov_weighted = 0.0
+        timing_cov_between = 0.0
 
         # Collect all class indices
+        _timing_t0 = time.time()
         all_classes = set()
         for client_stats in self.local_statistics_buffer.values():
             all_classes.update(client_stats['means'].keys())
+        timing_collect_classes += time.time() - _timing_t0
 
         embedding_dim = self._get_embedding_dim()
+        stat_entries = 0
 
         for class_idx in all_classes:
             class_idx = int(class_idx)
@@ -1190,6 +1241,7 @@ class GGEURServer(Server):
             counts = []
 
             # Collect statistics for this class from all clients
+            _timing_t0 = time.time()
             for client_id, client_stats in self.local_statistics_buffer.items():
                 mean = self._get_class_value(client_stats['means'], class_idx)
                 if mean is not None:
@@ -1202,46 +1254,72 @@ class GGEURServer(Server):
                     means.append(mean)
                     covs.append(cov)
                     counts.append(count)
+                    stat_entries += 1
+            timing_collect_stats += time.time() - _timing_t0
 
             if len(counts) == 0:
                 self.global_cov_matrices[class_idx] = np.eye(embedding_dim) * 0.01
                 continue
 
             # Compute aggregated mean
+            _timing_t0 = time.time()
             total_count = sum(counts)
             aggregated_mean = np.zeros(embedding_dim)
             for i, (mean, count) in enumerate(zip(means, counts)):
                 aggregated_mean += count * mean
             aggregated_mean /= total_count
+            timing_mean += time.time() - _timing_t0
 
             # Compute aggregated covariance using parallel axis theorem
             aggregated_cov = np.zeros((embedding_dim, embedding_dim))
 
             # First term: weighted average of local covariances
+            _timing_t0 = time.time()
             for i, (cov, count) in enumerate(zip(covs, counts)):
                 aggregated_cov += count * cov
+            timing_cov_weighted += time.time() - _timing_t0
 
             # Second term: between-client variance
+            _timing_t0 = time.time()
             for i, (mean, count) in enumerate(zip(means, counts)):
                 diff = mean - aggregated_mean
                 aggregated_cov += count * np.outer(diff, diff)
+            timing_cov_between += time.time() - _timing_t0
 
             aggregated_cov /= total_count
 
             self.global_cov_matrices[class_idx] = aggregated_cov
 
         logger.info(f"Server: Aggregated covariances for {len(self.global_cov_matrices)} classes")
+        logger.info(
+            "GGEUR_TIMING_SERVER "
+            f"stage=aggregate_covariances total_sec={time.time() - timing_total_start:.6f} "
+            f"collect_classes_sec={timing_collect_classes:.6f} "
+            f"collect_stats_sec={timing_collect_stats:.6f} "
+            f"mean_sec={timing_mean:.6f} "
+            f"cov_weighted_sec={timing_cov_weighted:.6f} "
+            f"cov_between_sec={timing_cov_between:.6f} "
+            f"classes={len(self.global_cov_matrices)} "
+            f"clients={len(self.local_statistics_buffer)} "
+            f"stat_entries={stat_entries} embedding_dim={embedding_dim}")
 
     def _compute_global_prototypes(self):
         """Compute global prototypes (weighted average of local means) for each class"""
         logger.info("Server: Computing global prototypes...")
+        timing_total_start = time.time()
+        timing_collect_classes = 0.0
+        timing_collect_stats = 0.0
+        timing_mean = 0.0
 
         embedding_dim = self._get_embedding_dim()
 
         # Collect all class indices
+        _timing_t0 = time.time()
         all_classes = set()
         for client_stats in self.local_statistics_buffer.values():
             all_classes.update(client_stats['means'].keys())
+        timing_collect_classes += time.time() - _timing_t0
+        stat_entries = 0
 
         for class_idx in all_classes:
             class_idx = int(class_idx)
@@ -1249,6 +1327,7 @@ class GGEURServer(Server):
             counts = []
 
             # Collect means for this class from all clients
+            _timing_t0 = time.time()
             for client_id, client_stats in self.local_statistics_buffer.items():
                 mean = self._get_class_value(client_stats['means'], class_idx)
                 if mean is not None:
@@ -1266,20 +1345,33 @@ class GGEURServer(Server):
                             f"{client_id}, class {class_idx}.")
                     means.append(mean_arr)
                     counts.append(int(count))
+                    stat_entries += 1
+            timing_collect_stats += time.time() - _timing_t0
 
             if len(counts) == 0:
                 continue
 
             # Compute weighted average mean (global prototype)
+            _timing_t0 = time.time()
             total_count = sum(counts)
             global_mean = np.zeros(embedding_dim)
             for mean, count in zip(means, counts):
                 global_mean += count * mean
             global_mean /= total_count
+            timing_mean += time.time() - _timing_t0
 
             self.global_prototypes[class_idx] = global_mean
 
         logger.info(f"Server: Computed global prototypes for {len(self.global_prototypes)} classes")
+        logger.info(
+            "GGEUR_TIMING_SERVER "
+            f"stage=compute_global_prototypes total_sec={time.time() - timing_total_start:.6f} "
+            f"collect_classes_sec={timing_collect_classes:.6f} "
+            f"collect_stats_sec={timing_collect_stats:.6f} "
+            f"mean_sec={timing_mean:.6f} "
+            f"classes={len(self.global_prototypes)} "
+            f"clients={len(self.local_statistics_buffer)} "
+            f"stat_entries={stat_entries} embedding_dim={embedding_dim}")
 
     def _prepare_other_prototypes(self):
         """Prepare prototypes from other clients for each client"""
@@ -1347,16 +1439,29 @@ class GGEURServer(Server):
     def _broadcast_global_covariances(self, other_prototypes):
         """Broadcast global covariance matrices and prototypes to all clients"""
         logger.info("Server: Broadcasting global covariances to clients...")
+        timing_total_start = time.time()
+        timing_serialize_cov = 0.0
+        timing_serialize_global_proto = 0.0
+        timing_serialize_all_proto = 0.0
+        timing_serialize_client_other = 0.0
+        timing_sizeof = 0.0
+        timing_send = 0.0
 
         receivers = sorted(self.active_client_ids or self.local_statistics_buffer.keys())
+        _timing_t0 = time.time()
         serialized_cov_matrices = self._serialize_array_payload(
             self.global_cov_matrices)
+        timing_serialize_cov += time.time() - _timing_t0
+        _timing_t0 = time.time()
         serialized_global_prototypes = self._serialize_array_payload(
             self.global_prototypes)
+        timing_serialize_global_proto += time.time() - _timing_t0
         serialized_all_prototypes = None
         if other_prototypes is None:
+            _timing_t0 = time.time()
             serialized_all_prototypes = self._serialize_array_payload(
                 self.all_prototypes)
+            timing_serialize_all_proto += time.time() - _timing_t0
 
         shared_payload = {
             'cov_matrices': serialized_cov_matrices,
@@ -1364,7 +1469,9 @@ class GGEURServer(Server):
         }
         if serialized_all_prototypes is not None:
             shared_payload['all_prototypes_by_client'] = serialized_all_prototypes
+        _timing_t0 = time.time()
         shared_content_size = self._sizeof_content(shared_payload)
+        timing_sizeof += time.time() - _timing_t0
         logger.info(
             "Server: Prepared shared covariance broadcast payload: "
             f"classes={len(self.global_cov_matrices)}, "
@@ -1383,16 +1490,22 @@ class GGEURServer(Server):
                 content['other_prototypes'] = {}
                 self._bytes_sent += shared_content_size
             else:
+                _timing_t0 = time.time()
                 client_other_prototypes = {
                     client_id: self._serialize_array_payload(
                         other_prototypes.get(client_id, {}))
                 }
+                timing_serialize_client_other += time.time() - _timing_t0
                 content['other_prototypes'] = client_other_prototypes
-                self._bytes_sent += shared_content_size + self._sizeof_content({
+                _timing_t0 = time.time()
+                client_other_size = self._sizeof_content({
                     'other_prototypes': client_other_prototypes
                 })
+                timing_sizeof += time.time() - _timing_t0
+                self._bytes_sent += shared_content_size + client_other_size
             logger.info(
                 f"Server: Sending global covariances to client {client_id}")
+            _timing_t0 = time.time()
             self.comm_manager.send(
                 Message(
                     msg_type='global_covariances',
@@ -1402,12 +1515,25 @@ class GGEURServer(Server):
                     content=content
                 )
             )
+            timing_send += time.time() - _timing_t0
             logger.info(
                 f"Server: Sent global covariances to client {client_id}")
 
         logger.info(
             f"Server: Broadcasted global covariances to {len(receivers)} "
             f"active clients: {receivers}")
+        logger.info(
+            "GGEUR_TIMING_SERVER "
+            f"stage=broadcast_global_covariances total_sec={time.time() - timing_total_start:.6f} "
+            f"serialize_cov_sec={timing_serialize_cov:.6f} "
+            f"serialize_global_proto_sec={timing_serialize_global_proto:.6f} "
+            f"serialize_all_proto_sec={timing_serialize_all_proto:.6f} "
+            f"serialize_client_other_sec={timing_serialize_client_other:.6f} "
+            f"sizeof_sec={timing_sizeof:.6f} send_sec={timing_send:.6f} "
+            f"receivers={len(receivers)} cov_classes={len(self.global_cov_matrices)} "
+            f"global_proto_classes={len(self.global_prototypes)} "
+            f"all_client_prototypes={len(self.all_prototypes) if serialized_all_prototypes is not None else 0} "
+            f"shared_bytes={shared_content_size}")
         self._mark_stage('augmentation_ready')
 
     @staticmethod
