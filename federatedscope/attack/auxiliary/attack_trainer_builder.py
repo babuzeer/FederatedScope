@@ -9,19 +9,24 @@ def wrap_attacker_trainer(base_trainer, config):
         The wrapped trainer; Type: core.trainers.GeneralTorchTrainer
 
     '''
-    if config.attack.attack_method.lower() == 'gan_attack':
+    attack_method = config.attack.attack_method.lower()
+    if attack_method == 'cerberus':
+        # GGEUR implements CERBERUS inside its custom client training path.
+        # No generic trainer wrapper is needed here.
+        return base_trainer
+    if attack_method == 'gan_attack':
         from federatedscope.attack.trainer import wrap_GANTrainer
         return wrap_GANTrainer(base_trainer)
-    elif config.attack.attack_method.lower() == 'gradascent':
+    elif attack_method == 'gradascent':
         from federatedscope.attack.trainer import wrap_GradientAscentTrainer
         return wrap_GradientAscentTrainer(base_trainer)
-    elif config.attack.attack_method.lower() == 'backdoor':
+    elif attack_method == 'backdoor':
         from federatedscope.attack.trainer import wrap_backdoorTrainer
         return wrap_backdoorTrainer(base_trainer)
-    elif config.attack.attack_method.lower() == 'a3fl':
+    elif attack_method == 'a3fl':
         from federatedscope.attack.trainer import wrap_A3FLTrainer
         return wrap_A3FLTrainer(base_trainer)
-    elif config.attack.attack_method.lower() == 'gaussian_noise':
+    elif attack_method == 'gaussian_noise':
         from federatedscope.attack.trainer import wrap_GaussianAttackTrainer
         return wrap_GaussianAttackTrainer(base_trainer)
     else:

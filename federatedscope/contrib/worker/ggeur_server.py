@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from federatedscope.attack.auxiliary.a3fl_utils import \
-    get_a3fl_active_attacker_ids
+    get_a3fl_active_attacker_ids, parse_attacker_ids
 from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.workers import Server
 from federatedscope.core.auxiliaries.optimizer_builder import get_optimizer
@@ -166,6 +166,41 @@ class GGEURServer(Server):
         self.latest_a3fl_meta = None
         self.a3fl_test_loaders = {}
         self.a3fl_test_loaded = False
+        self.foolsgold_update_history = {}
+
+        attack_method = str(getattr(config.attack, 'attack_method', '')).lower()
+        self.cerberus_enabled = attack_method == 'cerberus'
+        self.cerberus_cfg = getattr(config.attack, 'cerberus', None)
+        self.latest_cerberus_meta = None
+        self.cerberus_peer_model_bank = {}
+
+    def _is_cerberus_active_round(self, round_idx):
+        if not self.cerberus_enabled or self.cerberus_cfg is None:
+            return False
+        start_round = int(getattr(
+            self.cerberus_cfg, 'start_round',
+            getattr(self._cfg.attack, 'inject_round', 0)))
+        if int(round_idx) < start_round:
+            return False
+        poison_epochs = int(getattr(self.cerberus_cfg, 'poison_epochs', 0))
+        if poison_epochs <= 0:
+            return True
+        return int(round_idx) < start_round + poison_epochs
+
+    def _get_cerberus_active_attacker_ids(self, round_idx):
+        if not self._is_cerberus_active_round(round_idx):
+            return []
+        return parse_attacker_ids(self._cfg.attack.attacker_id)
+
+    def _attach_cerberus_payload(self, model_para):
+        if not self.cerberus_enabled:
+            return model_para
+        if not isinstance(model_para, dict) or 'mlp' not in model_para:
+            model_para = {'mlp': model_para}
+        model_para['cerberus'] = {
+            'peer_models': copy.deepcopy(self.cerberus_peer_model_bank)
+        }
+        return model_para
 
     def _mark_stage(self, stage_name):
         self._stage_name = stage_name
@@ -974,6 +1009,8 @@ class GGEURServer(Server):
                 model_para = {'mlp': model_para}
             model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
+        model_para = self._attach_cerberus_payload(model_para)
+
         # Broadcast to selected clients
         receiver = self._select_round_receivers()
         self.current_round_clients = list(receiver)
@@ -1002,6 +1039,21 @@ class GGEURServer(Server):
         if self.a3fl_enabled:
             active_attackers = get_a3fl_active_attacker_ids(
                 self._cfg, self.state, sample_num)
+            active_attackers = [cid for cid in active_attackers if cid in all_clients]
+            benign_pool = [cid for cid in all_clients if cid not in active_attackers]
+            benign_needed = max(0, sample_num - len(active_attackers))
+            if benign_needed > 0:
+                benign_selected = np.random.choice(benign_pool,
+                                                   size=benign_needed,
+                                                   replace=False).tolist()
+            else:
+                benign_selected = []
+            receiver = active_attackers + benign_selected
+            if len(receiver) == sample_num:
+                return receiver
+
+        if self.cerberus_enabled:
+            active_attackers = self._get_cerberus_active_attacker_ids(self.state)
             active_attackers = [cid for cid in active_attackers if cid in all_clients]
             benign_pool = [cid for cid in all_clients if cid not in active_attackers]
             benign_needed = max(0, sample_num - len(active_attackers))
@@ -1365,7 +1417,10 @@ class GGEURServer(Server):
         all_params = self.msg_buffer['train'][round_idx]
 
         # Filter out empty updates
-        valid_params = [(s, p) for s, p, _ in all_params if s > 0 and p is not None]
+        valid_params = [
+            (s, p, sender) for s, p, sender in all_params
+            if s > 0 and p is not None
+        ]
 
         if not valid_params:
             logger.warning("Server: No valid model parameters received")
@@ -1377,19 +1432,37 @@ class GGEURServer(Server):
             return
 
         # Compute sample weights
-        sample_sizes = [s for s, p in valid_params]
+        sample_sizes = [s for s, _, _ in valid_params]
         total_samples = sum(sample_sizes)
 
         a3fl_updates = []
+        cerberus_updates = []
         cleaned_valid_params = []
-        for sample_size, params in valid_params:
+        for sample_size, params, sender in valid_params:
             cleaned_params = params
             if isinstance(params, dict) and 'a3fl' in params:
                 a3fl_updates.append(params.get('a3fl'))
                 if 'mlp' not in params:
                     cleaned_params = copy.deepcopy(params)
                     cleaned_params.pop('a3fl', None)
-            cleaned_valid_params.append((sample_size, cleaned_params))
+            if isinstance(params, dict) and 'cerberus' in params:
+                cerberus_meta = params.get('cerberus')
+                cerberus_updates.append(cerberus_meta)
+                if isinstance(cerberus_meta, dict) and \
+                        cerberus_meta.get('active', False):
+                    if 'mlp' in params and params.get('mlp') is not None:
+                        self.cerberus_peer_model_bank[int(sender)] = \
+                            copy.deepcopy(params.get('mlp'))
+                    elif params is not None:
+                        clean_for_bank = copy.deepcopy(params)
+                        clean_for_bank.pop('cerberus', None)
+                        clean_for_bank.pop('a3fl', None)
+                        self.cerberus_peer_model_bank[int(sender)] = \
+                            clean_for_bank
+                if 'mlp' not in params:
+                    cleaned_params = copy.deepcopy(cleaned_params)
+                    cleaned_params.pop('cerberus', None)
+            cleaned_valid_params.append((sample_size, cleaned_params, sender))
         valid_params = cleaned_valid_params
 
         active_a3fl = [
@@ -1402,6 +1475,19 @@ class GGEURServer(Server):
                 f"Server: Round {round_idx} received {len(a3fl_updates)} A3FL metadata payloads, "
                 f"active={len(active_a3fl)}")
 
+        active_cerberus = [
+            meta for meta in cerberus_updates
+            if isinstance(meta, dict) and meta.get('active', False)
+        ]
+        self.latest_cerberus_meta = (
+            active_cerberus[0] if active_cerberus else None)
+        if self.cerberus_enabled:
+            logger.info(
+                f"Server: Round {round_idx} received "
+                f"{len(cerberus_updates)} CERBERUS metadata payloads, "
+                f"active={len(active_cerberus)}, "
+                f"peer_bank={len(self.cerberus_peer_model_bank)}")
+
         # Handle separated training mode
         if self.use_separated_training:
             self._perform_separated_fedavg(valid_params, total_samples, round_idx)
@@ -1413,12 +1499,20 @@ class GGEURServer(Server):
             if is_combined_params:
                 # Aggregate MLP and CNN separately
                 mlp_aggregated = self._aggregate_model_params(
-                    [(s, p['mlp']) for s, p in valid_params if p.get('mlp') is not None],
-                    total_samples
+                    [(s, p['mlp'], sender) for s, p, sender in valid_params
+                     if p.get('mlp') is not None],
+                    total_samples,
+                    base_params=self.global_mlp.state_dict()
+                    if self.global_mlp is not None else None,
+                    aggregation_name='mlp'
                 )
                 cnn_aggregated = self._aggregate_model_params(
-                    [(s, p['cnn']) for s, p in valid_params if p.get('cnn') is not None],
-                    total_samples
+                    [(s, p['cnn'], sender) for s, p, sender in valid_params
+                     if p.get('cnn') is not None],
+                    total_samples,
+                    base_params=self.global_cnn.state_dict()
+                    if self.global_cnn is not None else None,
+                    aggregation_name='cnn'
                 )
 
                 # Update global MLP (FedAvg or FedOpt)
@@ -1440,7 +1534,12 @@ class GGEURServer(Server):
 
             else:
                 # Standard mode: only MLP
-                mlp_aggregated = self._aggregate_model_params(valid_params, total_samples)
+                mlp_aggregated = self._aggregate_model_params(
+                    valid_params,
+                    total_samples,
+                    base_params=self.global_mlp.state_dict()
+                    if self.global_mlp is not None else None,
+                    aggregation_name='mlp')
 
                 if mlp_aggregated and self.global_mlp is not None:
                     try:
@@ -1467,6 +1566,42 @@ class GGEURServer(Server):
                 else:
                     logger.info(
                         f"Server: Round {round_idx} skipped A3FL Poison Accuracy logging "
+                        f"because evaluation returned no results")
+            if self.cerberus_enabled and self.latest_cerberus_meta is not None:
+                cerberus_eval = self._evaluate_cerberus_on_test_sets()
+                poison_results = cerberus_eval.get('asr', {})
+                non_target_results = cerberus_eval.get('non_target_asr', {})
+                clean_target_results = cerberus_eval.get(
+                    'clean_target_rate', {})
+                attacker_id = int(
+                    self.latest_cerberus_meta.get('client_id', -1))
+                if poison_results:
+                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
+                    logger.info(
+                        f"Server: Round {round_idx} CERBERUS ASR "
+                        f"(attacker {attacker_id}) "
+                        f"- {poison_str}")
+                    if non_target_results:
+                        non_target_str = ', '.join([
+                            f"{k}: {v:.4f}"
+                            for k, v in non_target_results.items()
+                        ])
+                        logger.info(
+                            f"Server: Round {round_idx} CERBERUS non-target ASR "
+                            f"(attacker {attacker_id}) "
+                            f"- {non_target_str}")
+                    if clean_target_results:
+                        clean_target_str = ', '.join([
+                            f"{k}: {v:.4f}"
+                            for k, v in clean_target_results.items()
+                        ])
+                        logger.info(
+                            f"Server: Round {round_idx} CERBERUS clean target rate "
+                            f"(target {int(self.latest_cerberus_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
+                            f"- {clean_target_str}")
+                else:
+                    logger.info(
+                        f"Server: Round {round_idx} skipped CERBERUS ASR logging "
                         f"because evaluation returned no results")
 
         # Aggregate and evaluate PromptFL if enabled
@@ -1573,11 +1708,21 @@ class GGEURServer(Server):
             # Phase 1: Aggregate classifier parameters
             if isinstance(first_params, dict) and 'classifier' in first_params:
                 classifier_aggregated = self._aggregate_model_params(
-                    [(s, p['classifier']) for s, p in valid_params if p.get('classifier') is not None],
-                    total_samples
+                    [(s, p['classifier'], sender)
+                     for s, p, sender in valid_params
+                     if p.get('classifier') is not None],
+                    total_samples,
+                    base_params=self.global_mlp.state_dict()
+                    if self.global_mlp is not None else None,
+                    aggregation_name='classifier'
                 )
             else:
-                classifier_aggregated = self._aggregate_model_params(valid_params, total_samples)
+                classifier_aggregated = self._aggregate_model_params(
+                    valid_params,
+                    total_samples,
+                    base_params=self.global_mlp.state_dict()
+                    if self.global_mlp is not None else None,
+                    aggregation_name='classifier')
 
             if classifier_aggregated and self.global_mlp is not None:
                 try:
@@ -1590,8 +1735,13 @@ class GGEURServer(Server):
             # Phase 2: Aggregate only CNN backbone parameters (classifier is frozen)
             if isinstance(first_params, dict) and 'cnn_backbone' in first_params:
                 cnn_aggregated = self._aggregate_model_params(
-                    [(s, p['cnn_backbone']) for s, p in valid_params if p.get('cnn_backbone') is not None],
-                    total_samples
+                    [(s, p['cnn_backbone'], sender)
+                     for s, p, sender in valid_params
+                     if p.get('cnn_backbone') is not None],
+                    total_samples,
+                    base_params=self.global_cnn.state_dict()
+                    if self.global_cnn is not None else None,
+                    aggregation_name='cnn_backbone'
                 )
 
                 if cnn_aggregated and self.global_cnn is not None:
@@ -1601,13 +1751,80 @@ class GGEURServer(Server):
                     except Exception as e:
                         logger.debug(f"Server: Could not load CNN backbone params: {e}")
 
-    def _aggregate_model_params(self, params_list, total_samples):
-        """Helper function to aggregate model parameters using weighted average"""
+    def _is_flame_enabled(self):
+        """Whether GGEUR should use FLAME for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method == 'flame' or agg_method == 'flame'
+
+    def _is_foolsgold_enabled(self):
+        """Whether GGEUR should use FoolsGold for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method in ('foolsgold', 'fools_gold') or \
+            agg_method in ('foolsgold', 'fools_gold')
+
+    def _is_multi_krum_enabled(self):
+        """Whether GGEUR should use Multi-Krum for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method in ('multi_krum', 'multikrum') or \
+            agg_method in ('multi_krum', 'multikrum')
+
+    def _is_trimmed_mean_enabled(self):
+        """Whether GGEUR should use Trimmed Mean for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method in ('trimmed_mean', 'trimmedmean', 'trim_mean') or \
+            agg_method in ('trimmed_mean', 'trimmedmean', 'trim_mean')
+
+    def _is_align_ins_enabled(self):
+        """Whether GGEUR should use AlignIns for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method in ('align_ins', 'alignins') or \
+            agg_method in ('align_ins', 'alignins')
+
+    @staticmethod
+    def _unpack_param_entry(entry):
+        if len(entry) >= 3:
+            return entry[0], entry[1], entry[2]
+        return entry[0], entry[1], None
+
+    @staticmethod
+    def _to_param_tensor(param):
+        if isinstance(param, torch.Tensor):
+            return param
+        try:
+            restored = param2tensor(param)
+            if isinstance(restored, torch.Tensor):
+                return restored
+            return torch.tensor(restored)
+        except Exception as e:
+            logger.debug(f"Server: Cannot convert model parameter to tensor ({e})")
+            return None
+
+    def _aggregate_model_params(self,
+                                params_list,
+                                total_samples,
+                                base_params=None,
+                                aggregation_name='model'):
+        """Aggregate model parameters with FedAvg or a configured defense."""
         if not params_list:
             return None
 
         # Filter valid params
-        valid_params = [(s, p) for s, p in params_list if s > 0 and p is not None]
+        valid_params = [
+            (s, p, sender)
+            for s, p, sender in
+            (self._unpack_param_entry(entry) for entry in params_list)
+            if s > 0 and p is not None
+        ]
         if not valid_params:
             return None
 
@@ -1616,17 +1833,65 @@ class GGEURServer(Server):
             logger.warning(f"Server: Expected dict for model params, got {type(first_params)}, skipping aggregation")
             return None
 
-        def _to_tensor(param):
-            if isinstance(param, torch.Tensor):
-                return param
-            try:
-                restored = param2tensor(param)
-                if isinstance(restored, torch.Tensor):
-                    return restored
-                return torch.tensor(restored)
-            except Exception as e:
-                logger.debug(f"Server: Cannot convert model parameter to tensor ({e})")
-                return None
+        if self._is_flame_enabled():
+            if base_params is not None:
+                flame_result = self._flame_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if flame_result is not None:
+                    return flame_result
+            logger.warning(
+                f"Server: FLAME requested for {aggregation_name}, but no "
+                "usable base parameters were available; falling back to FedAvg")
+
+        if self._is_foolsgold_enabled():
+            if base_params is not None:
+                foolsgold_result = self._foolsgold_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if foolsgold_result is not None:
+                    return foolsgold_result
+            logger.warning(
+                f"Server: FoolsGold requested for {aggregation_name}, but no "
+                "usable base parameters were available; falling back to FedAvg")
+
+        if self._is_multi_krum_enabled():
+            if base_params is not None:
+                multi_krum_result = self._multi_krum_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if multi_krum_result is not None:
+                    return multi_krum_result
+            logger.warning(
+                f"Server: Multi-Krum requested for {aggregation_name}, but no "
+                "usable base parameters were available; falling back to FedAvg")
+
+        if self._is_trimmed_mean_enabled():
+            if base_params is not None:
+                trimmed_mean_result = self._trimmed_mean_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if trimmed_mean_result is not None:
+                    return trimmed_mean_result
+            logger.warning(
+                f"Server: Trimmed Mean requested for {aggregation_name}, but no "
+                "usable base parameters were available; falling back to FedAvg")
+
+        if self._is_align_ins_enabled():
+            if base_params is not None:
+                align_ins_result = self._align_ins_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if align_ins_result is not None:
+                    return align_ins_result
+            logger.warning(
+                f"Server: AlignIns requested for {aggregation_name}, but no "
+                "usable base parameters were available; falling back to FedAvg")
 
         aggregated_params = {}
 
@@ -1636,7 +1901,7 @@ class GGEURServer(Server):
                 # Nested dict (e.g. combined params accidentally passed in); skip
                 logger.debug(f"Server: Skipping nested dict value for key '{key}' during aggregation setup")
                 continue
-            param_tensor = _to_tensor(param_tensor)
+            param_tensor = self._to_param_tensor(param_tensor)
             if param_tensor is None:
                 logger.debug(f"Server: Cannot convert key '{key}' to tensor, skipping")
                 continue
@@ -1646,7 +1911,7 @@ class GGEURServer(Server):
             return None
 
         # Weighted average — only iterate over keys validated from first_params
-        for sample_size, params in valid_params:
+        for sample_size, params, _ in valid_params:
             weight = sample_size / total_samples
             for key in aggregated_params.keys():
                 if key not in params:
@@ -1654,7 +1919,864 @@ class GGEURServer(Server):
                 param_tensor = params[key]
                 if isinstance(param_tensor, dict):
                     continue
-                param_tensor = _to_tensor(param_tensor)
+                param_tensor = self._to_param_tensor(param_tensor)
+                if param_tensor is None:
+                    continue
+                aggregated_params[key] += weight * param_tensor.float()
+
+        return aggregated_params
+
+    def _collect_update_vectors(self, valid_params, base_params,
+                                aggregation_name):
+        first_params = valid_params[0][1]
+        vector_keys = []
+        base_tensors = {}
+        shapes = {}
+        dtypes = {}
+        devices = {}
+
+        for key, value in first_params.items():
+            if isinstance(value, dict) or key not in base_params:
+                continue
+            base_tensor = self._to_param_tensor(base_params[key])
+            value_tensor = self._to_param_tensor(value)
+            if base_tensor is None or value_tensor is None:
+                continue
+            if not torch.is_floating_point(base_tensor) or \
+                    not torch.is_floating_point(value_tensor):
+                continue
+            vector_keys.append(key)
+            base_tensors[key] = base_tensor.detach().to(self.device).float()
+            shapes[key] = base_tensor.shape
+            dtypes[key] = base_tensor.dtype
+            devices[key] = base_tensor.device
+
+        if not vector_keys:
+            logger.warning(
+                f"Server: {aggregation_name} found no floating parameters "
+                "for robust aggregation")
+            return None
+
+        update_vectors = []
+        retained_valid_params = []
+        for sample_size, params, sender in valid_params:
+            pieces = []
+            usable = True
+            for key in vector_keys:
+                if key not in params:
+                    usable = False
+                    break
+                tensor = self._to_param_tensor(params[key])
+                if tensor is None:
+                    usable = False
+                    break
+                tensor = tensor.detach().to(self.device).float()
+                pieces.append((tensor - base_tensors[key]).reshape(-1))
+            if usable:
+                update_vectors.append(torch.cat(pieces))
+                retained_valid_params.append((sample_size, params, sender))
+
+        if not update_vectors:
+            return None
+
+        return {
+            'vector_keys': vector_keys,
+            'base_tensors': base_tensors,
+            'shapes': shapes,
+            'dtypes': dtypes,
+            'devices': devices,
+            'update_tensor': torch.stack(update_vectors, dim=0),
+            'retained_valid_params': retained_valid_params,
+        }
+
+    def _state_dict_from_update_vector(self, aggregated_update, vector_info,
+                                       valid_params):
+        aggregated_params = {}
+        offset = 0
+        for key in vector_info['vector_keys']:
+            param_size = int(np.prod(vector_info['shapes'][key]))
+            update = aggregated_update[offset:offset + param_size].view(
+                vector_info['shapes'][key])
+            new_value = vector_info['base_tensors'][key] + update
+            aggregated_params[key] = new_value.to(
+                device=vector_info['devices'][key],
+                dtype=vector_info['dtypes'][key])
+            offset += param_size
+
+        fedavg_params = self._fedavg_model_params_no_defense(
+            valid_params,
+            sum(s for s, _, _ in valid_params))
+        if fedavg_params:
+            for key, value in fedavg_params.items():
+                if key not in aggregated_params:
+                    aggregated_params[key] = value
+        return aggregated_params
+
+    def _foolsgold_aggregate_model_params(self,
+                                          valid_params,
+                                          base_params,
+                                          aggregation_name='model'):
+        """FoolsGold aggregation adapted to GGEUR state_dict payloads."""
+        if len(valid_params) < 2:
+            logger.info(
+                f"Server: FoolsGold for {aggregation_name} needs at least two "
+                "updates; using FedAvg fallback")
+            return None
+        if any(sender is None for _, _, sender in valid_params):
+            logger.warning(
+                f"Server: FoolsGold for {aggregation_name} needs client ids; "
+                "using FedAvg fallback")
+            return None
+
+        vector_info = self._collect_update_vectors(valid_params, base_params,
+                                                   f"FoolsGold {aggregation_name}")
+        if vector_info is None:
+            return None
+
+        update_tensor = vector_info['update_tensor']
+        retained_valid_params = vector_info['retained_valid_params']
+        if len(retained_valid_params) < 2:
+            logger.info(
+                f"Server: FoolsGold for {aggregation_name} has fewer than two "
+                "usable updates; using FedAvg fallback")
+            return None
+
+        history_key = aggregation_name
+        if history_key not in self.foolsgold_update_history:
+            self.foolsgold_update_history[history_key] = {}
+        history = self.foolsgold_update_history[history_key]
+
+        selected_history = []
+        for idx, (_, _, sender) in enumerate(retained_valid_params):
+            sender = int(sender)
+            current_update = update_tensor[idx].detach().clone()
+            if sender not in history:
+                history[sender] = current_update
+            else:
+                history[sender] = history[sender].to(self.device) + current_update
+            selected_history.append(history[sender])
+
+        eps = float(getattr(self.ggeur_cfg, 'foolsgold_eps', 1e-5))
+        client_ids = [int(sender) for _, _, sender in retained_valid_params]
+        update_norms = torch.norm(update_tensor.float(), dim=1)
+        history_tensor = torch.stack(selected_history, dim=0).reshape(
+            len(selected_history), -1)
+        history_norms = torch.norm(history_tensor.float(), dim=1)
+        normalized_history = F.normalize(history_tensor.float(),
+                                         p=2,
+                                         dim=1,
+                                         eps=eps)
+        cosine_similarity = torch.matmul(normalized_history,
+                                         normalized_history.T)
+        cosine_similarity = cosine_similarity - torch.eye(
+            cosine_similarity.shape[0], device=self.device)
+        maxcs = torch.max(cosine_similarity, dim=1)[0] + eps
+
+        pardoned = cosine_similarity.clone()
+        for i in range(pardoned.shape[0]):
+            for j in range(pardoned.shape[1]):
+                if i == j:
+                    continue
+                if maxcs[i] < maxcs[j]:
+                    pardoned[i][j] = pardoned[i][j] * (maxcs[i] / maxcs[j])
+
+        weights = 1.0 - torch.max(pardoned, dim=1)[0]
+        trust_before_clip = weights.detach().clone()
+        weights = torch.clamp(weights, min=0.0, max=1.0)
+        weights = weights / (torch.max(weights) + eps)
+        trust_after_rescale = weights.detach().clone()
+        weights = torch.where(weights == 1.0,
+                              torch.full_like(weights, 0.99),
+                              weights)
+        weights = torch.log((weights / (1.0 - weights + eps)) + eps) + 0.5
+        weights = torch.where(torch.isinf(weights) | (weights > 1.0),
+                              torch.ones_like(weights),
+                              weights)
+        weights = torch.clamp(weights, min=0.0, max=1.0)
+        trust_after_logit = weights.detach().clone()
+
+        if bool(getattr(self.ggeur_cfg, 'foolsgold_use_sample_weight',
+                        False)):
+            sample_weights = torch.tensor(
+                [max(0, s) for s, _, _ in retained_valid_params],
+                device=self.device,
+                dtype=weights.dtype)
+            weights = weights * sample_weights
+
+        weight_sum = torch.sum(weights)
+        if float(weight_sum.item()) <= eps:
+            logger.warning(
+                f"Server: FoolsGold {aggregation_name} produced zero trust "
+                "mass; aggregated update will be near zero")
+        normalized_weights = weights / (weight_sum + eps)
+
+        aggregated_update = torch.sum(
+            update_tensor * normalized_weights.view(-1, 1), dim=0)
+        logger.info(
+            f"Server: FoolsGold {aggregation_name} client_ids={client_ids}, "
+            f"weights={normalized_weights.detach().cpu().numpy().tolist()}")
+        if bool(getattr(self.ggeur_cfg, 'foolsgold_debug', False)):
+            self._log_foolsgold_debug(
+                aggregation_name=aggregation_name,
+                client_ids=client_ids,
+                update_norms=update_norms,
+                history_norms=history_norms,
+                cosine_similarity=cosine_similarity,
+                maxcs=maxcs,
+                pardoned=pardoned,
+                trust_before_clip=trust_before_clip,
+                trust_after_rescale=trust_after_rescale,
+                trust_after_logit=trust_after_logit,
+                final_weights=normalized_weights)
+
+        return self._state_dict_from_update_vector(
+            aggregated_update,
+            vector_info,
+            retained_valid_params)
+
+    def _log_foolsgold_debug(self,
+                             aggregation_name,
+                             client_ids,
+                             update_norms,
+                             history_norms,
+                             cosine_similarity,
+                             maxcs,
+                             pardoned,
+                             trust_before_clip,
+                             trust_after_rescale,
+                             trust_after_logit,
+                             final_weights):
+        """Log FoolsGold internals without affecting other aggregators."""
+        max_clients = int(getattr(self.ggeur_cfg,
+                                  'foolsgold_debug_max_clients', 20))
+
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        logger.info(
+            f"Server: FoolsGold DEBUG {aggregation_name} client_ids={client_ids}, "
+            f"update_norms={_round_list(update_norms)}, "
+            f"history_norms={_round_list(history_norms)}, "
+            f"maxcs={_round_list(maxcs)}, "
+            f"trust_before_clip={_round_list(trust_before_clip)}, "
+            f"trust_after_rescale={_round_list(trust_after_rescale)}, "
+            f"trust_after_logit={_round_list(trust_after_logit)}, "
+            f"final_weights={_round_list(final_weights)}")
+
+        if len(client_ids) <= max_clients:
+            logger.info(
+                f"Server: FoolsGold DEBUG {aggregation_name} "
+                f"cosine_similarity={_round_list(cosine_similarity)}")
+            logger.info(
+                f"Server: FoolsGold DEBUG {aggregation_name} "
+                f"pardoned_similarity={_round_list(pardoned)}")
+        else:
+            logger.info(
+                f"Server: FoolsGold DEBUG {aggregation_name} skipped matrix "
+                f"dump because clients={len(client_ids)} exceeds "
+                f"foolsgold_debug_max_clients={max_clients}")
+
+    def _multi_krum_aggregate_model_params(self,
+                                           valid_params,
+                                           base_params,
+                                           aggregation_name='model'):
+        """Multi-Krum aggregation adapted to GGEUR state_dict payloads."""
+        if len(valid_params) < 2:
+            logger.info(
+                f"Server: Multi-Krum for {aggregation_name} needs at least two "
+                "updates; using FedAvg fallback")
+            return None
+
+        vector_info = self._collect_update_vectors(valid_params, base_params,
+                                                   f"Multi-Krum {aggregation_name}")
+        if vector_info is None:
+            return None
+
+        update_tensor = vector_info['update_tensor']
+        retained_valid_params = vector_info['retained_valid_params']
+        n_users = len(retained_valid_params)
+        if n_users < 2:
+            logger.info(
+                f"Server: Multi-Krum for {aggregation_name} has fewer than two "
+                "usable updates; using FedAvg fallback")
+            return None
+
+        num_malicious = int(getattr(self.ggeur_cfg,
+                                    'multi_krum_num_malicious', 2))
+        num_malicious = max(0, min(num_malicious, n_users - 1))
+        if n_users < 2 * num_malicious + 3:
+            logger.warning(
+                f"Server: Multi-Krum {aggregation_name} received n={n_users}, "
+                f"f={num_malicious}; formal condition n >= 2f + 3 is not met")
+
+        distances = torch.cdist(update_tensor.float(), update_tensor.float(),
+                                p=2)
+        k = min(max(n_users - num_malicious - 2, 1), n_users - 1)
+        nearest_distances = torch.sort(distances, dim=1)[0][:, 1:k + 1]
+        krum_scores = torch.sum(nearest_distances, dim=1)
+        select_num = min(max(n_users - 2 * num_malicious, 1), n_users)
+        selected_indices = torch.topk(krum_scores,
+                                      select_num,
+                                      largest=False).indices
+        selected_indices_list = selected_indices.detach().cpu().tolist()
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+        selected_client_ids = [client_ids[i] for i in selected_indices_list]
+        aggregated_update = update_tensor[selected_indices].mean(dim=0)
+
+        logger.info(
+            f"Server: Multi-Krum {aggregation_name} client_ids={client_ids}, "
+            f"num_malicious={num_malicious}, k={k}, "
+            f"selected_client_ids={selected_client_ids}, "
+            f"selected_indices={selected_indices_list}")
+
+        if bool(getattr(self.ggeur_cfg, 'multi_krum_debug', False)):
+            self._log_multi_krum_debug(
+                aggregation_name=aggregation_name,
+                client_ids=client_ids,
+                distances=distances,
+                krum_scores=krum_scores,
+                selected_indices=selected_indices,
+                selected_client_ids=selected_client_ids,
+                k=k,
+                select_num=select_num)
+
+        return self._state_dict_from_update_vector(
+            aggregated_update,
+            vector_info,
+            retained_valid_params)
+
+    def _log_multi_krum_debug(self,
+                              aggregation_name,
+                              client_ids,
+                              distances,
+                              krum_scores,
+                              selected_indices,
+                              selected_client_ids,
+                              k,
+                              select_num):
+        """Log Multi-Krum internals without affecting other aggregators."""
+        max_clients = int(getattr(self.ggeur_cfg,
+                                  'multi_krum_debug_max_clients', 20))
+
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        logger.info(
+            f"Server: Multi-Krum DEBUG {aggregation_name} client_ids={client_ids}, "
+            f"k={k}, select_num={select_num}, "
+            f"krum_scores={_round_list(krum_scores)}, "
+            f"selected_indices={selected_indices.detach().cpu().tolist()}, "
+            f"selected_client_ids={selected_client_ids}")
+
+        if len(client_ids) <= max_clients:
+            logger.info(
+                f"Server: Multi-Krum DEBUG {aggregation_name} "
+                f"distances={_round_list(distances)}")
+        else:
+            logger.info(
+                f"Server: Multi-Krum DEBUG {aggregation_name} skipped matrix "
+                f"dump because clients={len(client_ids)} exceeds "
+                f"multi_krum_debug_max_clients={max_clients}")
+
+    def _trimmed_mean_aggregate_model_params(self,
+                                             valid_params,
+                                             base_params,
+                                             aggregation_name='model'):
+        """Coordinate-wise Trimmed Mean aggregation for GGEUR state_dicts."""
+        if len(valid_params) < 2:
+            logger.info(
+                f"Server: Trimmed Mean for {aggregation_name} needs at least two "
+                "updates; using FedAvg fallback")
+            return None
+
+        vector_info = self._collect_update_vectors(
+            valid_params,
+            base_params,
+            f"Trimmed Mean {aggregation_name}")
+        if vector_info is None:
+            return None
+
+        update_tensor = vector_info['update_tensor']
+        retained_valid_params = vector_info['retained_valid_params']
+        n_users = len(retained_valid_params)
+        if n_users < 2:
+            logger.info(
+                f"Server: Trimmed Mean for {aggregation_name} has fewer than two "
+                "usable updates; using FedAvg fallback")
+            return None
+
+        trim_ratio = float(getattr(self.ggeur_cfg,
+                                   'trimmed_mean_trim_ratio', 0.2))
+        trim_ratio = max(0.0, min(trim_ratio, 0.5))
+        trim_count = int(n_users * trim_ratio)
+        if trim_ratio > 0.0:
+            trim_count = max(1, trim_count)
+        trim_count = min(trim_count, max((n_users - 1) // 2, 0))
+
+        sorted_updates = torch.sort(update_tensor.float(), dim=0)[0]
+        if trim_count > 0:
+            trimmed_updates = sorted_updates[trim_count:n_users - trim_count]
+        else:
+            trimmed_updates = sorted_updates
+        if trimmed_updates.shape[0] <= 0:
+            logger.warning(
+                f"Server: Trimmed Mean {aggregation_name} removed all updates; "
+                "using FedAvg fallback")
+            return None
+
+        aggregated_update = trimmed_updates.mean(dim=0)
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+
+        logger.info(
+            f"Server: Trimmed Mean {aggregation_name} client_ids={client_ids}, "
+            f"trim_ratio={trim_ratio}, trim_count={trim_count}, "
+            f"retained_per_coordinate={trimmed_updates.shape[0]}")
+
+        if bool(getattr(self.ggeur_cfg, 'trimmed_mean_debug', False)):
+            self._log_trimmed_mean_debug(
+                aggregation_name=aggregation_name,
+                client_ids=client_ids,
+                update_tensor=update_tensor,
+                trim_ratio=trim_ratio,
+                trim_count=trim_count,
+                retained_count=trimmed_updates.shape[0])
+
+        return self._state_dict_from_update_vector(
+            aggregated_update,
+            vector_info,
+            retained_valid_params)
+
+    def _log_trimmed_mean_debug(self,
+                                aggregation_name,
+                                client_ids,
+                                update_tensor,
+                                trim_ratio,
+                                trim_count,
+                                retained_count):
+        """Log Trimmed Mean internals without affecting other aggregators."""
+
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        update_norms = torch.norm(update_tensor.float(), dim=1)
+        coord_means = update_tensor.float().mean(dim=0)
+        coord_stds = update_tensor.float().std(dim=0, unbiased=False)
+        logger.info(
+            f"Server: Trimmed Mean DEBUG {aggregation_name} client_ids={client_ids}, "
+            f"trim_ratio={trim_ratio}, trim_count={trim_count}, "
+            f"retained_count={retained_count}, "
+            f"update_norms={_round_list(update_norms)}, "
+            f"coord_mean_abs_avg={float(coord_means.abs().mean().item()):.6f}, "
+            f"coord_std_avg={float(coord_stds.mean().item()):.6f}")
+
+    def _align_ins_aggregate_model_params(self,
+                                          valid_params,
+                                          base_params,
+                                          aggregation_name='model'):
+        """AlignIns aggregation adapted to GGEUR state_dict payloads."""
+        if len(valid_params) < 2:
+            logger.info(
+                f"Server: AlignIns for {aggregation_name} needs at least two "
+                "updates; using FedAvg fallback")
+            return None
+
+        vector_info = self._collect_update_vectors(
+            valid_params,
+            base_params,
+            f"AlignIns {aggregation_name}")
+        if vector_info is None:
+            return None
+
+        update_tensor = vector_info['update_tensor'].float()
+        retained_valid_params = vector_info['retained_valid_params']
+        n_users = len(retained_valid_params)
+        if n_users < 2:
+            logger.info(
+                f"Server: AlignIns for {aggregation_name} has fewer than two "
+                "usable updates; using FedAvg fallback")
+            return None
+
+        eps = float(getattr(self.ggeur_cfg, 'align_ins_eps', 1e-12))
+        tau_c = float(getattr(self.ggeur_cfg, 'align_ins_tau_c', 1.0))
+        tau_s = float(getattr(self.ggeur_cfg, 'align_ins_tau_s', 1.0))
+        topk_cfg = float(getattr(self.ggeur_cfg, 'align_ins_topk', 0.3))
+        dim = update_tensor.shape[1]
+        if topk_cfg <= 1.0:
+            topk = int(topk_cfg * dim)
+        else:
+            topk = int(topk_cfg)
+        topk = max(1, min(topk, dim))
+
+        base_vector = torch.cat([
+            vector_info['base_tensors'][key].reshape(-1)
+            for key in vector_info['vector_keys']
+        ]).to(self.device).float()
+        base_norm = torch.norm(base_vector) + eps
+        update_norms = torch.norm(update_tensor, dim=1) + eps
+        tda = torch.sum(update_tensor * base_vector.view(1, -1), dim=1) / (
+            update_norms * base_norm)
+
+        principal_sign = torch.sign(torch.sum(torch.sign(update_tensor), dim=0))
+        mpsa_values = []
+        for idx in range(n_users):
+            topk_idx = torch.topk(update_tensor[idx].abs(),
+                                  topk,
+                                  largest=True).indices
+            mismatches = torch.sum(
+                torch.sign(update_tensor[idx][topk_idx]) !=
+                principal_sign[topk_idx]).float()
+            mpsa_values.append(1.0 - mismatches / float(topk))
+        mpsa = torch.stack(mpsa_values).to(self.device).float()
+
+        z_tda = self._align_ins_mz_score(tda, eps)
+        z_mpsa = self._align_ins_mz_score(mpsa, eps)
+        keep_mask = (torch.abs(z_tda) <= tau_c) & (torch.abs(z_mpsa) <= tau_s)
+        keep_indices = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+        fallback_used = False
+        if keep_indices.numel() == 0:
+            fallback_used = True
+            keep_indices = torch.argmin(torch.abs(z_tda) + torch.abs(z_mpsa)).view(1)
+
+        kept_updates = update_tensor[keep_indices]
+        kept_norms = torch.norm(kept_updates, dim=1) + eps
+        clip_norm = torch.median(kept_norms)
+        scales = torch.minimum(torch.ones_like(kept_norms), clip_norm / kept_norms)
+        aggregated_update = torch.mean(kept_updates * scales.view(-1, 1), dim=0)
+
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+        keep_indices_list = keep_indices.detach().cpu().tolist()
+        kept_client_ids = [client_ids[i] for i in keep_indices_list]
+        logger.info(
+            f"Server: AlignIns {aggregation_name} client_ids={client_ids}, "
+            f"kept_client_ids={kept_client_ids}, tau_c={tau_c}, tau_s={tau_s}, "
+            f"topk={topk}, clip_norm={float(clip_norm.item()):.6f}, "
+            f"fallback_used={fallback_used}")
+
+        if bool(getattr(self.ggeur_cfg, 'align_ins_debug', False)):
+            self._log_align_ins_debug(
+                aggregation_name=aggregation_name,
+                client_ids=client_ids,
+                tda=tda,
+                mpsa=mpsa,
+                z_tda=z_tda,
+                z_mpsa=z_mpsa,
+                update_norms=update_norms,
+                kept_client_ids=kept_client_ids)
+
+        return self._state_dict_from_update_vector(
+            aggregated_update,
+            vector_info,
+            retained_valid_params)
+
+    @staticmethod
+    def _align_ins_mz_score(values, eps):
+        median = torch.median(values)
+        std = torch.std(values, unbiased=False)
+        if float(std.item()) < eps:
+            std = torch.full_like(std, eps)
+        return (values - median) / std
+
+    def _log_align_ins_debug(self,
+                             aggregation_name,
+                             client_ids,
+                             tda,
+                             mpsa,
+                             z_tda,
+                             z_mpsa,
+                             update_norms,
+                             kept_client_ids):
+        """Log AlignIns internals without affecting other aggregators."""
+
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        logger.info(
+            f"Server: AlignIns DEBUG {aggregation_name} client_ids={client_ids}, "
+            f"tda={_round_list(tda)}, mpsa={_round_list(mpsa)}, "
+            f"z_tda={_round_list(z_tda)}, z_mpsa={_round_list(z_mpsa)}, "
+            f"update_norms={_round_list(update_norms)}, "
+            f"kept_client_ids={kept_client_ids}")
+
+    def _flame_aggregate_model_params(self,
+                                      valid_params,
+                                      base_params,
+                                      aggregation_name='model'):
+        """FLAME aggregation adapted to GGEUR state_dict payloads.
+
+        The implementation follows doc/flame/flame_aggregator.py:
+        cluster client updates, keep the benign cluster, clip each update to
+        the median norm, average retained updates, add Gaussian noise, and add
+        the result to the current global parameters.
+        """
+        if len(valid_params) < 2:
+            logger.info(
+                f"Server: FLAME for {aggregation_name} needs at least two "
+                "updates; using FedAvg fallback")
+            return None
+
+        first_params = valid_params[0][1]
+        vector_keys = []
+        base_tensors = {}
+        shapes = {}
+        dtypes = {}
+        devices = {}
+
+        for key, value in first_params.items():
+            if isinstance(value, dict) or key not in base_params:
+                continue
+            base_tensor = self._to_param_tensor(base_params[key])
+            value_tensor = self._to_param_tensor(value)
+            if base_tensor is None or value_tensor is None:
+                continue
+            if not torch.is_floating_point(base_tensor) or \
+                    not torch.is_floating_point(value_tensor):
+                continue
+            vector_keys.append(key)
+            base_tensors[key] = base_tensor.detach().to(self.device).float()
+            shapes[key] = base_tensor.shape
+            dtypes[key] = base_tensor.dtype
+            devices[key] = base_tensor.device
+
+        if not vector_keys:
+            logger.warning(
+                f"Server: FLAME for {aggregation_name} found no floating "
+                "parameters; using FedAvg fallback")
+            return None
+
+        update_vectors = []
+        retained_valid_params = []
+        for sample_size, params, sender in valid_params:
+            pieces = []
+            usable = True
+            for key in vector_keys:
+                if key not in params:
+                    usable = False
+                    break
+                tensor = self._to_param_tensor(params[key])
+                if tensor is None:
+                    usable = False
+                    break
+                tensor = tensor.detach().to(self.device).float()
+                pieces.append((tensor - base_tensors[key]).reshape(-1))
+            if usable:
+                update_vectors.append(torch.cat(pieces))
+                retained_valid_params.append((sample_size, params, sender))
+
+        if len(update_vectors) < 2:
+            logger.info(
+                f"Server: FLAME for {aggregation_name} has fewer than two "
+                "usable updates; using FedAvg fallback")
+            return None
+
+        update_tensor = torch.stack(update_vectors, dim=0)
+        good_indices = self._flame_select_good_updates(update_tensor,
+                                                       aggregation_name)
+        if not good_indices:
+            logger.warning(
+                f"Server: FLAME for {aggregation_name} selected no updates; "
+                "using all usable updates")
+            good_indices = list(range(update_tensor.shape[0]))
+
+        selected_updates = update_tensor[good_indices]
+        selected_params = [retained_valid_params[i] for i in good_indices]
+        norms = torch.norm(selected_updates, dim=1)
+        positive_norms = norms[norms > 0]
+        if positive_norms.numel() == 0:
+            median_norm = torch.tensor(0.0, device=self.device)
+            clipped_updates = selected_updates
+        else:
+            median_norm = torch.median(positive_norms)
+            scale = median_norm / torch.clamp(norms, min=1e-12)
+            scale = torch.clamp(scale, max=1.0)
+            clipped_updates = selected_updates * scale.view(-1, 1)
+
+        if bool(getattr(self.ggeur_cfg, 'flame_weighted_avg', False)):
+            selected_samples = torch.tensor(
+                [max(0, s) for s, _, _ in selected_params],
+                device=self.device,
+                dtype=clipped_updates.dtype)
+            weight_sum = selected_samples.sum()
+            if weight_sum > 0:
+                weights = selected_samples / weight_sum
+                aggregated_update = torch.sum(
+                    clipped_updates * weights.view(-1, 1), dim=0)
+            else:
+                aggregated_update = clipped_updates.mean(dim=0)
+        else:
+            aggregated_update = clipped_updates.mean(dim=0)
+
+        lambda_noise = float(getattr(self.ggeur_cfg, 'flame_lambda_noise',
+                                     0.001))
+        sigma = lambda_noise * float(median_norm.item())
+        if sigma > 0:
+            aggregated_update = aggregated_update + torch.normal(
+                mean=0.0,
+                std=sigma,
+                size=aggregated_update.size(),
+                device=self.device)
+
+        logger.info(
+            f"Server: FLAME {aggregation_name} kept {len(good_indices)}/"
+            f"{len(update_vectors)} updates, S_t={float(median_norm.item()):.6f}, "
+            f"sigma={sigma:.6f}")
+
+        aggregated_params = {}
+        offset = 0
+        for key in vector_keys:
+            param_size = int(np.prod(shapes[key]))
+            update = aggregated_update[offset:offset + param_size].view(
+                shapes[key])
+            new_value = base_tensors[key] + update
+            aggregated_params[key] = new_value.to(
+                device=devices[key], dtype=dtypes[key])
+            offset += param_size
+
+        # Preserve non-floating buffers and parameters with a normal average so
+        # load_state_dict receives a complete state_dict.
+        fedavg_params = self._fedavg_model_params_no_defense(
+            valid_params,
+            sum(s for s, _, _ in valid_params))
+        if fedavg_params:
+            for key, value in fedavg_params.items():
+                if key not in aggregated_params:
+                    aggregated_params[key] = value
+
+        return aggregated_params
+
+    def _flame_select_good_updates(self, update_tensor, aggregation_name):
+        try:
+            import hdbscan
+        except ImportError:
+            logger.warning(
+                f"Server: hdbscan is not installed; FLAME {aggregation_name} "
+                "will use cosine-distance fallback clustering")
+            return self._flame_select_good_updates_fallback(update_tensor,
+                                                            aggregation_name)
+
+        try:
+            cluster = hdbscan.HDBSCAN(
+                metric="cosine",
+                algorithm="generic",
+                min_cluster_size=max(2, update_tensor.shape[0] // 2 + 1),
+                min_samples=1,
+                allow_single_cluster=True,
+            )
+            labels = cluster.fit_predict(update_tensor.double().cpu().numpy())
+        except Exception as e:
+            logger.warning(
+                f"Server: FLAME {aggregation_name} clustering failed ({e}); "
+                "keeping all usable updates")
+            return list(range(update_tensor.shape[0]))
+
+        non_noise_labels = [label for label in labels if label >= 0]
+        if not non_noise_labels:
+            return list(range(update_tensor.shape[0]))
+
+        label_counts = {
+            label: int(np.sum(labels == label))
+            for label in sorted(set(non_noise_labels))
+        }
+        good_label = max(label_counts, key=label_counts.get)
+        good_indices = [
+            idx for idx, label in enumerate(labels)
+            if int(label) == int(good_label)
+        ]
+        logger.info(
+            f"Server: FLAME {aggregation_name} cluster labels="
+            f"{labels.tolist()}, selected_label={good_label}")
+        return good_indices
+
+    def _flame_select_good_updates_fallback(self, update_tensor,
+                                            aggregation_name):
+        """Dependency-free fallback when hdbscan is unavailable.
+
+        Build a graph with edges between update vectors whose cosine distance
+        is no larger than the median pairwise distance, then keep the largest
+        connected component as the presumed benign majority.
+        """
+        num_updates = int(update_tensor.shape[0])
+        if num_updates <= 2:
+            return list(range(num_updates))
+
+        normalized = F.normalize(update_tensor.float(), p=2, dim=1, eps=1e-12)
+        distance = 1.0 - torch.matmul(normalized, normalized.T)
+        pairwise = distance[torch.triu(
+            torch.ones_like(distance, dtype=torch.bool), diagonal=1)]
+        finite_pairwise = pairwise[torch.isfinite(pairwise)]
+        if finite_pairwise.numel() == 0:
+            return list(range(num_updates))
+
+        threshold = torch.median(finite_pairwise)
+        adjacency = distance <= threshold
+        adjacency.fill_diagonal_(True)
+
+        visited = [False] * num_updates
+        components = []
+        for start in range(num_updates):
+            if visited[start]:
+                continue
+            stack = [start]
+            visited[start] = True
+            component = []
+            while stack:
+                node = stack.pop()
+                component.append(node)
+                neighbors = torch.nonzero(adjacency[node],
+                                          as_tuple=False).view(-1).tolist()
+                for neighbor in neighbors:
+                    if not visited[neighbor]:
+                        visited[neighbor] = True
+                        stack.append(int(neighbor))
+            components.append(component)
+
+        good_indices = max(components, key=len)
+        logger.info(
+            f"Server: FLAME {aggregation_name} fallback components="
+            f"{[len(c) for c in components]}, "
+            f"threshold={float(threshold.item()):.6f}, "
+            f"selected={good_indices}")
+        return good_indices
+
+    def _fedavg_model_params_no_defense(self, valid_params, total_samples):
+        if not valid_params or total_samples <= 0:
+            return None
+
+        normalized_valid_params = [
+            self._unpack_param_entry(entry) for entry in valid_params
+        ]
+        first_params = normalized_valid_params[0][1]
+        if not isinstance(first_params, dict):
+            return None
+
+        aggregated_params = {}
+        for key in first_params.keys():
+            param_tensor = first_params[key]
+            if isinstance(param_tensor, dict):
+                continue
+            param_tensor = self._to_param_tensor(param_tensor)
+            if param_tensor is None:
+                continue
+            aggregated_params[key] = torch.zeros_like(param_tensor).float()
+
+        for sample_size, params, _ in normalized_valid_params:
+            weight = sample_size / total_samples
+            for key in aggregated_params.keys():
+                if key not in params or isinstance(params[key], dict):
+                    continue
+                param_tensor = self._to_param_tensor(params[key])
                 if param_tensor is None:
                     continue
                 aggregated_params[key] += weight * param_tensor.float()
@@ -1840,17 +2962,11 @@ class GGEURServer(Server):
             return
 
         from torchvision import transforms
-        if self.feature_extractor_type == 'clip':
-            mean = [0.48145466, 0.4578275, 0.40821073]
-            std = [0.26862954, 0.26130258, 0.27577711]
-        else:
-            mean = [0.485, 0.456, 0.406]
-            std = [0.229, 0.224, 0.225]
-
         transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
+            transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                 std=[0.26862954, 0.26130258, 0.27577711])
         ])
 
         for domain in domains:
@@ -1886,17 +3002,20 @@ class GGEURServer(Server):
             return torch.tensor(restored)
         return restored
 
-    def _evaluate_a3fl_on_test_sets(self):
-        if self.global_mlp is None or self.latest_a3fl_meta is None:
+    def _evaluate_trigger_target_rate(self,
+                                      meta,
+                                      structured=False,
+                                      invalid_log=None):
+        if self.global_mlp is None or meta is None:
             return {}
-        trigger = self._restore_a3fl_tensor(
-            self.latest_a3fl_meta.get('trigger'))
-        mask = self._restore_a3fl_tensor(self.latest_a3fl_meta.get('mask'))
+        trigger = self._restore_a3fl_tensor(meta.get('trigger'))
+        mask = self._restore_a3fl_tensor(meta.get('mask'))
         if trigger is None or mask is None:
             return {}
         if not isinstance(trigger, torch.Tensor) or \
                 not isinstance(mask, torch.Tensor):
-            logger.info("Server: A3FL metadata received but trigger/mask could not be restored")
+            if invalid_log:
+                logger.info(invalid_log)
             return {}
 
         self._load_a3fl_test_loaders()
@@ -1906,7 +3025,7 @@ class GGEURServer(Server):
         self._load_feature_extractor()
         trigger = trigger.to(self.device).float()
         mask = mask.to(self.device).float()
-        target_label = int(self.latest_a3fl_meta.get(
+        target_label = int(meta.get(
             'target_label', self._cfg.attack.target_label_ind))
 
         self.global_mlp.eval()
@@ -1917,59 +3036,92 @@ class GGEURServer(Server):
         if self.feature_extractor_type == 'timm' and self.timm_extractor is not None:
             self.timm_extractor.eval()
 
-        results = {}
-        domain_debug = {}
+        asr_results = {}
+        non_target_asr_results = {}
+        clean_target_rate_results = {}
         with torch.no_grad():
             for domain, dataloader in self.a3fl_test_loaders.items():
-                correct = 0
-                total = 0
-                target_logit_sum = 0.0
-                batch_count = 0
-                for images, _ in dataloader:
+                asr_correct = 0
+                asr_total = 0
+                non_target_correct = 0
+                non_target_total = 0
+                clean_target_correct = 0
+                clean_total = 0
+                for images, labels in dataloader:
                     images = images.to(self.device)
+                    labels = labels.to(self.device).long()
                     poisoned_images = trigger * mask + images * (1.0 - mask)
                     if self.feature_extractor_type == 'cnn':
-                        features = self.cnn_extractor(poisoned_images)
+                        clean_features = self.cnn_extractor(images)
+                        poison_features = self.cnn_extractor(poisoned_images)
                     elif self.feature_extractor_type == 'timm':
-                        features = self.timm_extractor(poisoned_images)
+                        clean_features = self.timm_extractor(images)
+                        poison_features = self.timm_extractor(poisoned_images)
                     else:
-                        features = self.clip_model.encode_image(poisoned_images)
-                    logits = self.global_mlp(features.float())
-                    preds = torch.argmax(logits, dim=1)
-                    targets = torch.full_like(preds, target_label)
-                    correct += preds.eq(targets).sum().item()
-                    total += preds.shape[0]
-                    target_logit_sum += logits[:, target_label].mean().item()
-                    batch_count += 1
-                results[domain] = correct / total if total > 0 else 0.0
-                domain_debug[domain] = {
-                    'target_rate': results[domain],
-                    'target_logit': (
-                        target_logit_sum / batch_count if batch_count > 0
-                        else 0.0),
-                    'samples': int(total),
-                }
+                        clean_features = self.clip_model.encode_image(images)
+                        poison_features = self.clip_model.encode_image(
+                            poisoned_images)
 
-        if results:
-            results['average'] = sum(results.values()) / len(results)
-        if domain_debug:
-            avg_target_logit = sum(
-                item['target_logit'] for item in domain_debug.values()
-            ) / len(domain_debug)
-            avg_target_rate = sum(
-                item['target_rate'] for item in domain_debug.values()
-            ) / len(domain_debug)
-            meta_parts = []
-            for domain, metrics in domain_debug.items():
-                meta_parts.append(
-                    f"{domain}: rate={metrics['target_rate']:.4f}, "
-                    f"logit={metrics['target_logit']:.4f}, "
-                    f"n={metrics['samples']}")
-            logger.info(
-                f"Server: A3FL eval debug - avg_target_rate={avg_target_rate:.4f}, "
-                f"avg_target_logit={avg_target_logit:.4f}; "
-                + '; '.join(meta_parts))
-        return results
+                    clean_logits = self.global_mlp(clean_features.float())
+                    poison_logits = self.global_mlp(poison_features.float())
+                    clean_preds = torch.argmax(clean_logits, dim=1)
+                    poison_preds = torch.argmax(poison_logits, dim=1)
+
+                    asr_correct += poison_preds.eq(target_label).sum().item()
+                    asr_total += poison_preds.shape[0]
+
+                    non_target_mask = labels != target_label
+                    if non_target_mask.any():
+                        non_target_correct += poison_preds[
+                            non_target_mask].eq(target_label).sum().item()
+                        non_target_total += non_target_mask.sum().item()
+
+                    clean_target_correct += clean_preds.eq(
+                        target_label).sum().item()
+                    clean_total += clean_preds.shape[0]
+
+                asr_results[domain] = (
+                    asr_correct / asr_total if asr_total > 0 else 0.0)
+                non_target_asr_results[domain] = (
+                    non_target_correct / non_target_total
+                    if non_target_total > 0 else 0.0)
+                clean_target_rate_results[domain] = (
+                    clean_target_correct / clean_total
+                    if clean_total > 0 else 0.0)
+
+        if asr_results:
+            asr_results['average'] = (
+                sum(asr_results.values()) / len(asr_results))
+        if non_target_asr_results:
+            non_target_asr_results['average'] = (
+                sum(non_target_asr_results.values()) /
+                len(non_target_asr_results))
+        if clean_target_rate_results:
+            clean_target_rate_results['average'] = (
+                sum(clean_target_rate_results.values()) /
+                len(clean_target_rate_results))
+
+        if not structured:
+            return asr_results
+        return {
+            'asr': asr_results,
+            'non_target_asr': non_target_asr_results,
+            'clean_target_rate': clean_target_rate_results,
+        }
+
+    def _evaluate_a3fl_on_test_sets(self):
+        return self._evaluate_trigger_target_rate(
+            self.latest_a3fl_meta,
+            structured=False,
+            invalid_log="Server: A3FL metadata received but trigger/mask could not be restored")
+
+    def _evaluate_cerberus_on_test_sets(self, cerberus_meta=None):
+        if cerberus_meta is None:
+            cerberus_meta = self.latest_cerberus_meta
+        return self._evaluate_trigger_target_rate(
+            cerberus_meta,
+            structured=True,
+            invalid_log="Server: CERBERUS metadata received but trigger/mask could not be restored")
 
     @staticmethod
     def _sizeof_content(content) -> int:
@@ -2116,19 +3268,28 @@ class GGEURServer(Server):
     def _aggregate_prompt(self, valid_params, total_samples):
         """Aggregate prompt ctx vectors from clients using weighted average."""
         prompt_params = []
-        for _, p in valid_params:
+        for _, p, sender in (
+                self._unpack_param_entry(entry) for entry in valid_params):
             if isinstance(p, dict) and p.get('prompt') is not None:
                 prompt_dict = p['prompt']
                 ctx = prompt_dict.get('ctx')
                 prompt_sample_size = int(prompt_dict.get('sample_size', 0))
                 if ctx is not None and prompt_sample_size > 0:
-                    prompt_params.append((prompt_sample_size, {'ctx': ctx}))
+                    prompt_params.append((prompt_sample_size, {'ctx': ctx},
+                                          sender))
 
         if not prompt_params:
             return
 
-        total_prompt_samples = sum(s for s, _ in prompt_params)
-        aggregated = self._aggregate_model_params(prompt_params, total_prompt_samples)
+        total_prompt_samples = sum(s for s, _, _ in prompt_params)
+        prompt_base = None
+        if self.global_prompt_ctx is not None:
+            prompt_base = {'ctx': self.global_prompt_ctx.detach().clone()}
+        aggregated = self._aggregate_model_params(
+            prompt_params,
+            total_prompt_samples,
+            base_params=prompt_base,
+            aggregation_name='prompt')
         if aggregated and 'ctx' in aggregated:
             self.global_prompt_ctx = aggregated['ctx'].to(self.device)
             logger.info(f"Server: Aggregated prompt ctx from {len(prompt_params)} clients "
