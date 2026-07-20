@@ -110,6 +110,44 @@ def extend_attack_cfg(cfg):
     cfg.attack.cerberus.trigger_search_gain_margin = 0.5
     cfg.attack.cerberus.trigger_search_l2_weight = 0.0001
 
+    # for SABRE full-image additive backdoor on the GGEUR MLP head
+    cfg.attack.sabre = CN()
+    cfg.attack.sabre.start_round = -1
+    cfg.attack.sabre.poison_epochs = 10
+    cfg.attack.sabre.clean_anchor_lr = 0.001
+    cfg.attack.sabre.clean_anchor_epochs = 1
+    cfg.attack.sabre.poison_lr = 0.001
+    cfg.attack.sabre.poison_optimizer = 'Adam'
+    cfg.attack.sabre.internal_poison_epochs = 1
+    cfg.attack.sabre.poisoning_per_batch = 0
+    cfg.attack.sabre.preserve_clean_batches = True
+    cfg.attack.sabre.trigger_init_mode = 'uniform'
+    cfg.attack.sabre.trigger_init = 0.0
+    cfg.attack.sabre.trigger_seed = 0
+    cfg.attack.sabre.trigger_random_scale = 0.01
+    cfg.attack.sabre.max_poison_samples = 0
+    cfg.attack.sabre.poison_feature_repeat = 1
+    cfg.attack.sabre.clean_ce_weight = 1.0
+    cfg.attack.sabre.poison_ce_weight = 1.0
+    cfg.attack.sabre.anchor_loss_weight = 0.01
+    cfg.attack.sabre.clean_target_suppression_weight = 0.0
+    cfg.attack.sabre.clean_target_margin = 0.5
+    cfg.attack.sabre.constrain_update_to_anchor = False
+    cfg.attack.sabre.anchor_residual_gamma = 0.5
+    cfg.attack.sabre.image_clip_min = -3.0
+    cfg.attack.sabre.image_clip_max = 3.0
+    cfg.attack.sabre.trigger_search_steps = 0
+    cfg.attack.sabre.trigger_search_batches = 2
+    cfg.attack.sabre.trigger_search_batch_size = 8
+    cfg.attack.sabre.trigger_search_lr = 0.01
+    cfg.attack.sabre.trigger_search_clip_min = -0.05
+    cfg.attack.sabre.trigger_search_clip_max = 0.05
+    cfg.attack.sabre.trigger_search_proj_norm = 4.0
+    cfg.attack.sabre.trigger_search_target_margin = 1.0
+    cfg.attack.sabre.trigger_search_gain_weight = 0.5
+    cfg.attack.sabre.trigger_search_gain_margin = 0.5
+    cfg.attack.sabre.trigger_search_l2_weight = 0.0001
+
     # for reconstruct_opt
     cfg.attack.reconstruct_lr = 0.01
     cfg.attack.reconstruct_optim = 'Adam'

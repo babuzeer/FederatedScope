@@ -108,6 +108,27 @@ def extend_ggeur_cfg(cfg):
     # disable the watchdog.
     cfg.ggeur.distributed_stage_timeout = 1800
 
+    # ========== Server-side Defense Settings ==========
+    # GGEUR-specific robust aggregation for MLP/head updates. Supported values:
+    # '', 'flame', 'foolsgold', 'multi_krum', 'trimmed_mean', 'align_ins'.
+    cfg.ggeur.defense_method = ''
+    cfg.ggeur.flame_lambda_noise = 0.001
+    cfg.ggeur.flame_weighted_avg = False
+    cfg.ggeur.foolsgold_eps = 1e-5
+    cfg.ggeur.foolsgold_use_sample_weight = False
+    cfg.ggeur.foolsgold_debug = False
+    cfg.ggeur.foolsgold_debug_max_clients = 20
+    cfg.ggeur.multi_krum_num_malicious = 2
+    cfg.ggeur.multi_krum_debug = False
+    cfg.ggeur.multi_krum_debug_max_clients = 20
+    cfg.ggeur.trimmed_mean_trim_ratio = 0.2
+    cfg.ggeur.trimmed_mean_debug = False
+    cfg.ggeur.align_ins_eps = 1e-12
+    cfg.ggeur.align_ins_tau_c = 1.0
+    cfg.ggeur.align_ins_tau_s = 1.0
+    cfg.ggeur.align_ins_topk = 0.3
+    cfg.ggeur.align_ins_debug = False
+
     # ========== FedProto Integration Settings ==========
     # Whether to use FedProto-style prototype regularization during MLP training
     # If True: Add prototype distance loss to regularize embeddings

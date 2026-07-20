@@ -164,6 +164,7 @@ class GGEURServer(Server):
         self.current_round_clients = list(range(1, self._client_num + 1))
         self.a3fl_enabled = str(getattr(config.attack, 'attack_method', '')).lower() == 'a3fl'
         self.latest_a3fl_meta = None
+        self.a3fl_shared_trigger = None
         self.a3fl_test_loaders = {}
         self.a3fl_test_loaded = False
         self.foolsgold_update_history = {}
@@ -172,7 +173,12 @@ class GGEURServer(Server):
         self.cerberus_enabled = attack_method == 'cerberus'
         self.cerberus_cfg = getattr(config.attack, 'cerberus', None)
         self.latest_cerberus_meta = None
+        self.cerberus_shared_trigger = None
         self.cerberus_peer_model_bank = {}
+        self.sabre_enabled = attack_method == 'sabre'
+        self.sabre_cfg = getattr(config.attack, 'sabre', None)
+        self.latest_sabre_meta = None
+        self.sabre_shared_trigger = None
 
     def _is_cerberus_active_round(self, round_idx):
         if not self.cerberus_enabled or self.cerberus_cfg is None:
@@ -192,15 +198,151 @@ class GGEURServer(Server):
             return []
         return parse_attacker_ids(self._cfg.attack.attacker_id)
 
+    def _is_sabre_active_round(self, round_idx):
+        if not self.sabre_enabled or self.sabre_cfg is None:
+            return False
+        start_round = int(getattr(
+            self.sabre_cfg, 'start_round',
+            getattr(self._cfg.attack, 'inject_round', 0)))
+        if int(round_idx) < start_round:
+            return False
+        poison_epochs = int(getattr(self.sabre_cfg, 'poison_epochs', 0))
+        if poison_epochs <= 0:
+            return True
+        return int(round_idx) < start_round + poison_epochs
+
+    def _get_sabre_active_attacker_ids(self, round_idx):
+        if not self._is_sabre_active_round(round_idx):
+            return []
+        return parse_attacker_ids(self._cfg.attack.attacker_id)
+
+    def _attach_shared_trigger_payload(self, model_para, attack_name,
+                                       shared_trigger):
+        if shared_trigger is None:
+            return model_para
+        if not isinstance(model_para, dict) or 'mlp' not in model_para:
+            model_para = {'mlp': model_para}
+        shared_trigger = copy.deepcopy(shared_trigger)
+        payload = model_para.get(attack_name, {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload['shared_trigger'] = shared_trigger
+        model_para[attack_name] = payload
+        model_para[f'{attack_name}_shared_trigger'] = shared_trigger
+        return model_para
+
+    def _attach_a3fl_payload(self, model_para):
+        if not self.a3fl_enabled:
+            return model_para
+        return self._attach_shared_trigger_payload(
+            model_para, 'a3fl', self.a3fl_shared_trigger)
+
     def _attach_cerberus_payload(self, model_para):
         if not self.cerberus_enabled:
             return model_para
         if not isinstance(model_para, dict) or 'mlp' not in model_para:
             model_para = {'mlp': model_para}
-        model_para['cerberus'] = {
+        cerberus_payload = {
             'peer_models': copy.deepcopy(self.cerberus_peer_model_bank)
         }
+        if self.cerberus_shared_trigger is not None:
+            shared_trigger = copy.deepcopy(self.cerberus_shared_trigger)
+            cerberus_payload['shared_trigger'] = shared_trigger
+            model_para['cerberus_shared_trigger'] = shared_trigger
+        model_para['cerberus'] = cerberus_payload
         return model_para
+
+    def _attach_sabre_payload(self, model_para):
+        if not self.sabre_enabled:
+            return model_para
+        return self._attach_shared_trigger_payload(
+            model_para, 'sabre', self.sabre_shared_trigger)
+
+    def _update_shared_trigger(self, active_updates, attack_name, shared_attr):
+        for meta in active_updates:
+            if not isinstance(meta, dict):
+                continue
+            trigger = meta.get('trigger', None)
+            mask = meta.get('mask', None)
+            if trigger is None or mask is None:
+                continue
+            try:
+                trigger = param2tensor(trigger)
+                mask = param2tensor(mask)
+            except Exception as exc:
+                logger.debug(
+                    f"Server: Could not restore {attack_name.upper()} "
+                    f"shared trigger from client "
+                    f"{meta.get('client_id', 'unknown')}: {exc}")
+                continue
+            if not isinstance(trigger, torch.Tensor) or \
+                    not isinstance(mask, torch.Tensor):
+                continue
+            shared_trigger = {
+                'trigger': trigger.detach().cpu(),
+                'mask': mask.detach().cpu(),
+                'source_client_id': int(meta.get('client_id', -1)),
+                'source_round': int(meta.get('round', self.state)),
+            }
+            if 'target_label' in meta:
+                shared_trigger['target_label'] = int(meta.get('target_label'))
+            if 'trigger_mode' in meta:
+                shared_trigger['trigger_mode'] = meta.get('trigger_mode')
+            setattr(self, shared_attr, shared_trigger)
+            nonzero = int(mask.detach().cpu().ne(0).sum().item())
+            logger.info(
+                f"Server: Updated {attack_name.upper()} shared trigger "
+                f"from client {int(meta.get('client_id', -1))} "
+                f"for round {int(meta.get('round', self.state))} "
+                f"(mask_nonzero={nonzero})")
+            return
+
+    def _update_a3fl_shared_trigger(self, active_a3fl):
+        if not self.a3fl_enabled:
+            return
+        self._update_shared_trigger(
+            active_a3fl, 'a3fl', 'a3fl_shared_trigger')
+
+    def _update_cerberus_shared_trigger(self, active_cerberus):
+        if not self.cerberus_enabled:
+            return
+        for meta in active_cerberus:
+            if not isinstance(meta, dict):
+                continue
+            trigger = meta.get('trigger', None)
+            mask = meta.get('mask', None)
+            if trigger is None or mask is None:
+                continue
+            try:
+                trigger = param2tensor(trigger)
+                mask = param2tensor(mask)
+            except Exception as exc:
+                logger.debug(
+                    "Server: Could not restore CERBERUS shared trigger "
+                    f"from client {meta.get('client_id', 'unknown')}: {exc}")
+                continue
+            if not isinstance(trigger, torch.Tensor) or \
+                    not isinstance(mask, torch.Tensor):
+                continue
+            self.cerberus_shared_trigger = {
+                'trigger': trigger.detach().cpu(),
+                'mask': mask.detach().cpu(),
+                'source_client_id': int(meta.get('client_id', -1)),
+                'source_round': int(meta.get('round', self.state)),
+            }
+            nonzero = int(mask.detach().cpu().ne(0).sum().item())
+            logger.info(
+                "Server: Updated CERBERUS shared trigger "
+                f"from client {int(meta.get('client_id', -1))} "
+                f"for round {int(meta.get('round', self.state))} "
+                f"(mask_nonzero={nonzero})")
+            return
+
+    def _update_sabre_shared_trigger(self, active_sabre):
+        if not self.sabre_enabled:
+            return
+        self._update_shared_trigger(
+            active_sabre, 'sabre', 'sabre_shared_trigger')
 
     def _mark_stage(self, stage_name):
         self._stage_name = stage_name
@@ -1009,7 +1151,9 @@ class GGEURServer(Server):
                 model_para = {'mlp': model_para}
             model_para['prompt'] = {'ctx': self.global_prompt_ctx.cpu()}
 
+        model_para = self._attach_a3fl_payload(model_para)
         model_para = self._attach_cerberus_payload(model_para)
+        model_para = self._attach_sabre_payload(model_para)
 
         # Broadcast to selected clients
         receiver = self._select_round_receivers()
@@ -1054,6 +1198,21 @@ class GGEURServer(Server):
 
         if self.cerberus_enabled:
             active_attackers = self._get_cerberus_active_attacker_ids(self.state)
+            active_attackers = [cid for cid in active_attackers if cid in all_clients]
+            benign_pool = [cid for cid in all_clients if cid not in active_attackers]
+            benign_needed = max(0, sample_num - len(active_attackers))
+            if benign_needed > 0:
+                benign_selected = np.random.choice(benign_pool,
+                                                   size=benign_needed,
+                                                   replace=False).tolist()
+            else:
+                benign_selected = []
+            receiver = active_attackers + benign_selected
+            if len(receiver) == sample_num:
+                return receiver
+
+        if self.sabre_enabled:
+            active_attackers = self._get_sabre_active_attacker_ids(self.state)
             active_attackers = [cid for cid in active_attackers if cid in all_clients]
             benign_pool = [cid for cid in all_clients if cid not in active_attackers]
             benign_needed = max(0, sample_num - len(active_attackers))
@@ -1437,6 +1596,7 @@ class GGEURServer(Server):
 
         a3fl_updates = []
         cerberus_updates = []
+        sabre_updates = []
         cleaned_valid_params = []
         for sample_size, params, sender in valid_params:
             cleaned_params = params
@@ -1462,6 +1622,11 @@ class GGEURServer(Server):
                 if 'mlp' not in params:
                     cleaned_params = copy.deepcopy(cleaned_params)
                     cleaned_params.pop('cerberus', None)
+            if isinstance(params, dict) and 'sabre' in params:
+                sabre_updates.append(params.get('sabre'))
+                if 'mlp' not in params:
+                    cleaned_params = copy.deepcopy(cleaned_params)
+                    cleaned_params.pop('sabre', None)
             cleaned_valid_params.append((sample_size, cleaned_params, sender))
         valid_params = cleaned_valid_params
 
@@ -1470,10 +1635,12 @@ class GGEURServer(Server):
             if isinstance(meta, dict) and meta.get('active', False)
         ]
         self.latest_a3fl_meta = active_a3fl[0] if active_a3fl else None
+        self._update_a3fl_shared_trigger(active_a3fl)
         if self.a3fl_enabled:
             logger.info(
                 f"Server: Round {round_idx} received {len(a3fl_updates)} A3FL metadata payloads, "
-                f"active={len(active_a3fl)}")
+                f"active={len(active_a3fl)}, "
+                f"shared_trigger={'yes' if self.a3fl_shared_trigger is not None else 'no'}")
 
         active_cerberus = [
             meta for meta in cerberus_updates
@@ -1481,12 +1648,26 @@ class GGEURServer(Server):
         ]
         self.latest_cerberus_meta = (
             active_cerberus[0] if active_cerberus else None)
+        self._update_cerberus_shared_trigger(active_cerberus)
         if self.cerberus_enabled:
             logger.info(
                 f"Server: Round {round_idx} received "
                 f"{len(cerberus_updates)} CERBERUS metadata payloads, "
                 f"active={len(active_cerberus)}, "
                 f"peer_bank={len(self.cerberus_peer_model_bank)}")
+
+        active_sabre = [
+            meta for meta in sabre_updates
+            if isinstance(meta, dict) and meta.get('active', False)
+        ]
+        self.latest_sabre_meta = active_sabre[0] if active_sabre else None
+        self._update_sabre_shared_trigger(active_sabre)
+        if self.sabre_enabled:
+            logger.info(
+                f"Server: Round {round_idx} received "
+                f"{len(sabre_updates)} SABRE metadata payloads, "
+                f"active={len(active_sabre)}, "
+                f"shared_trigger={'yes' if self.sabre_shared_trigger is not None else 'no'}")
 
         # Handle separated training mode
         if self.use_separated_training:
@@ -1603,7 +1784,42 @@ class GGEURServer(Server):
                     logger.info(
                         f"Server: Round {round_idx} skipped CERBERUS ASR logging "
                         f"because evaluation returned no results")
-
+            if self.sabre_enabled and self.latest_sabre_meta is not None:
+                sabre_eval = self._evaluate_sabre_on_test_sets()
+                poison_results = sabre_eval.get('asr', {})
+                non_target_results = sabre_eval.get('non_target_asr', {})
+                clean_target_results = sabre_eval.get(
+                    'clean_target_rate', {})
+                attacker_id = int(
+                    self.latest_sabre_meta.get('client_id', -1))
+                if poison_results:
+                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
+                    logger.info(
+                        f"Server: Round {round_idx} SABRE ASR "
+                        f"(attacker {attacker_id}) "
+                        f"- {poison_str}")
+                    if non_target_results:
+                        non_target_str = ', '.join([
+                            f"{k}: {v:.4f}"
+                            for k, v in non_target_results.items()
+                        ])
+                        logger.info(
+                            f"Server: Round {round_idx} SABRE non-target ASR "
+                            f"(attacker {attacker_id}) "
+                            f"- {non_target_str}")
+                    if clean_target_results:
+                        clean_target_str = ', '.join([
+                            f"{k}: {v:.4f}"
+                            for k, v in clean_target_results.items()
+                        ])
+                        logger.info(
+                            f"Server: Round {round_idx} SABRE clean target rate "
+                            f"(target {int(self.latest_sabre_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
+                            f"- {clean_target_str}")
+                else:
+                    logger.info(
+                        f"Server: Round {round_idx} skipped SABRE ASR logging "
+                        f"because evaluation returned no results")
         # Aggregate and evaluate PromptFL if enabled
         if self.use_promptfl:
             self._aggregate_prompt(valid_params, total_samples)
@@ -3005,6 +3221,9 @@ class GGEURServer(Server):
     def _evaluate_trigger_target_rate(self,
                                       meta,
                                       structured=False,
+                                      additive=False,
+                                      image_clip_min=-3.0,
+                                      image_clip_max=3.0,
                                       invalid_log=None):
         if self.global_mlp is None or meta is None:
             return {}
@@ -3050,7 +3269,13 @@ class GGEURServer(Server):
                 for images, labels in dataloader:
                     images = images.to(self.device)
                     labels = labels.to(self.device).long()
-                    poisoned_images = trigger * mask + images * (1.0 - mask)
+                    if additive:
+                        poisoned_images = torch.clamp(
+                            images + trigger * mask,
+                            float(image_clip_min),
+                            float(image_clip_max))
+                    else:
+                        poisoned_images = trigger * mask + images * (1.0 - mask)
                     if self.feature_extractor_type == 'cnn':
                         clean_features = self.cnn_extractor(images)
                         poison_features = self.cnn_extractor(poisoned_images)
@@ -3122,6 +3347,17 @@ class GGEURServer(Server):
             cerberus_meta,
             structured=True,
             invalid_log="Server: CERBERUS metadata received but trigger/mask could not be restored")
+
+    def _evaluate_sabre_on_test_sets(self, sabre_meta=None):
+        if sabre_meta is None:
+            sabre_meta = self.latest_sabre_meta
+        return self._evaluate_trigger_target_rate(
+            sabre_meta,
+            structured=True,
+            additive=True,
+            image_clip_min=getattr(self.sabre_cfg, 'image_clip_min', -3.0),
+            image_clip_max=getattr(self.sabre_cfg, 'image_clip_max', 3.0),
+            invalid_log="Server: SABRE metadata received but trigger/mask could not be restored")
 
     @staticmethod
     def _sizeof_content(content) -> int:
