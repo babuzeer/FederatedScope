@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from federatedscope.attack.auxiliary.a3fl_utils import \
-    parse_attacker_ids, should_a3fl_attack
+    get_a3fl_start_round, parse_attacker_ids, should_a3fl_attack
 from federatedscope.core.message import Message, b64serializer
 from federatedscope.core.auxiliaries.utils import param2tensor
 from federatedscope.core.workers import Client
@@ -272,6 +272,35 @@ class GGEURClient(Client):
             'client_id': int(self.ID)
         }
 
+        # ===== Label-flipping Data Poisoning Mode =====
+        # Ported from doc/DataPoisoning_FL: malicious clients replace local
+        # class labels before local training. In GGEUR, the poisoned labels can
+        # optionally affect both the feature statistics/augmentation stage and
+        # the per-round augmented-feature training stage.
+        self.label_flip_enabled = attack_method in (
+            'label_flip', 'label_flipping', 'data_poisoning')
+        self.label_flip_cfg = getattr(config.attack, 'label_flip', None)
+        self.label_flip_attacker_ids = set(
+            parse_attacker_ids(config.attack.attacker_id))
+        self.label_flip_is_attacker = (
+            self.label_flip_enabled and self.ID in self.label_flip_attacker_ids)
+        self.label_flip_feature_flip_count = 0
+        self.label_flip_latest_meta = {
+            'active': False,
+            'client_id': int(self.ID)
+        }
+
+        # ===== A Little Is Enough / ALIE Model-Poisoning Mode =====
+        # The coordinated parameter rewrite is applied by the GGEUR server
+        # just before aggregation, where same-round attacker statistics are
+        # available. The client tracks identity for cache metadata and logging.
+        self.lie_enabled = attack_method in (
+            'little_is_enough', 'lie', 'alie')
+        self.lie_cfg = getattr(config.attack, 'little_is_enough', None)
+        self.lie_attacker_ids = set(parse_attacker_ids(config.attack.attacker_id))
+        self.lie_is_attacker = (
+            self.lie_enabled and self.ID in self.lie_attacker_ids)
+
     def _register_default_handlers(self):
         """Register message handlers"""
         super()._register_default_handlers()
@@ -342,6 +371,192 @@ class GGEURClient(Client):
         if isinstance(dataset, Subset):
             return dataset.dataset, list(dataset.indices)
         return dataset, list(range(len(dataset)))
+
+    def _is_label_flip_active_round(self, round_idx):
+        if not self.label_flip_enabled or self.label_flip_cfg is None:
+            return False
+
+        start_round = int(getattr(
+            self.label_flip_cfg, 'start_round',
+            getattr(self._cfg.attack, 'inject_round', 0)))
+        if start_round < 0:
+            start_round = int(getattr(self._cfg.attack, 'inject_round', 0))
+        if int(round_idx) < start_round:
+            return False
+
+        poison_epochs = int(getattr(self.label_flip_cfg, 'poison_epochs', 0))
+        if poison_epochs <= 0:
+            return True
+        return int(round_idx) < start_round + poison_epochs
+
+    def _should_label_flip_attack(self, round_idx):
+        return (
+            self.label_flip_enabled and self.label_flip_is_attacker and
+            self._is_label_flip_active_round(round_idx)
+        )
+
+    def _get_label_flip_target_label(self):
+        target = int(getattr(
+            self.label_flip_cfg, 'target_label_ind',
+            getattr(self._cfg.attack, 'target_label_ind', -1)))
+        if target < 0:
+            target = int(getattr(self._cfg.attack, 'target_label_ind', -1))
+        return target
+
+    def _get_label_flip_pairs(self):
+        if self.label_flip_cfg is None:
+            return []
+
+        pairs = []
+        raw_pairs = getattr(self.label_flip_cfg, 'replacement_pairs', [])
+        if raw_pairs:
+            for pair in raw_pairs:
+                if pair is None or len(pair) != 2:
+                    continue
+                source, target = int(pair[0]), int(pair[1])
+                if source >= 0 and target >= 0 and source != target:
+                    pairs.append((source, target))
+
+        if pairs:
+            return pairs
+
+        source = getattr(self.label_flip_cfg, 'source_label_ind', -1)
+        target = self._get_label_flip_target_label()
+        if target < 0:
+            return []
+
+        if isinstance(source, (list, tuple)):
+            for item in source:
+                src = int(item)
+                if src >= 0 and src != target:
+                    pairs.append((src, target))
+        else:
+            source = int(source)
+            if source >= 0 and source != target:
+                pairs.append((source, target))
+
+        return pairs
+
+    def _apply_label_flip_to_numpy_labels(self, labels, round_idx, context):
+        arr = np.asarray(labels).copy()
+        if arr.size == 0 or not self._should_label_flip_attack(round_idx):
+            return arr, 0, {}
+
+        target_label = self._get_label_flip_target_label()
+        all_to_target = bool(
+            getattr(self.label_flip_cfg, 'all_to_target', False))
+        replacement_targets = arr.copy()
+        eligible = np.zeros(arr.shape, dtype=bool)
+
+        if all_to_target and target_label >= 0:
+            eligible = arr != target_label
+            replacement_targets[eligible] = target_label
+        else:
+            for source, target in self._get_label_flip_pairs():
+                mask = arr == source
+                if not mask.any():
+                    continue
+                replacement_targets[mask] = target
+                eligible |= mask
+
+        eligible_indices = np.flatnonzero(eligible.reshape(-1))
+        if eligible_indices.size == 0:
+            return arr, 0, {}
+
+        poison_ratio = float(getattr(
+            self.label_flip_cfg, 'poison_ratio',
+            getattr(self._cfg.attack, 'poison_ratio', 1.0)))
+        poison_ratio = max(0.0, min(1.0, poison_ratio))
+        if poison_ratio <= 0.0:
+            return arr, 0, {}
+
+        selected = eligible_indices
+        if poison_ratio < 1.0:
+            poison_num = max(1, int(round(eligible_indices.size *
+                                          poison_ratio)))
+            seed = int(getattr(self._cfg, 'seed', 0))
+            context_offset = sum(ord(ch) for ch in str(context))
+            rng = np.random.RandomState(
+                seed + int(round_idx) * 1009 + int(self.ID) * 9173 +
+                context_offset)
+            selected = rng.choice(eligible_indices,
+                                  size=min(poison_num, eligible_indices.size),
+                                  replace=False)
+
+        flat_arr = arr.reshape(-1)
+        flat_targets = replacement_targets.reshape(-1)
+        flat_arr[selected] = flat_targets[selected]
+
+        actual_counts = {}
+        original_flat = np.asarray(labels).reshape(-1)
+        for idx in selected:
+            key = f'{int(original_flat[idx])}->{int(flat_targets[idx])}'
+            actual_counts[key] = actual_counts.get(key, 0) + 1
+
+        return arr, int(len(selected)), actual_counts
+
+    def _apply_label_flip_to_tensor_labels(self, labels, round_idx, context):
+        if not isinstance(labels, torch.Tensor):
+            flipped, _, _ = self._apply_label_flip_to_numpy_labels(
+                labels, round_idx, context)
+            return flipped
+
+        flipped, _, _ = self._apply_label_flip_to_numpy_labels(
+            labels.detach().cpu().numpy(), round_idx, context)
+        return torch.as_tensor(flipped, dtype=labels.dtype,
+                               device=labels.device)
+
+    def _label_flip_label_for_statistics(self, label):
+        if not bool(getattr(self.label_flip_cfg, 'poison_statistics', True)):
+            return int(label)
+        flipped, count, _ = self._apply_label_flip_to_numpy_labels(
+            np.asarray([int(label)]), self.state, 'statistics')
+        self.label_flip_feature_flip_count += int(count)
+        return int(flipped[0])
+
+    def _apply_label_flip_to_augmented_data(self, round_idx):
+        if not self.label_flip_enabled:
+            return
+        active = self._should_label_flip_attack(round_idx)
+        self.label_flip_latest_meta = {
+            'active': bool(active),
+            'client_id': int(self.ID),
+            'round': int(round_idx),
+            'poison_ratio': float(getattr(
+                self.label_flip_cfg, 'poison_ratio',
+                getattr(self._cfg.attack, 'poison_ratio', 1.0))),
+            'poison_statistics': bool(getattr(
+                self.label_flip_cfg, 'poison_statistics', True)),
+            'poison_training': bool(getattr(
+                self.label_flip_cfg, 'poison_training', True)),
+        }
+        if not bool(getattr(self.label_flip_cfg, 'poison_training', True)):
+            return
+
+        self._restore_base_augmented_dataset()
+        if not active or self.augmented_labels is None:
+            return
+
+        flipped_labels, flipped_count, counts = \
+            self._apply_label_flip_to_numpy_labels(
+                self.augmented_labels, round_idx, 'augmented_training')
+        self.augmented_labels = flipped_labels.astype(
+            np.asarray(self.augmented_labels).dtype, copy=False)
+        dataset = AugmentedFeatureDataset(self.augmented_features,
+                                          self.augmented_labels)
+        self.augmented_loader = DataLoader(
+            dataset,
+            batch_size=self._cfg.dataloader.batch_size,
+            shuffle=True)
+        self.label_flip_latest_meta.update({
+            'flipped_samples': int(flipped_count),
+            'replacement_counts': counts,
+            'target_label': int(self._get_label_flip_target_label()),
+        })
+        logger.info(
+            f"Client {self.ID}: Label-flip poisoning active in round "
+            f"{int(round_idx)} - flipped {int(flipped_count)} augmented "
+            f"labels ({counts})")
 
     def _ensure_a3fl_trigger(self, sample_image):
         if self.a3fl_trigger is not None and self.a3fl_mask is not None:
@@ -680,6 +895,38 @@ class GGEURClient(Client):
                 f"feature_shift_l2={debug_metrics['feature_shift_l2']:.4f}")
         return processed_batches > 0
 
+    def _should_update_a3fl_trigger(self, round_idx):
+        if self.a3fl_trigger is None or self.a3fl_mask is None:
+            return True
+
+        update_interval = max(
+            1, int(getattr(self.a3fl_cfg, 'trigger_update_interval', 1)))
+        start_round = get_a3fl_start_round(self._cfg)
+        active_offset = int(round_idx) - int(start_round)
+        return active_offset % update_interval == 0
+
+    def _get_a3fl_trigger_update_interval(self):
+        return max(
+            1, int(getattr(self.a3fl_cfg, 'trigger_update_interval', 1)))
+
+    def _train_a3fl_on_augmented_data(self):
+        train_epochs = int(getattr(self.a3fl_cfg, 'poison_train_epochs', 0))
+        if train_epochs <= 0:
+            train_epochs = int(self._cfg.train.local_update_steps)
+        train_epochs = max(1, train_epochs)
+
+        train_lr = float(getattr(self.a3fl_cfg, 'poison_train_lr', 0.0))
+        if train_lr <= 0:
+            train_lr = float(self._cfg.train.optimizer.lr)
+
+        self.a3fl_latest_meta.update({
+            'poison_train_epochs': int(train_epochs),
+            'poison_train_lr': float(train_lr),
+        })
+        return self._train_on_augmented_data(local_epochs=train_epochs,
+                                             lr=train_lr,
+                                             log_prefix='A3FL train')
+
     def _restore_base_augmented_dataset(self):
         if self.base_augmented_features is None or self.base_augmented_labels is None:
             return
@@ -707,8 +954,21 @@ class GGEURClient(Client):
         if not active:
             return
 
-        if not self._run_a3fl_trigger_search():
-            return
+        trigger_update_interval = self._get_a3fl_trigger_update_interval()
+        optimize_trigger = self._should_update_a3fl_trigger(round_idx)
+        self.a3fl_latest_meta.update({
+            'trigger_update_interval': int(trigger_update_interval),
+            'trigger_optimized': bool(optimize_trigger),
+        })
+        if optimize_trigger:
+            if not self._run_a3fl_trigger_search():
+                self.a3fl_latest_meta['active'] = False
+                self.a3fl_latest_meta['trigger_optimized'] = False
+                return
+        else:
+            logger.info(
+                f"Client {self.ID}: Reusing A3FL trigger in round {round_idx}; "
+                f"optimization interval={trigger_update_interval}")
 
         base_dataset, subset_indices = self._get_train_dataset_base()
         if base_dataset is None or not subset_indices:
@@ -826,6 +1086,19 @@ class GGEURClient(Client):
             self._is_cerberus_active_round(round_idx)
         )
 
+    def _get_cerberus_trigger_update_interval(self):
+        return max(
+            1, int(getattr(self.cerberus_cfg, 'trigger_update_interval', 1)))
+
+    def _should_update_cerberus_trigger(self, round_idx):
+        if self.cerberus_trigger is None or self.cerberus_mask is None:
+            return True
+
+        update_interval = self._get_cerberus_trigger_update_interval()
+        start_round = self._get_cerberus_start_round()
+        active_offset = int(round_idx) - int(start_round)
+        return active_offset % update_interval == 0
+
     def _get_cerberus_pattern(self, height, width):
         pattern = getattr(self.cerberus_cfg, 'poison_pattern', None)
         if pattern:
@@ -889,6 +1162,19 @@ class GGEURClient(Client):
             self.sabre_is_attacker and
             self._is_sabre_active_round(round_idx)
         )
+
+    def _get_sabre_trigger_update_interval(self):
+        return max(
+            1, int(getattr(self.sabre_cfg, 'trigger_update_interval', 1)))
+
+    def _should_update_sabre_trigger(self, round_idx):
+        if self.sabre_trigger is None or self.sabre_mask is None:
+            return True
+
+        update_interval = self._get_sabre_trigger_update_interval()
+        start_round = self._get_sabre_start_round()
+        active_offset = int(round_idx) - int(start_round)
+        return active_offset % update_interval == 0
 
     def _ensure_sabre_trigger(self, sample_image):
         if self.sabre_trigger is not None and self.sabre_mask is not None:
@@ -1190,8 +1476,21 @@ class GGEURClient(Client):
         self._load_feature_extractor()
         first_image, _ = base_dataset[selected_indices[0]]
         self._ensure_cerberus_trigger(first_image.to(self.device))
-        self._optimize_cerberus_trigger(base_dataset, selected_indices,
-                                        round_idx)
+        trigger_update_interval = \
+            self._get_cerberus_trigger_update_interval()
+        optimize_trigger = self._should_update_cerberus_trigger(round_idx)
+        self.cerberus_latest_meta.update({
+            'trigger_update_interval': int(trigger_update_interval),
+            'trigger_optimized': bool(optimize_trigger),
+        })
+        if optimize_trigger:
+            self._optimize_cerberus_trigger(base_dataset, selected_indices,
+                                            round_idx)
+        else:
+            logger.info(
+                f"Client {self.ID}: Reusing CERBERUS trigger in round "
+                f"{round_idx}; optimization interval="
+                f"{trigger_update_interval}")
         self.cerberus_latest_meta.update({
             'trigger': self.cerberus_trigger.detach().cpu(),
             'mask': self.cerberus_mask.detach().cpu(),
@@ -1930,7 +2229,20 @@ class GGEURClient(Client):
         self._load_feature_extractor()
         first_image, _ = base_dataset[selected_indices[0]]
         self._ensure_sabre_trigger(first_image.to(self.device))
-        self._optimize_sabre_trigger(base_dataset, selected_indices, round_idx)
+        trigger_update_interval = self._get_sabre_trigger_update_interval()
+        optimize_trigger = self._should_update_sabre_trigger(round_idx)
+        self.sabre_latest_meta.update({
+            'trigger_update_interval': int(trigger_update_interval),
+            'trigger_optimized': bool(optimize_trigger),
+        })
+        if optimize_trigger:
+            self._optimize_sabre_trigger(base_dataset, selected_indices,
+                                         round_idx)
+        else:
+            logger.info(
+                f"Client {self.ID}: Reusing SABRE trigger in round "
+                f"{round_idx}; optimization interval="
+                f"{trigger_update_interval}")
         self.sabre_latest_meta.update({
             'trigger': self.sabre_trigger.detach().cpu(),
             'mask': self.sabre_mask.detach().cpu(),
@@ -2553,6 +2865,7 @@ class GGEURClient(Client):
 
         self.local_features = {}
         self.local_labels = {}
+        self.label_flip_feature_flip_count = 0
 
         # QPS tracking
         _qps_samples = 0
@@ -2591,7 +2904,7 @@ class GGEURClient(Client):
                         indices_to_extract.append(local_idx)
                         base_indices_to_extract.append(base_idx)
                         continue
-                    label = int(label)
+                    label = self._label_flip_label_for_statistics(label)
                     if label not in self.local_features:
                         self.local_features[label] = []
                         self.local_labels[label] = []
@@ -2651,7 +2964,7 @@ class GGEURClient(Client):
                             cache_updated = True
 
                             # Add to local features
-                            label = int(label)
+                            label = self._label_flip_label_for_statistics(label)
                             if label not in self.local_features:
                                 self.local_features[label] = []
                                 self.local_labels[label] = []
@@ -2694,6 +3007,13 @@ class GGEURClient(Client):
                     _qps_time += time.time() - _t0
                     features = features.cpu().numpy()
                     labels = labels.cpu().numpy()
+                    if bool(getattr(self.label_flip_cfg,
+                                    'poison_statistics', True)):
+                        labels, flipped_count, _ = \
+                            self._apply_label_flip_to_numpy_labels(
+                                labels, self.state, 'statistics')
+                        self.label_flip_feature_flip_count += int(
+                            flipped_count)
 
                     for feat, label in zip(features, labels):
                         if not self._is_valid_feature_vector(feat):
@@ -2718,6 +3038,11 @@ class GGEURClient(Client):
             qps = _qps_samples / _qps_time
             logger.info(f"Client {self.ID}: Feature extraction QPS={qps:.1f} img/s "
                         f"({_qps_samples} samples in {_qps_time:.2f}s)")
+        if self.label_flip_enabled:
+            logger.info(
+                f"Client {self.ID}: Label-flip statistics poisoning "
+                f"flipped {self.label_flip_feature_flip_count} labels "
+                f"(active={self._should_label_flip_attack(self.state)})")
         logger.info(f"Client {self.ID}: Extracted {total_samples} {extractor_name} features from {len(self.local_features)} classes")
 
     def _extract_clip_features(self):
@@ -3315,6 +3640,40 @@ class GGEURClient(Client):
                 int(self.ggeur_cfg.num_generated_per_prototype),
             'target_size_per_class':
                 int(self.ggeur_cfg.target_size_per_class),
+            'label_flip_enabled': bool(self.label_flip_enabled),
+            'label_flip_is_attacker': bool(self.label_flip_is_attacker),
+            'label_flip_source_label_ind':
+                getattr(self.label_flip_cfg, 'source_label_ind', -1),
+            'label_flip_target_label_ind':
+                self._get_label_flip_target_label()
+                if self.label_flip_enabled else -1,
+            'label_flip_replacement_pairs': list(getattr(
+                self.label_flip_cfg, 'replacement_pairs', [])),
+            'label_flip_all_to_target': bool(getattr(
+                self.label_flip_cfg, 'all_to_target', False)),
+            'label_flip_poison_ratio': float(getattr(
+                self.label_flip_cfg, 'poison_ratio',
+                getattr(self._cfg.attack, 'poison_ratio', 1.0))),
+            'label_flip_start_round': int(getattr(
+                self.label_flip_cfg, 'start_round', -1)),
+            'label_flip_poison_epochs': int(getattr(
+                self.label_flip_cfg, 'poison_epochs', 0)),
+            'label_flip_poison_statistics': bool(getattr(
+                self.label_flip_cfg, 'poison_statistics', True)),
+            'label_flip_poison_training': bool(getattr(
+                self.label_flip_cfg, 'poison_training', True)),
+            'little_is_enough_enabled': bool(self.lie_enabled),
+            'little_is_enough_is_attacker': bool(self.lie_is_attacker),
+            'little_is_enough_z': float(getattr(
+                self.lie_cfg, 'z', 1.0)) if self.lie_enabled else 1.0,
+            'little_is_enough_auto_z': bool(getattr(
+                self.lie_cfg, 'auto_z', False)) if self.lie_enabled else False,
+            'little_is_enough_direction': str(getattr(
+                self.lie_cfg, 'direction', 'positive'))
+                if self.lie_enabled else 'positive',
+            'little_is_enough_stats_source': str(getattr(
+                self.lie_cfg, 'stats_source', 'attacker'))
+                if self.lie_enabled else 'attacker',
             'headonly_cache_version':
                 str(getattr(self.ggeur_cfg, 'headonly_cache_version',
                             'fcache_v1')),
@@ -3591,6 +3950,10 @@ class GGEURClient(Client):
         # Apply A3FL poisoning on the GGEUR augmented feature training set.
         self._inject_a3fl_poison_features(round_idx)
 
+        # Apply label-flipping data poisoning on this client's augmented local
+        # labels before the normal MLP-head training step.
+        self._apply_label_flip_to_augmented_data(round_idx)
+
         # Train MLP on augmented features
         if self._should_cerberus_attack(round_idx):
             logger.info(
@@ -3623,8 +3986,13 @@ class GGEURClient(Client):
                 'client_id': int(self.ID),
                 'round': int(round_idx),
             }
-            mlp_sample_size, mlp_model_para, mlp_results = \
-                self._train_on_augmented_data()
+            if self.a3fl_enabled and self.a3fl_latest_meta.get('active',
+                                                               False):
+                mlp_sample_size, mlp_model_para, mlp_results = \
+                    self._train_a3fl_on_augmented_data()
+            else:
+                mlp_sample_size, mlp_model_para, mlp_results = \
+                    self._train_on_augmented_data()
         if self.a3fl_enabled and self.a3fl_latest_meta.get('active', False):
             mlp_model_para = self._strengthen_a3fl_mlp_update(
                 a3fl_global_mlp_state, mlp_model_para)
@@ -3712,6 +4080,16 @@ class GGEURClient(Client):
                     'sabre': copy.deepcopy(self.sabre_latest_meta)
                 }
 
+        if self.label_flip_enabled:
+            if isinstance(combined_para, dict) and 'mlp' in combined_para:
+                combined_para['label_flip'] = copy.deepcopy(
+                    self.label_flip_latest_meta)
+            else:
+                combined_para = {
+                    'mlp': combined_para,
+                    'label_flip': copy.deepcopy(self.label_flip_latest_meta)
+                }
+
         # PromptFL: train soft prompts on augmented features and attach to combined_para
         if self.use_promptfl:
             _, prompt_para, _ = self._train_prompt_on_augmented_data()
@@ -3758,8 +4136,14 @@ class GGEURClient(Client):
                 except Exception as e:
                     logger.debug(f"Client {self.ID}: Could not load classifier: {e}")
 
+            self._apply_label_flip_to_augmented_data(round_idx)
+
             # Train classifier on augmented features
             sample_size, model_para, results = self._train_on_augmented_data()
+            response_para = {'classifier': model_para}
+            if self.label_flip_enabled:
+                response_para['label_flip'] = copy.deepcopy(
+                    self.label_flip_latest_meta)
 
             # Send classifier parameters
             self.comm_manager.send(
@@ -3769,7 +4153,7 @@ class GGEURClient(Client):
                     receiver=[sender],
                     state=self.state,
                     timestamp=timestamp,
-                    content=(sample_size, {'classifier': model_para})
+                    content=(sample_size, response_para)
                 )
             )
 
@@ -4040,14 +4424,17 @@ class GGEURClient(Client):
 
         return total_samples, backbone_para, results
 
-    def _train_on_augmented_data(self):
+    def _train_on_augmented_data(self, local_epochs=None, lr=None,
+                                 log_prefix='Train'):
         """Train MLP classifier on augmented features with optional FedProto/FedProx regularization"""
         if self.augmented_loader is None or self.mlp_classifier is None:
             return 0, {}, {}
 
         self.mlp_classifier.train()
+        if lr is None:
+            lr = float(self._cfg.train.optimizer.lr)
         optimizer = torch.optim.Adam(self.mlp_classifier.parameters(),
-                                     lr=self._cfg.train.optimizer.lr)
+                                     lr=lr)
         criterion = nn.CrossEntropyLoss()
 
         # FedProx settings (proximal term to the received global model)
@@ -4104,7 +4491,9 @@ class GGEURClient(Client):
         total_correct = 0
         total_samples = 0
 
-        local_epochs = self._cfg.train.local_update_steps
+        if local_epochs is None:
+            local_epochs = self._cfg.train.local_update_steps
+        local_epochs = max(1, int(local_epochs))
 
         for epoch in range(local_epochs):
             for features, labels in self.augmented_loader:
@@ -4234,16 +4623,16 @@ class GGEURClient(Client):
         accuracy = total_correct / total_samples if total_samples > 0 else 0
 
         if use_fedproto:
-            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+            logger.info(f"Client {self.ID}: {log_prefix} loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
                        f"proto={avg_proto_loss:.4f}), accuracy={accuracy:.4f}")
         elif use_fedprox and fedprox_mu > 0:
-            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+            logger.info(f"Client {self.ID}: {log_prefix} loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
                        f"prox={avg_prox_loss:.4f}), accuracy={accuracy:.4f}")
         elif use_moon:
-            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
+            logger.info(f"Client {self.ID}: {log_prefix} loss={avg_loss:.4f} (CE={avg_ce_loss:.4f}, "
                        f"moon={avg_moon_loss:.4f}), accuracy={accuracy:.4f}")
         else:
-            logger.info(f"Client {self.ID}: Train loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
+            logger.info(f"Client {self.ID}: {log_prefix} loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
 
         # Get model parameters
         model_para = copy.deepcopy(self.mlp_classifier.state_dict())
@@ -4255,7 +4644,9 @@ class GGEURClient(Client):
             'train_prox_loss': avg_prox_loss,
             'train_moon_loss': avg_moon_loss,
             'train_acc': accuracy,
-            'train_total': total_samples
+            'train_total': total_samples,
+            'train_epochs': int(local_epochs),
+            'train_lr': float(lr)
         }
 
         return total_samples, model_para, results

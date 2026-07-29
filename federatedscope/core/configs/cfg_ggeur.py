@@ -110,7 +110,8 @@ def extend_ggeur_cfg(cfg):
 
     # ========== Server-side Defense Settings ==========
     # GGEUR-specific robust aggregation for MLP/head updates. Supported values:
-    # '', 'flame', 'foolsgold', 'multi_krum', 'trimmed_mean', 'align_ins'.
+    # '', 'flame', 'foolsgold', 'multi_krum', 'trimmed_mean', 'align_ins',
+    # 'mars', 'multi_metrics'.
     cfg.ggeur.defense_method = ''
     cfg.ggeur.flame_lambda_noise = 0.001
     cfg.ggeur.flame_weighted_avg = False
@@ -128,6 +129,25 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.align_ins_tau_s = 1.0
     cfg.ggeur.align_ins_topk = 0.3
     cfg.ggeur.align_ins_debug = False
+    # MARS: malignity-aware backdoor defense. It estimates backdoor energy
+    # from uploaded model parameters only, clusters concentrated BE with
+    # Wasserstein distance, and aggregates the trusted cluster.
+    cfg.ggeur.mars_top_factor = 5.0
+    cfg.ggeur.mars_epsilon = 0.03
+    cfg.ggeur.mars_max_iter = 20
+    cfg.ggeur.mars_min_clients = 2
+    cfg.ggeur.mars_bn_eps = 1e-5
+    cfg.ggeur.mars_cluster_selection = 'low_norm'
+    cfg.ggeur.mars_target_models = ['mlp', 'classifier', 'model']
+    cfg.ggeur.mars_debug = False
+    # Multi-metrics adaptive backdoor defense (ICCV 2023): score each client
+    # update with Manhattan, Euclidean and Cosine features, apply whitening as
+    # dynamic weighting, and aggregate the lowest-divergence updates.
+    cfg.ggeur.multi_metrics_keep_ratio = 0.5
+    cfg.ggeur.multi_metrics_min_clients = 4
+    cfg.ggeur.multi_metrics_cov_eps = 1e-6
+    cfg.ggeur.multi_metrics_target_models = ['mlp', 'classifier', 'model']
+    cfg.ggeur.multi_metrics_debug = False
 
     # ========== FedProto Integration Settings ==========
     # Whether to use FedProto-style prototype regularization during MLP training

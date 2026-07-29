@@ -17,6 +17,7 @@ import logging
 import copy
 import re
 import queue
+import math
 import base64
 import io
 import zlib
@@ -179,6 +180,18 @@ class GGEURServer(Server):
         self.sabre_cfg = getattr(config.attack, 'sabre', None)
         self.latest_sabre_meta = None
         self.sabre_shared_trigger = None
+        self.label_flip_enabled = attack_method in (
+            'label_flip', 'label_flipping', 'data_poisoning')
+        self.label_flip_cfg = getattr(config.attack, 'label_flip', None)
+        self.latest_label_flip_meta = None
+        self.lie_enabled = attack_method in (
+            'little_is_enough', 'lie', 'alie')
+        self.lie_cfg = getattr(config.attack, 'little_is_enough', None)
+        self.lie_attacker_ids = set(parse_attacker_ids(config.attack.attacker_id))
+        self.aggregate_benign_only = bool(getattr(
+            config.attack, 'aggregate_benign_only', False))
+        self.aggregate_benign_attacker_ids = set(parse_attacker_ids(
+            config.attack.attacker_id))
 
     def _is_cerberus_active_round(self, round_idx):
         if not self.cerberus_enabled or self.cerberus_cfg is None:
@@ -215,6 +228,310 @@ class GGEURServer(Server):
         if not self._is_sabre_active_round(round_idx):
             return []
         return parse_attacker_ids(self._cfg.attack.attacker_id)
+
+    def _is_label_flip_active_round(self, round_idx):
+        if not self.label_flip_enabled or self.label_flip_cfg is None:
+            return False
+        start_round = int(getattr(
+            self.label_flip_cfg, 'start_round',
+            getattr(self._cfg.attack, 'inject_round', 0)))
+        if start_round < 0:
+            start_round = int(getattr(self._cfg.attack, 'inject_round', 0))
+        if int(round_idx) < start_round:
+            return False
+        poison_epochs = int(getattr(self.label_flip_cfg, 'poison_epochs', 0))
+        if poison_epochs <= 0:
+            return True
+        return int(round_idx) < start_round + poison_epochs
+
+    def _get_label_flip_active_attacker_ids(self, round_idx):
+        if not self._is_label_flip_active_round(round_idx):
+            return []
+        return parse_attacker_ids(self._cfg.attack.attacker_id)
+
+    def _is_lie_active_round(self, round_idx):
+        if not self.lie_enabled or self.lie_cfg is None:
+            return False
+        start_round = int(getattr(
+            self.lie_cfg, 'start_round',
+            getattr(self._cfg.attack, 'inject_round', 0)))
+        if start_round < 0:
+            start_round = int(getattr(self._cfg.attack, 'inject_round', 0))
+        if int(round_idx) < start_round:
+            return False
+        poison_epochs = int(getattr(self.lie_cfg, 'poison_epochs', 0))
+        if poison_epochs <= 0:
+            return True
+        return int(round_idx) < start_round + poison_epochs
+
+    def _get_lie_active_attacker_ids(self, round_idx):
+        if not self._is_lie_active_round(round_idx):
+            return []
+        return parse_attacker_ids(self._cfg.attack.attacker_id)
+
+    def _filter_benign_updates_for_aggregation(self, valid_params, round_idx):
+        """Optionally drop configured malicious clients before aggregation."""
+        if not self.aggregate_benign_only:
+            return valid_params
+
+        attacker_ids = set(self.aggregate_benign_attacker_ids)
+        if not attacker_ids:
+            logger.warning(
+                "Server: aggregate_benign_only is enabled but "
+                "cfg.attack.attacker_id is empty; keeping all updates")
+            return valid_params
+
+        kept_params = []
+        dropped_ids = []
+        for sample_size, params, sender in valid_params:
+            try:
+                sender_id = int(sender)
+            except (TypeError, ValueError):
+                sender_id = None
+
+            if sender_id is not None and sender_id in attacker_ids:
+                dropped_ids.append(sender_id)
+                continue
+            kept_params.append((sample_size, params, sender))
+
+        if not dropped_ids:
+            logger.info(
+                f"Server: aggregate_benign_only enabled for round {round_idx}, "
+                "but no received update matched cfg.attack.attacker_id")
+            return valid_params
+
+        if not kept_params:
+            logger.warning(
+                f"Server: aggregate_benign_only would remove all valid updates "
+                f"in round {round_idx}; falling back to all updates")
+            return valid_params
+
+        logger.info(
+            f"Server: aggregate_benign_only dropped malicious client updates "
+            f"{sorted(set(dropped_ids))} in round {round_idx}; "
+            f"kept {len(kept_params)}/{len(valid_params)} updates")
+        return kept_params
+
+    def _filter_benign_statistics_for_aggregation(self):
+        """Optionally exclude malicious clients from statistics aggregation."""
+        if not self.aggregate_benign_only:
+            return self.local_statistics_buffer
+
+        attacker_ids = set(self.aggregate_benign_attacker_ids)
+        if not attacker_ids:
+            logger.warning(
+                "Server: aggregate_benign_only is enabled but "
+                "cfg.attack.attacker_id is empty; keeping all statistics")
+            return self.local_statistics_buffer
+
+        kept_stats = {}
+        dropped_ids = []
+        for client_id, client_stats in self.local_statistics_buffer.items():
+            try:
+                normalized_client_id = int(client_id)
+            except (TypeError, ValueError):
+                normalized_client_id = None
+
+            if normalized_client_id is not None and \
+                    normalized_client_id in attacker_ids:
+                dropped_ids.append(normalized_client_id)
+                continue
+            kept_stats[client_id] = client_stats
+
+        if not dropped_ids:
+            logger.info(
+                "Server: aggregate_benign_only enabled for statistics, "
+                "but no received statistics matched cfg.attack.attacker_id")
+            return self.local_statistics_buffer
+
+        if not kept_stats:
+            logger.warning(
+                "Server: aggregate_benign_only would remove all local "
+                "statistics; falling back to all statistics")
+            return self.local_statistics_buffer
+
+        logger.info(
+            "Server: aggregate_benign_only dropped malicious client "
+            f"statistics/prototypes {sorted(set(dropped_ids))}; "
+            f"kept {len(kept_stats)}/{len(self.local_statistics_buffer)} "
+            "statistics payloads")
+        return kept_stats
+
+    def _resolve_lie_z(self, n_workers, m_attackers):
+        cfg_z = float(getattr(self.lie_cfg, 'z', 1.0))
+        if not bool(getattr(self.lie_cfg, 'auto_z', False)):
+            return cfg_z
+
+        if n_workers <= 0 or m_attackers <= 0:
+            return cfg_z
+
+        seduced = math.floor(n_workers / 2 + 1) - m_attackers
+        seduced = max(0, seduced)
+        prob = (n_workers - seduced) / float(n_workers)
+        prob = min(max(prob, 1e-6), 1.0 - 1e-6)
+        try:
+            z_value = torch.distributions.Normal(0.0, 1.0).icdf(
+                torch.tensor(prob)).item()
+        except Exception as exc:
+            logger.debug(
+                f"Server: LIE auto_z failed ({exc}); using configured z={cfg_z}")
+            z_value = cfg_z
+
+        max_z = float(getattr(self.lie_cfg, 'max_z', 1.5))
+        if max_z > 0:
+            z_value = min(z_value, max_z)
+        return float(z_value)
+
+    def _lie_should_target_model(self, aggregation_name):
+        targets = getattr(self.lie_cfg, 'target_models', ['mlp', 'classifier'])
+        if isinstance(targets, str):
+            targets = [item.strip() for item in targets.split(',')]
+        targets = {str(item).lower() for item in targets}
+        return 'all' in targets or str(aggregation_name).lower() in targets
+
+    def _apply_little_is_enough_attack_to_params(self, valid_params,
+                                                 aggregation_name,
+                                                 base_params=None):
+        """Apply the A Little Is Enough parameter-poisoning transform.
+
+        This simulates coordinated malicious GGEUR clients after local training:
+        for each floating parameter dimension, replace every attacker update by
+        mu +/- z * sigma, where mu/sigma are estimated from the configured
+        source updates in the same round.
+        """
+        if not self.lie_enabled or self.lie_cfg is None:
+            return valid_params
+        if not self._is_lie_active_round(self.state):
+            return valid_params
+        if not self._lie_should_target_model(aggregation_name):
+            return valid_params
+
+        active_attackers = set(self._get_lie_active_attacker_ids(self.state))
+        if not active_attackers:
+            return valid_params
+
+        attacker_indices = [
+            idx for idx, (_, _, sender) in enumerate(valid_params)
+            if sender is not None and int(sender) in active_attackers
+        ]
+        min_attackers = int(getattr(self.lie_cfg, 'min_attackers', 1))
+        if len(attacker_indices) < max(1, min_attackers):
+            if bool(getattr(self.lie_cfg, 'log_detail', True)):
+                logger.info(
+                    f"Server: LIE skipped for {aggregation_name} in round "
+                    f"{self.state}; active attackers in valid updates="
+                    f"{len(attacker_indices)} < min_attackers={min_attackers}")
+            return valid_params
+
+        stats_source = str(getattr(self.lie_cfg, 'stats_source',
+                                   'attacker')).lower()
+        if stats_source in ('all', 'all_clients', 'valid'):
+            stats_indices = list(range(len(valid_params)))
+        else:
+            stats_indices = attacker_indices
+
+        if len(stats_indices) < 1:
+            return valid_params
+
+        z_value = self._resolve_lie_z(len(valid_params), len(attacker_indices))
+        direction = str(getattr(self.lie_cfg, 'direction', 'positive')).lower()
+        sign = -1.0 if direction in ('negative', 'minus', '-', 'lower') else 1.0
+        min_std = float(getattr(self.lie_cfg, 'min_std', 1e-6))
+
+        first_params = valid_params[0][1]
+        poisoned_state = {}
+        poisoned_keys = 0
+        sigma_sq_sum = 0.0
+        perturb_sq_sum = 0.0
+        poison_elem_count = 0
+
+        for key, value in first_params.items():
+            if isinstance(value, dict):
+                continue
+            first_tensor = self._to_param_tensor(value)
+            if first_tensor is None or not torch.is_floating_point(first_tensor):
+                continue
+
+            source_tensors = []
+            for idx in stats_indices:
+                params = valid_params[idx][1]
+                if key not in params or isinstance(params[key], dict):
+                    continue
+                tensor = self._to_param_tensor(params[key])
+                if tensor is None or not torch.is_floating_point(tensor):
+                    continue
+                source_tensors.append(tensor.detach().float().to(self.device))
+
+            if not source_tensors:
+                continue
+
+            stacked = torch.stack(source_tensors, dim=0)
+            mean_tensor = stacked.mean(dim=0)
+            if stacked.shape[0] > 1:
+                std_tensor = stacked.std(dim=0, unbiased=False)
+            else:
+                std_tensor = torch.zeros_like(mean_tensor)
+            if min_std > 0:
+                std_tensor = torch.clamp(std_tensor, min=min_std)
+
+            if direction in ('away_from_global', 'away', 'diverge') and \
+                    base_params is not None and key in base_params:
+                base_tensor = self._to_param_tensor(base_params[key])
+                if base_tensor is not None and torch.is_floating_point(
+                        base_tensor):
+                    base_tensor = base_tensor.detach().float().to(self.device)
+                    sign_tensor = torch.sign(mean_tensor - base_tensor)
+                    sign_tensor = torch.where(
+                        sign_tensor == 0,
+                        torch.ones_like(sign_tensor),
+                        sign_tensor)
+                    poisoned = mean_tensor + z_value * std_tensor * sign_tensor
+                else:
+                    poisoned = mean_tensor + sign * z_value * std_tensor
+            else:
+                poisoned = mean_tensor + sign * z_value * std_tensor
+            poisoned_state[key] = poisoned.to(
+                dtype=first_tensor.dtype,
+                device=first_tensor.device)
+            poisoned_keys += 1
+            if bool(getattr(self.lie_cfg, 'log_norms', True)):
+                sigma_sq_sum += float(torch.sum(std_tensor ** 2).item())
+                perturb_sq_sum += float(
+                    torch.sum((poisoned - mean_tensor) ** 2).item())
+                poison_elem_count += int(std_tensor.numel())
+
+        if not poisoned_state:
+            logger.warning(
+                f"Server: LIE found no floating parameters to poison for "
+                f"{aggregation_name} in round {self.state}")
+            return valid_params
+
+        poisoned_params = []
+        for idx, (sample_size, params, sender) in enumerate(valid_params):
+            if idx not in attacker_indices:
+                poisoned_params.append((sample_size, params, sender))
+                continue
+            replaced = copy.deepcopy(params)
+            for key, value in poisoned_state.items():
+                replaced[key] = value.detach().clone()
+            poisoned_params.append((sample_size, replaced, sender))
+
+        if bool(getattr(self.lie_cfg, 'log_detail', True)):
+            norm_msg = ''
+            if poison_elem_count > 0:
+                sigma_rms = math.sqrt(sigma_sq_sum / poison_elem_count)
+                perturb_rms = math.sqrt(perturb_sq_sum / poison_elem_count)
+                norm_msg = (
+                    f", sigma_rms={sigma_rms:.6g}, "
+                    f"perturb_rms={perturb_rms:.6g}")
+            logger.info(
+                f"Server: Applied LIE attack to {aggregation_name} in round "
+                f"{self.state}: attackers={len(attacker_indices)}/"
+                f"{len(valid_params)}, stats_source={stats_source}, "
+                f"z={z_value:.4f}, direction={direction}, "
+                f"poisoned_keys={poisoned_keys}{norm_msg}")
+
+        return poisoned_params
 
     def _attach_shared_trigger_payload(self, model_para, attack_name,
                                        shared_trigger):
@@ -929,15 +1246,18 @@ class GGEURServer(Server):
         # Check if all clients have uploaded statistics
         if len(self.local_statistics_buffer) >= self._client_num:
             logger.info(f"Server: Received statistics from all {self._client_num} clients")
+            statistics_for_aggregation = \
+                self._filter_benign_statistics_for_aggregation()
 
             # Aggregate covariance matrices
-            self._aggregate_covariances()
+            self._aggregate_covariances(statistics_for_aggregation)
 
             # Compute global prototypes (aggregated means for each class)
-            self._compute_global_prototypes()
+            self._compute_global_prototypes(statistics_for_aggregation)
 
             # Prepare other client prototypes for each client
-            other_prototypes = self._prepare_other_prototypes()
+            other_prototypes = self._prepare_other_prototypes(
+                statistics_for_aggregation)
 
             # Build global MLP
             # IMPORTANT: Use config's num_classes, not the number of classes in covariance matrices
@@ -1226,6 +1546,53 @@ class GGEURServer(Server):
             if len(receiver) == sample_num:
                 return receiver
 
+        if self.label_flip_enabled:
+            active_attackers = self._get_label_flip_active_attacker_ids(
+                self.state)
+            active_attackers = [
+                cid for cid in active_attackers if cid in all_clients
+            ]
+            if len(active_attackers) > sample_num:
+                active_attackers = np.random.choice(
+                    active_attackers, size=sample_num,
+                    replace=False).tolist()
+            benign_pool = [
+                cid for cid in all_clients if cid not in active_attackers
+            ]
+            benign_needed = max(0, sample_num - len(active_attackers))
+            if benign_needed > 0:
+                benign_selected = np.random.choice(
+                    benign_pool, size=benign_needed,
+                    replace=False).tolist()
+            else:
+                benign_selected = []
+            receiver = active_attackers + benign_selected
+            if len(receiver) == sample_num:
+                return receiver
+
+        if self.lie_enabled:
+            active_attackers = self._get_lie_active_attacker_ids(self.state)
+            active_attackers = [
+                cid for cid in active_attackers if cid in all_clients
+            ]
+            if len(active_attackers) > sample_num:
+                active_attackers = np.random.choice(
+                    active_attackers, size=sample_num,
+                    replace=False).tolist()
+            benign_pool = [
+                cid for cid in all_clients if cid not in active_attackers
+            ]
+            benign_needed = max(0, sample_num - len(active_attackers))
+            if benign_needed > 0:
+                benign_selected = np.random.choice(
+                    benign_pool, size=benign_needed,
+                    replace=False).tolist()
+            else:
+                benign_selected = []
+            receiver = active_attackers + benign_selected
+            if len(receiver) == sample_num:
+                return receiver
+
         return self.sampler.sample(size=sample_num)
 
     def _prepare_separated_training_params(self):
@@ -1338,13 +1705,14 @@ class GGEURServer(Server):
 
         return classifier
 
-    def _aggregate_covariances(self):
+    def _aggregate_covariances(self, statistics_buffer=None):
         """Aggregate covariance matrices using parallel axis theorem"""
         logger.info("Server: Aggregating covariance matrices...")
+        statistics_buffer = statistics_buffer or self.local_statistics_buffer
 
         # Collect all class indices
         all_classes = set()
-        for client_stats in self.local_statistics_buffer.values():
+        for client_stats in statistics_buffer.values():
             all_classes.update(client_stats['means'].keys())
 
         embedding_dim = self._get_embedding_dim()
@@ -1356,7 +1724,7 @@ class GGEURServer(Server):
             counts = []
 
             # Collect statistics for this class from all clients
-            for client_id, client_stats in self.local_statistics_buffer.items():
+            for client_id, client_stats in statistics_buffer.items():
                 mean = self._get_class_value(client_stats['means'], class_idx)
                 if mean is not None:
                     cov = self._get_class_value(client_stats['covs'],
@@ -1398,15 +1766,16 @@ class GGEURServer(Server):
 
         logger.info(f"Server: Aggregated covariances for {len(self.global_cov_matrices)} classes")
 
-    def _compute_global_prototypes(self):
+    def _compute_global_prototypes(self, statistics_buffer=None):
         """Compute global prototypes (weighted average of local means) for each class"""
         logger.info("Server: Computing global prototypes...")
+        statistics_buffer = statistics_buffer or self.local_statistics_buffer
 
         embedding_dim = self._get_embedding_dim()
 
         # Collect all class indices
         all_classes = set()
-        for client_stats in self.local_statistics_buffer.values():
+        for client_stats in statistics_buffer.values():
             all_classes.update(client_stats['means'].keys())
 
         for class_idx in all_classes:
@@ -1415,7 +1784,7 @@ class GGEURServer(Server):
             counts = []
 
             # Collect means for this class from all clients
-            for client_id, client_stats in self.local_statistics_buffer.items():
+            for client_id, client_stats in statistics_buffer.items():
                 mean = self._get_class_value(client_stats['means'], class_idx)
                 if mean is not None:
                     count = self._get_class_value(client_stats['counts'],
@@ -1447,16 +1816,18 @@ class GGEURServer(Server):
 
         logger.info(f"Server: Computed global prototypes for {len(self.global_prototypes)} classes")
 
-    def _prepare_other_prototypes(self):
+    def _prepare_other_prototypes(self, statistics_buffer=None):
         """Prepare prototypes from other clients for each client"""
         other_prototypes = {}
+        prototype_sources = statistics_buffer or self.local_statistics_buffer
 
         for client_id in self.all_prototypes.keys():
             other_prototypes[client_id] = {}
 
-            for other_client_id, prototypes in self.all_prototypes.items():
+            for other_client_id, client_stats in prototype_sources.items():
                 if other_client_id == client_id:
                     continue
+                prototypes = client_stats.get('prototypes', {})
 
                 for class_idx, prototype in prototypes.items():
                     class_idx = int(class_idx)
@@ -1590,13 +1961,10 @@ class GGEURServer(Server):
                 self._finish()
             return
 
-        # Compute sample weights
-        sample_sizes = [s for s, _, _ in valid_params]
-        total_samples = sum(sample_sizes)
-
         a3fl_updates = []
         cerberus_updates = []
         sabre_updates = []
+        label_flip_updates = []
         cleaned_valid_params = []
         for sample_size, params, sender in valid_params:
             cleaned_params = params
@@ -1627,6 +1995,11 @@ class GGEURServer(Server):
                 if 'mlp' not in params:
                     cleaned_params = copy.deepcopy(cleaned_params)
                     cleaned_params.pop('sabre', None)
+            if isinstance(params, dict) and 'label_flip' in params:
+                label_flip_updates.append(params.get('label_flip'))
+                if 'mlp' not in params:
+                    cleaned_params = copy.deepcopy(cleaned_params)
+                    cleaned_params.pop('label_flip', None)
             cleaned_valid_params.append((sample_size, cleaned_params, sender))
         valid_params = cleaned_valid_params
 
@@ -1668,6 +2041,36 @@ class GGEURServer(Server):
                 f"{len(sabre_updates)} SABRE metadata payloads, "
                 f"active={len(active_sabre)}, "
                 f"shared_trigger={'yes' if self.sabre_shared_trigger is not None else 'no'}")
+
+        active_label_flip = [
+            meta for meta in label_flip_updates
+            if isinstance(meta, dict) and meta.get('active', False)
+        ]
+        self.latest_label_flip_meta = (
+            active_label_flip[0] if active_label_flip else None)
+        if self.label_flip_enabled:
+            total_flipped = sum(
+                int(meta.get('flipped_samples', 0))
+                for meta in active_label_flip
+                if isinstance(meta, dict))
+            logger.info(
+                f"Server: Round {round_idx} received "
+                f"{len(label_flip_updates)} label-flip metadata payloads, "
+                f"active={len(active_label_flip)}, "
+                f"flipped_samples={total_flipped}")
+
+        valid_params = self._filter_benign_updates_for_aggregation(
+            valid_params, round_idx)
+        total_samples = sum(s for s, _, _ in valid_params)
+        if total_samples <= 0:
+            logger.warning(
+                "Server: No positive sample weights available for aggregation")
+            self.state = round_idx + 1
+            if self.state < self._total_round_num:
+                self._start_training_round()
+            else:
+                self._finish()
+            return
 
         # Handle separated training mode
         if self.use_separated_training:
@@ -2006,6 +2409,40 @@ class GGEURServer(Server):
         return ggeur_method in ('align_ins', 'alignins') or \
             agg_method in ('align_ins', 'alignins')
 
+    def _is_mars_enabled(self):
+        """Whether GGEUR should use MARS for server-side aggregation."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        return ggeur_method in ('mars', 'mars_defense') or \
+            agg_method in ('mars', 'mars_defense')
+
+    def _mars_should_target_model(self, aggregation_name):
+        targets = getattr(self.ggeur_cfg, 'mars_target_models',
+                          ['mlp', 'classifier', 'model'])
+        if isinstance(targets, str):
+            targets = [item.strip() for item in targets.split(',')]
+        targets = {str(item).lower() for item in targets}
+        return 'all' in targets or str(aggregation_name).lower() in targets
+
+    def _is_multi_metrics_enabled(self):
+        """Whether GGEUR should use multi-metrics adaptive defense."""
+        ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
+        agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
+                                 '')).lower() if hasattr(self._cfg, 'aggregator') else ''
+        aliases = ('multi_metrics', 'multi-metrics', 'multimetrics',
+                   'multi_metric',
+                   'multi_metrics_adaptive')
+        return ggeur_method in aliases or agg_method in aliases
+
+    def _multi_metrics_should_target_model(self, aggregation_name):
+        targets = getattr(self.ggeur_cfg, 'multi_metrics_target_models',
+                          ['mlp', 'classifier', 'model'])
+        if isinstance(targets, str):
+            targets = [item.strip() for item in targets.split(',')]
+        targets = {str(item).lower() for item in targets}
+        return 'all' in targets or str(aggregation_name).lower() in targets
+
     @staticmethod
     def _unpack_param_entry(entry):
         if len(entry) >= 3:
@@ -2048,6 +2485,35 @@ class GGEURServer(Server):
         if not isinstance(first_params, dict):
             logger.warning(f"Server: Expected dict for model params, got {type(first_params)}, skipping aggregation")
             return None
+
+        valid_params = self._apply_little_is_enough_attack_to_params(
+            valid_params, aggregation_name, base_params=base_params)
+        first_params = valid_params[0][1]
+
+        if self._is_mars_enabled() and \
+                self._mars_should_target_model(aggregation_name):
+            mars_result = self._mars_aggregate_model_params(
+                valid_params,
+                aggregation_name=aggregation_name)
+            if mars_result is not None:
+                return mars_result
+            logger.warning(
+                f"Server: MARS requested for {aggregation_name}, but no "
+                "usable CBE features were available; falling back to FedAvg")
+
+        if self._is_multi_metrics_enabled() and \
+                self._multi_metrics_should_target_model(aggregation_name):
+            if base_params is not None:
+                multi_metrics_result = self._multi_metrics_aggregate_model_params(
+                    valid_params,
+                    base_params,
+                    aggregation_name=aggregation_name)
+                if multi_metrics_result is not None:
+                    return multi_metrics_result
+            logger.warning(
+                f"Server: Multi-metrics requested for {aggregation_name}, "
+                "but no usable base parameters were available; falling back "
+                "to FedAvg")
 
         if self._is_flame_enabled():
             if base_params is not None:
@@ -2227,6 +2693,135 @@ class GGEURServer(Server):
                 if key not in aggregated_params:
                     aggregated_params[key] = value
         return aggregated_params
+
+    def _multi_metrics_aggregate_model_params(self,
+                                              valid_params,
+                                              base_params,
+                                              aggregation_name='model'):
+        """Multi-metrics adaptive aggregation for GGEUR state_dict payloads.
+
+        This follows Huang et al. (ICCV 2023): build each client feature from
+        Manhattan norm, Euclidean norm and Cosine similarity, whiten the
+        round-wise feature-distance indicators, discard high-divergence
+        clients, and FedAvg the retained updates.
+        """
+        min_clients = int(getattr(self.ggeur_cfg,
+                                  'multi_metrics_min_clients', 4))
+        min_clients = max(4, min_clients)
+        if len(valid_params) < min_clients:
+            logger.info(
+                f"Server: Multi-metrics for {aggregation_name} needs at "
+                f"least {min_clients} updates for whitening; using FedAvg "
+                "fallback")
+            return None
+
+        vector_info = self._collect_update_vectors(
+            valid_params,
+            base_params,
+            f"Multi-metrics {aggregation_name}")
+        if vector_info is None:
+            return None
+
+        update_tensor = vector_info['update_tensor'].float()
+        retained_valid_params = vector_info['retained_valid_params']
+        n_users = len(retained_valid_params)
+        if n_users < min_clients:
+            logger.info(
+                f"Server: Multi-metrics for {aggregation_name} has fewer "
+                f"than {min_clients} usable updates; using FedAvg fallback")
+            return None
+
+        eps = float(getattr(self.ggeur_cfg,
+                            'multi_metrics_cov_eps', 1e-6))
+        eps = max(eps, 1e-12)
+        base_vector = torch.cat([
+            vector_info['base_tensors'][key].reshape(-1)
+            for key in vector_info['vector_keys']
+        ]).to(self.device).float()
+        client_vectors = update_tensor + base_vector.view(1, -1)
+
+        manhattan = torch.norm(update_tensor, p=1, dim=1)
+        euclidean = torch.norm(update_tensor, p=2, dim=1)
+        base_norm = torch.norm(base_vector, p=2) + eps
+        client_norms = torch.norm(client_vectors, p=2, dim=1) + eps
+        cosine = torch.sum(client_vectors * base_vector.view(1, -1),
+                           dim=1) / (base_norm * client_norms)
+        features = torch.stack([manhattan, euclidean, cosine], dim=1)
+
+        indicators = torch.sum(
+            torch.abs(features.unsqueeze(1) - features.unsqueeze(0)),
+            dim=1)
+        cov = self._multi_metrics_covariance(indicators, eps)
+        inv_cov = torch.pinverse(cov)
+        raw_scores = torch.sum((indicators @ inv_cov) * indicators, dim=1)
+        scores = torch.sqrt(torch.clamp(raw_scores, min=0.0))
+        scores = torch.where(torch.isfinite(scores), scores,
+                             torch.full_like(scores, float('inf')))
+
+        keep_ratio = float(getattr(self.ggeur_cfg,
+                                   'multi_metrics_keep_ratio', 0.5))
+        keep_ratio = max(0.0, min(1.0, keep_ratio))
+        keep_num = int(math.ceil(n_users * keep_ratio))
+        keep_num = max(1, min(keep_num, n_users))
+        keep_indices = torch.topk(scores,
+                                  keep_num,
+                                  largest=False).indices
+        keep_indices_list = keep_indices.detach().cpu().tolist()
+        selected_params = [
+            retained_valid_params[idx] for idx in keep_indices_list
+        ]
+        selected_total_samples = sum(s for s, _, _ in selected_params)
+        if selected_total_samples <= 0:
+            return None
+
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+        kept_client_ids = [client_ids[idx] for idx in keep_indices_list]
+        logger.info(
+            f"Server: Multi-metrics {aggregation_name} client_ids={client_ids}, "
+            f"kept_client_ids={kept_client_ids}, keep_ratio={keep_ratio:.4f}, "
+            f"keep_num={keep_num}/{n_users}")
+
+        if bool(getattr(self.ggeur_cfg, 'multi_metrics_debug', False)):
+            self._log_multi_metrics_debug(
+                aggregation_name=aggregation_name,
+                client_ids=client_ids,
+                features=features,
+                indicators=indicators,
+                scores=scores,
+                kept_client_ids=kept_client_ids)
+
+        return self._fedavg_model_params_no_defense(
+            selected_params,
+            selected_total_samples)
+
+    @staticmethod
+    def _multi_metrics_covariance(features, eps):
+        centered = features - features.mean(dim=0, keepdim=True)
+        denom = max(int(features.shape[0]) - 1, 1)
+        cov = centered.T @ centered / float(denom)
+        eye = torch.eye(cov.shape[0], device=features.device, dtype=cov.dtype)
+        return cov + eps * eye
+
+    def _log_multi_metrics_debug(self,
+                                 aggregation_name,
+                                 client_ids,
+                                 features,
+                                 indicators,
+                                 scores,
+                                 kept_client_ids):
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        logger.info(
+            f"Server: Multi-metrics DEBUG {aggregation_name} "
+            f"client_ids={client_ids}, features={_round_list(features)}, "
+            f"indicators={_round_list(indicators)}, "
+            f"scores={_round_list(scores)}, "
+            f"kept_client_ids={kept_client_ids}")
 
     def _foolsgold_aggregate_model_params(self,
                                           valid_params,
@@ -2966,6 +3561,270 @@ class GGEURServer(Server):
             f"selected={good_indices}")
         return good_indices
 
+    def _mars_aggregate_model_params(self,
+                                     valid_params,
+                                     aggregation_name='model'):
+        """MARS aggregation adapted to GGEUR state_dict payloads.
+
+        MARS estimates neuron-level backdoor energy from model weights only,
+        concentrates the largest per-layer BE values into CBE vectors, clusters
+        CBEs with a 1-D Wasserstein K-Means variant, and FedAvg-aggregates the
+        trusted cluster.
+        """
+        min_clients = int(getattr(self.ggeur_cfg, 'mars_min_clients', 2))
+        if len(valid_params) < max(2, min_clients):
+            logger.info(
+                f"Server: MARS for {aggregation_name} needs at least "
+                f"{max(2, min_clients)} updates; using FedAvg fallback")
+            return None
+
+        cbe_vectors = []
+        retained_valid_params = []
+        for sample_size, params, sender in valid_params:
+            cbe = self._mars_extract_cbe(params)
+            if cbe is None or cbe.numel() == 0:
+                continue
+            cbe_vectors.append(cbe.detach().cpu().float())
+            retained_valid_params.append((sample_size, params, sender))
+
+        if len(retained_valid_params) < max(2, min_clients):
+            logger.info(
+                f"Server: MARS for {aggregation_name} found fewer than "
+                f"{max(2, min_clients)} usable CBE vectors; using FedAvg fallback")
+            return None
+
+        min_len = min(int(vec.numel()) for vec in cbe_vectors)
+        if min_len <= 0:
+            return None
+        if any(int(vec.numel()) != min_len for vec in cbe_vectors):
+            logger.warning(
+                f"Server: MARS {aggregation_name} received variable CBE "
+                f"lengths; truncating to min_len={min_len}")
+        cbe_tensor = torch.stack([
+            torch.sort(vec.reshape(-1)[:min_len].float())[0]
+            for vec in cbe_vectors
+        ], dim=0).to(self.device)
+
+        selected_indices, labels, centers, center_distance = \
+            self._mars_select_trusted_indices(cbe_tensor, aggregation_name)
+        if selected_indices is None:
+            return None
+        if not selected_indices:
+            logger.warning(
+                f"Server: MARS {aggregation_name} selected no updates; "
+                "using all usable updates")
+            selected_indices = list(range(len(retained_valid_params)))
+
+        selected_params = [retained_valid_params[i] for i in selected_indices]
+        selected_total_samples = sum(s for s, _, _ in selected_params)
+        if selected_total_samples <= 0:
+            return None
+
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+        selected_client_ids = [client_ids[i] for i in selected_indices]
+        center_norms = [
+            float(torch.norm(center, p=1).item()) for center in centers
+        ] if centers is not None else []
+        logger.info(
+            f"Server: MARS {aggregation_name} client_ids={client_ids}, "
+            f"labels={labels}, center_distance={center_distance:.6f}, "
+            f"center_l1_norms={center_norms}, "
+            f"selected_client_ids={selected_client_ids}")
+
+        if bool(getattr(self.ggeur_cfg, 'mars_debug', False)):
+            self._log_mars_debug(aggregation_name, cbe_tensor, client_ids,
+                                 labels, centers, selected_client_ids)
+
+        return self._fedavg_model_params_no_defense(
+            selected_params,
+            selected_total_samples)
+
+    def _mars_extract_cbe(self, params):
+        top_factor = float(getattr(self.ggeur_cfg, 'mars_top_factor', 5.0))
+        top_factor = max(0.0, min(top_factor, 100.0))
+        layer_energies = self._mars_get_layer_backdoor_energies(params)
+        cbe_parts = []
+
+        for energy in layer_energies:
+            if energy is None or energy.numel() == 0:
+                continue
+            energy = energy.reshape(-1).float()
+            energy = energy[torch.isfinite(energy)]
+            if energy.numel() == 0:
+                continue
+            top_k = int(math.ceil(float(energy.numel()) * top_factor / 100.0))
+            top_k = max(1, min(top_k, int(energy.numel())))
+            cbe_parts.append(torch.topk(energy, top_k, largest=True).values)
+
+        if not cbe_parts:
+            return None
+        return torch.cat(cbe_parts, dim=0)
+
+    def _mars_get_layer_backdoor_energies(self, params):
+        bn_eps = float(getattr(self.ggeur_cfg, 'mars_bn_eps', 1e-5))
+        energies = []
+
+        for key, value in params.items():
+            if isinstance(value, dict):
+                continue
+            tensor = self._to_param_tensor(value)
+            if tensor is None or not torch.is_floating_point(tensor):
+                continue
+            tensor = tensor.detach().float().cpu()
+
+            if tensor.dim() >= 2:
+                # For Linear and Conv weights, each output row/channel is one
+                # neuron/channel. Its row/filter norm approximates the
+                # neuron-wise Lipschitz constant used by MARS.
+                energies.append(tensor.reshape(tensor.shape[0], -1).norm(
+                    p=2, dim=1))
+                continue
+
+            if tensor.dim() == 1 and key.endswith('weight'):
+                running_var_key = key[:-len('weight')] + 'running_var'
+                running_var = params.get(running_var_key, None)
+                running_var_tensor = self._to_param_tensor(running_var) \
+                    if running_var is not None else None
+                if running_var_tensor is not None and \
+                        torch.is_floating_point(running_var_tensor) and \
+                        running_var_tensor.numel() == tensor.numel():
+                    bn_scale = tensor.abs() / torch.sqrt(
+                        running_var_tensor.detach().float().cpu() + bn_eps)
+                    energies.append(bn_scale)
+
+        return energies
+
+    def _mars_select_trusted_indices(self, cbe_tensor, aggregation_name):
+        n_clients = int(cbe_tensor.shape[0])
+        if n_clients < 2:
+            return None, None, None, 0.0
+
+        labels, centers = self._mars_kwmeans(cbe_tensor, aggregation_name)
+        if labels is None or centers is None:
+            return None, None, None, 0.0
+
+        epsilon = float(getattr(self.ggeur_cfg, 'mars_epsilon', 0.03))
+        center_distance = float(
+            self._mars_wasserstein_distance(centers[0], centers[1]).item())
+        if center_distance < epsilon:
+            return list(range(n_clients)), labels.detach().cpu().tolist(), \
+                centers, center_distance
+
+        cluster_selection = str(getattr(
+            self.ggeur_cfg, 'mars_cluster_selection', 'low_norm')).lower()
+        cluster_sizes = [
+            int(torch.sum(labels == cluster_idx).item())
+            for cluster_idx in range(2)
+        ]
+        center_norms = [
+            float(torch.norm(centers[cluster_idx], p=1).item())
+            for cluster_idx in range(2)
+        ]
+
+        if cluster_selection in ('majority', 'largest'):
+            trusted_label = 0 if cluster_sizes[0] >= cluster_sizes[1] else 1
+        else:
+            trusted_label = 0 if center_norms[0] <= center_norms[1] else 1
+
+        selected = torch.nonzero(labels == trusted_label,
+                                 as_tuple=False).view(-1).detach().cpu()
+        return selected.tolist(), labels.detach().cpu().tolist(), centers, \
+            center_distance
+
+    def _mars_kwmeans(self, cbe_tensor, aggregation_name):
+        max_iter = int(getattr(self.ggeur_cfg, 'mars_max_iter', 20))
+        max_iter = max(1, max_iter)
+
+        norms = torch.norm(cbe_tensor, p=1, dim=1)
+        low_idx = int(torch.argmin(norms).item())
+        high_idx = int(torch.argmax(norms).item())
+        if low_idx == high_idx:
+            logger.info(
+                f"Server: MARS {aggregation_name} CBE norms are identical; "
+                "treating all clients as trusted")
+            labels = torch.zeros(cbe_tensor.shape[0],
+                                 dtype=torch.long,
+                                 device=self.device)
+            centers = torch.stack([cbe_tensor[low_idx],
+                                   cbe_tensor[low_idx]], dim=0)
+            return labels, centers
+
+        centers = torch.stack([cbe_tensor[low_idx].clone(),
+                               cbe_tensor[high_idx].clone()], dim=0)
+        labels = None
+        for _ in range(max_iter):
+            dist_to_0 = self._mars_wasserstein_distance_batch(cbe_tensor,
+                                                              centers[0])
+            dist_to_1 = self._mars_wasserstein_distance_batch(cbe_tensor,
+                                                              centers[1])
+            new_labels = torch.where(dist_to_0 <= dist_to_1,
+                                     torch.zeros_like(dist_to_0,
+                                                      dtype=torch.long),
+                                     torch.ones_like(dist_to_1,
+                                                    dtype=torch.long))
+
+            if labels is not None and torch.equal(new_labels, labels):
+                break
+            labels = new_labels
+
+            for cluster_idx in range(2):
+                member_mask = labels == cluster_idx
+                if torch.any(member_mask):
+                    centers[cluster_idx] = cbe_tensor[member_mask].mean(dim=0)
+
+        if labels is None:
+            labels = torch.zeros(cbe_tensor.shape[0],
+                                 dtype=torch.long,
+                                 device=self.device)
+
+        if torch.unique(labels).numel() < 2:
+            median_norm = torch.median(norms)
+            labels = (norms > median_norm).long()
+            if torch.unique(labels).numel() < 2:
+                sorted_idx = torch.argsort(norms)
+                labels = torch.zeros(cbe_tensor.shape[0],
+                                     dtype=torch.long,
+                                     device=self.device)
+                labels[sorted_idx[cbe_tensor.shape[0] // 2:]] = 1
+            for cluster_idx in range(2):
+                member_mask = labels == cluster_idx
+                if torch.any(member_mask):
+                    centers[cluster_idx] = cbe_tensor[member_mask].mean(dim=0)
+
+        return labels, centers
+
+    @staticmethod
+    def _mars_wasserstein_distance(left, right):
+        return torch.mean(torch.abs(torch.sort(left.reshape(-1).float())[0] -
+                                    torch.sort(right.reshape(-1).float())[0]))
+
+    @staticmethod
+    def _mars_wasserstein_distance_batch(samples, center):
+        sorted_samples = torch.sort(samples.float(), dim=1)[0]
+        sorted_center = torch.sort(center.reshape(-1).float())[0]
+        return torch.mean(torch.abs(sorted_samples - sorted_center.view(1, -1)),
+                          dim=1)
+
+    def _log_mars_debug(self, aggregation_name, cbe_tensor, client_ids, labels,
+                        centers, selected_client_ids):
+        cbe_norms = torch.norm(cbe_tensor, p=1, dim=1)
+
+        def _round_list(tensor):
+            return np.round(tensor.detach().cpu().float().numpy(),
+                            6).tolist()
+
+        logger.info(
+            f"Server: MARS DEBUG {aggregation_name} client_ids={client_ids}, "
+            f"cbe_l1_norms={_round_list(cbe_norms)}, labels={labels}, "
+            f"selected_client_ids={selected_client_ids}")
+        if centers is not None:
+            logger.info(
+                f"Server: MARS DEBUG {aggregation_name} center_l1_norms="
+                f"{_round_list(torch.norm(centers, p=1, dim=1))}")
+
     def _fedavg_model_params_no_defense(self, valid_params, total_samples):
         if not valid_params or total_samples <= 0:
             return None
@@ -3292,14 +4151,15 @@ class GGEURServer(Server):
                     clean_preds = torch.argmax(clean_logits, dim=1)
                     poison_preds = torch.argmax(poison_logits, dim=1)
 
-                    asr_correct += poison_preds.eq(target_label).sum().item()
-                    asr_total += poison_preds.shape[0]
-
                     non_target_mask = labels != target_label
                     if non_target_mask.any():
-                        non_target_correct += poison_preds[
+                        target_hits = poison_preds[
                             non_target_mask].eq(target_label).sum().item()
-                        non_target_total += non_target_mask.sum().item()
+                        non_target_count = non_target_mask.sum().item()
+                        asr_correct += target_hits
+                        asr_total += non_target_count
+                        non_target_correct += target_hits
+                        non_target_total += non_target_count
 
                     clean_target_correct += clean_preds.eq(
                         target_label).sum().item()

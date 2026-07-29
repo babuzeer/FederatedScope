@@ -12,6 +12,9 @@ def extend_attack_cfg(cfg):
     # for gan_attack
     cfg.attack.target_label_ind = -1
     cfg.attack.attacker_id = -1
+    # When enabled, server-side aggregation ignores statistics/prototypes and
+    # model updates from clients listed in cfg.attack.attacker_id.
+    cfg.attack.aggregate_benign_only = False
 
     # for backdoor attack
 
@@ -47,6 +50,7 @@ def extend_attack_cfg(cfg):
     cfg.attack.a3fl.trigger_offset = 2
     cfg.attack.a3fl.trigger_init = 0.5
     cfg.attack.a3fl.trigger_outer_epochs = 20
+    cfg.attack.a3fl.trigger_update_interval = 1
     cfg.attack.a3fl.trigger_search_batches = 2
     cfg.attack.a3fl.trigger_lr = 0.01
     cfg.attack.a3fl.trigger_clip_min = -2.0
@@ -54,8 +58,40 @@ def extend_attack_cfg(cfg):
     cfg.attack.a3fl.save_trigger_samples = False
     cfg.attack.a3fl.save_trigger_max_samples = 4
     cfg.attack.a3fl.poison_feature_repeat = 1
+    cfg.attack.a3fl.poison_train_epochs = 0
+    cfg.attack.a3fl.poison_train_lr = 0.0
     cfg.attack.a3fl.update_scale = 1.0
     cfg.attack.a3fl.target_row_scale = 1.0
+
+    # for label-flipping data poisoning on the GGEUR client
+    cfg.attack.label_flip = CN()
+    cfg.attack.label_flip.source_label_ind = -1
+    cfg.attack.label_flip.target_label_ind = -1
+    cfg.attack.label_flip.replacement_pairs = []
+    cfg.attack.label_flip.all_to_target = False
+    cfg.attack.label_flip.poison_ratio = 1.0
+    cfg.attack.label_flip.start_round = -1
+    cfg.attack.label_flip.poison_epochs = 0
+    cfg.attack.label_flip.poison_statistics = True
+    cfg.attack.label_flip.poison_training = True
+
+    # for A Little Is Enough / ALIE model-poisoning attack on GGEUR
+    # Malicious clients keep their local training unchanged; before server-side
+    # aggregation, their submitted model parameters are replaced by
+    # mean +/- z * std estimated per parameter dimension.
+    cfg.attack.little_is_enough = CN()
+    cfg.attack.little_is_enough.start_round = -1
+    cfg.attack.little_is_enough.poison_epochs = 0
+    cfg.attack.little_is_enough.z = 1.0
+    cfg.attack.little_is_enough.auto_z = False
+    cfg.attack.little_is_enough.max_z = 1.5
+    cfg.attack.little_is_enough.direction = 'positive'
+    cfg.attack.little_is_enough.stats_source = 'attacker'
+    cfg.attack.little_is_enough.min_std = 1e-6
+    cfg.attack.little_is_enough.min_attackers = 1
+    cfg.attack.little_is_enough.target_models = ['mlp', 'classifier']
+    cfg.attack.little_is_enough.log_detail = True
+    cfg.attack.little_is_enough.log_norms = True
 
     # for CERBERUS backdoor attack on the GGEUR client
     cfg.attack.cerberus = CN()
@@ -99,6 +135,7 @@ def extend_attack_cfg(cfg):
     cfg.attack.cerberus.auto_scale_max = 1.0
     cfg.attack.cerberus.scale_cap = 1.0
     cfg.attack.cerberus.trigger_search_steps = 0
+    cfg.attack.cerberus.trigger_update_interval = 1
     cfg.attack.cerberus.trigger_search_batches = 2
     cfg.attack.cerberus.trigger_search_batch_size = 8
     cfg.attack.cerberus.trigger_search_lr = 0.05
@@ -137,6 +174,7 @@ def extend_attack_cfg(cfg):
     cfg.attack.sabre.image_clip_min = -3.0
     cfg.attack.sabre.image_clip_max = 3.0
     cfg.attack.sabre.trigger_search_steps = 0
+    cfg.attack.sabre.trigger_update_interval = 1
     cfg.attack.sabre.trigger_search_batches = 2
     cfg.attack.sabre.trigger_search_batch_size = 8
     cfg.attack.sabre.trigger_search_lr = 0.01
