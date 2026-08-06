@@ -199,6 +199,8 @@ class GGEURClient(Client):
 
         # MLP classifier
         self.mlp_classifier = None
+        # 自适应 DP：保存接收到的全局 MLP 状态，用于上传时计算 delta
+        self._adaptive_dp_global_mlp_state = None
 
         # State tracking
         self.statistics_uploaded = False
@@ -3933,6 +3935,11 @@ class GGEURClient(Client):
             a3fl_global_mlp_state = copy.deepcopy(
                 self.mlp_classifier.state_dict())
 
+        # 自适应 DP：保存全局 MLP 状态快照，上传时用于计算 delta = local - global
+        self._adaptive_dp_global_mlp_state = (
+            copy.deepcopy(self.mlp_classifier.state_dict())
+            if self.mlp_classifier is not None else None)
+
         # MOON: snapshot global model after loading global params, before local training
         if self.use_moon and self.mlp_classifier is not None:
             self.moon_global_model = copy.deepcopy(self.mlp_classifier)
@@ -4098,6 +4105,10 @@ class GGEURClient(Client):
             else:
                 combined_para = {'mlp': combined_para, 'prompt': prompt_para}
 
+        # 自适应 DP：对上传的 MLP 更新施加 clip(delta, C_t) + 高斯噪声
+        combined_para = self._apply_adaptive_dp_to_upload(
+            combined_para, round_idx)
+
         # Send model parameters
         self.comm_manager.send(
             Message(
@@ -4109,6 +4120,81 @@ class GGEURClient(Client):
                 content=(sample_size, combined_para)
             )
         )
+
+    def _apply_adaptive_dp_to_upload(self, combined_para, round_idx):
+        """对上传的 MLP 更新施加自适应裁剪 DP：clip(delta, C_t) + 高斯噪声。
+
+        在上传前计算 delta = local_mlp - global_mlp，裁剪并加噪后重建
+        sanitized_local = global + sanitized_delta，仅替换 MLP 部分，
+        不影响攻击元数据或 CNN/Prompt 等其他上传字段。
+        """
+        from federatedscope.core.privacy.adaptive_dp import get_controller_for_cfg
+        try:
+            controller = get_controller_for_cfg(self._cfg)
+        except Exception:
+            controller = None
+        if controller is None or combined_para is None:
+            return combined_para
+        if self._adaptive_dp_global_mlp_state is None:
+            logger.warning(
+                f"Client {self.ID}: adaptive DP enabled but no global MLP "
+                f"snapshot; skip sanitization.")
+            return combined_para
+
+        # 定位 combined_para 中的 MLP state_dict
+        is_wrapped = (
+            isinstance(combined_para, dict) and 'mlp' in combined_para
+            and not all(torch.is_tensor(v) for v in combined_para.values()))
+        if is_wrapped:
+            mlp_state = combined_para.get('mlp')
+        else:
+            mlp_state = combined_para
+
+        if not isinstance(mlp_state, dict):
+            return combined_para
+
+        global_state = self._adaptive_dp_global_mlp_state
+
+        # delta = local - global
+        delta = {}
+        for key, value in mlp_state.items():
+            g = global_state.get(key)
+            if torch.is_tensor(value) and torch.is_tensor(g):
+                delta[key] = (
+                    value.detach().cpu().float()
+                    - g.detach().cpu().float())
+            else:
+                delta[key] = value
+
+        expected = max(1, int(self._cfg.federate.sample_client_num))
+        sanitized_delta, stats = controller.sanitize(
+            delta, round_idx=int(round_idx), client_id=int(self.ID),
+            expected_clients=expected)
+
+        # 重建 sanitized_local = global + sanitized_delta
+        new_mlp_state = {}
+        for key, value in mlp_state.items():
+            g = global_state.get(key)
+            sd = sanitized_delta.get(key)
+            if torch.is_tensor(g) and torch.is_tensor(sd):
+                base = g.detach().cpu().float() + sd
+                new_mlp_state[key] = base.to(value.dtype) if torch.is_tensor(value) else base
+            else:
+                new_mlp_state[key] = value
+
+        logger.info(
+            f"[AdaptiveDP] client={self.ID} round={round_idx} "
+            f"raw_norm={float(stats.get('raw_norm', 0.0)):.6f} "
+            f"clip={float(stats.get('clip_bound', 0.0)):.6f} "
+            f"factor={float(stats.get('clip_factor', 0.0)):.6f} "
+            f"noise_std={float(stats.get('noise_std', 0.0)):.6f} "
+            f"sanitized_norm={float(stats.get('sanitized_norm', 0.0)):.6f}")
+
+        if is_wrapped:
+            combined_para['mlp'] = new_mlp_state
+        else:
+            combined_para = new_mlp_state
+        return combined_para
 
     def _handle_separated_training(self, message: Message):
         """Handle training in separated training mode"""

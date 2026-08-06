@@ -2779,10 +2779,48 @@ class GGEURServer(Server):
             for _, _, sender in retained_valid_params
         ]
         kept_client_ids = [client_ids[idx] for idx in keep_indices_list]
+        kept_set = set(keep_indices_list)
+        dropped_indices_list = [
+            i for i in range(n_users) if i not in kept_set
+        ]
+        dropped_client_ids = [client_ids[i] for i in dropped_indices_list]
+
+        scores_np = scores.detach().cpu().float().numpy()
+        features_np = features.detach().cpu().float().numpy()
+        score_min = float(scores_np.min())
+        score_max = float(scores_np.max())
+        score_mean = float(scores_np.mean())
+        score_median = float(np.median(scores_np))
+        if keep_indices_list:
+            cutoff_score = float(scores_np[keep_indices_list[-1]])
+        else:
+            cutoff_score = float('inf')
+
+        feat_manhattan = features_np[:, 0]
+        feat_euclidean = features_np[:, 1]
+        feat_cosine = features_np[:, 2]
+
+        def _r4(x):
+            return [round(float(v), 4) for v in x]
+
         logger.info(
-            f"Server: Multi-metrics {aggregation_name} client_ids={client_ids}, "
-            f"kept_client_ids={kept_client_ids}, keep_ratio={keep_ratio:.4f}, "
-            f"keep_num={keep_num}/{n_users}")
+            f"Server: Multi-metrics {aggregation_name} "
+            f"client_ids={client_ids}, kept={kept_client_ids}, "
+            f"dropped={dropped_client_ids}, "
+            f"keep_ratio={keep_ratio:.4f}, keep_num={keep_num}/{n_users}, "
+            f"eps={eps:.2e}, cutoff_score={cutoff_score:.4f}, "
+            f"score_min={score_min:.4f}, score_max={score_max:.4f}, "
+            f"score_mean={score_mean:.4f}, score_median={score_median:.4f}, "
+            f"scores={_r4(scores_np.tolist())}, "
+            f"feat_manhattan_min={float(feat_manhattan.min()):.4f}, "
+            f"feat_manhattan_max={float(feat_manhattan.max()):.4f}, "
+            f"feat_manhattan_mean={float(feat_manhattan.mean()):.4f}, "
+            f"feat_euclidean_min={float(feat_euclidean.min()):.4f}, "
+            f"feat_euclidean_max={float(feat_euclidean.max()):.4f}, "
+            f"feat_euclidean_mean={float(feat_euclidean.mean()):.4f}, "
+            f"feat_cosine_min={float(feat_cosine.min()):.4f}, "
+            f"feat_cosine_max={float(feat_cosine.max()):.4f}, "
+            f"feat_cosine_mean={float(feat_cosine.mean()):.4f}")
 
         if bool(getattr(self.ggeur_cfg, 'multi_metrics_debug', False)):
             self._log_multi_metrics_debug(
