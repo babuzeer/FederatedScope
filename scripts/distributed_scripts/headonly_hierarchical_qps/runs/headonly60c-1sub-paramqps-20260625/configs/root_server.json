@@ -1,0 +1,10 @@
+﻿{
+  "role": "root",
+  "experiment_summary": "headonly60c-1sub-paramqps",
+  "run_id": "headonly60c-1sub-paramqps-20260625",
+  "listen_host": "0.0.0.0",
+  "listen_port": 58051,
+  "expected_subservers": 1,
+  "total_rounds": 20,
+  "log_dir": "/root/autodl-tmp/FederatedScope/exp/headonly_hierarchical_qps/headonly60c-1sub-paramqps-20260625"
+}

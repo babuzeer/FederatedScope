@@ -31,8 +31,7 @@ train:
 
 ggeur:
   use: True
-  
-  domainnet_shared_classes_only: False
+  domainnet_domains: ['clipart', 'painting', 'real', 'sketch']
   feature_extractor: 'clip'
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
@@ -49,7 +48,7 @@ ggeur:
   statistics_round: 0
   use_fedproto: False
   use_lds: True
-  lds_alpha: 0.1
+  lds_alpha: 0.01
   lds_seed: 42
   use_cnn_distillation: False
   use_feature_alignment: False
@@ -57,4 +56,3 @@ ggeur:
 
 outdir: 'exp/domainnet_4domains/vit/ggeur_fedavg'
 expname: 'domainnet_4domains_vit_ggeur_fedavg'
-

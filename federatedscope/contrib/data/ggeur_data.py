@@ -7,15 +7,51 @@ Supports:
 - LDS (Label Distribution Skew) using Dirichlet distribution for non-IID data
 """
 
+import json
 import logging
+import os
 import numpy as np
-from torch.utils.data import DataLoader, Subset
+from PIL import Image
+from torch.utils.data import DataLoader, ConcatDataset, Dataset, Subset
 from torchvision import transforms
 
 from federatedscope.register import register_data
 from federatedscope.core.data.utils import convert_data_mode
 
 logger = logging.getLogger(__name__)
+
+
+class ManifestImageDataset(Dataset):
+    """Image dataset backed by an explicit per-client manifest."""
+
+    def __init__(self, root, records, transform=None, domain=None,
+                 client_id=None):
+        self.root = root
+        self.records = list(records)
+        self.transform = transform
+        self.domain = domain
+        self.client_id = client_id
+        self.data = [
+            item['path'] if os.path.isabs(item['path'])
+            else os.path.join(root, item['path'])
+            for item in self.records
+        ]
+        self.targets = [int(item['label']) for item in self.records]
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        image_path = self.data[idx]
+        label = self.targets[idx]
+        try:
+            image = Image.open(image_path).convert('RGB')
+        except Exception as error:
+            logger.error(f"Error loading manifest image {image_path}: {error}")
+            image = Image.new('RGB', (224, 224), color='white')
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
 
 
 def load_ggeur_data(config, client_cfgs=None):
@@ -211,6 +247,46 @@ def _split_subset_for_clients(subset, num_clients, seed=123):
     return subsets
 
 
+def _sample_dataset_for_clients(dataset,
+                                num_clients,
+                                samples_per_client,
+                                seed=123,
+                                replace=False):
+    """
+    Build clients by independently sampling a fixed number of examples.
+
+    This is intended for large-client OfficeHome runs where the dataset is not
+    large enough for non-overlapping allocation. Each client receives unique
+    samples by default, while different clients can sample the same underlying
+    image.
+    """
+    n_samples = len(dataset)
+    if n_samples <= 0:
+        raise ValueError("Cannot sample clients from an empty dataset")
+    if samples_per_client <= 0:
+        raise ValueError("samples_per_client must be positive")
+
+    rng = np.random.RandomState(seed)
+    sample_with_replacement = bool(replace) or samples_per_client > n_samples
+    subsets = []
+    covered = set()
+
+    for _ in range(num_clients):
+        selected = rng.choice(n_samples,
+                              size=samples_per_client,
+                              replace=sample_with_replacement)
+        selected = selected.astype(int).tolist()
+        subsets.append(Subset(dataset, selected))
+        covered.update(selected)
+
+    return subsets, {
+        'samples_per_client': int(samples_per_client),
+        'sample_with_replacement': bool(sample_with_replacement),
+        'unique_covered_samples': int(len(covered)),
+        'source_samples': int(n_samples),
+    }
+
+
 def _load_pacs_ggeur_data(config, client_cfgs=None):
     """Load PACS dataset for GGEUR_Clip"""
     from federatedscope.cv.dataset.pacs import PACS, load_pacs_domain_data
@@ -343,6 +419,71 @@ def _load_pacs_ggeur_data(config, client_cfgs=None):
     return data_dict, config
 
 
+def _resolve_manifest_path(config):
+    manifest_path = ''
+    if hasattr(config, 'ggeur'):
+        manifest_path = getattr(config.ggeur, 'officehome_manifest_path', '')
+    if manifest_path:
+        return manifest_path
+
+    candidate = os.path.join(config.data.root, 'client_manifest.json')
+    if os.path.exists(candidate):
+        return candidate
+    return ''
+
+
+def _load_officehome_manifest_data(config, transform):
+    manifest_path = _resolve_manifest_path(config)
+    if not manifest_path:
+        return None
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(
+            f"OfficeHome manifest not found: {manifest_path}")
+
+    with open(manifest_path, 'r', encoding='utf-8') as file:
+        manifest = json.load(file)
+
+    root = manifest.get('root') or config.data.root
+    if not os.path.isabs(root):
+        root = os.path.abspath(os.path.join(os.path.dirname(manifest_path),
+                                            root))
+
+    batch_size = config.dataloader.batch_size
+    num_workers = config.dataloader.num_workers
+    data_dict = {}
+    client_id = int(manifest.get('client_id', 1))
+    domain = manifest.get('domain', None)
+    splits = manifest.get('splits', {})
+
+    client_data = {}
+    for split in ('train', 'val', 'test'):
+        records = splits.get(split, [])
+        dataset = ManifestImageDataset(root,
+                                       records,
+                                       transform=transform,
+                                       domain=domain,
+                                       client_id=client_id)
+        if split == 'val' and len(dataset) == 0:
+            client_data[split] = None
+        else:
+            client_data[split] = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=(split == 'train'),
+                num_workers=num_workers,
+                drop_last=False)
+
+    data_dict[client_id] = client_data
+    logger.info(
+        "GGEUR_Clip Office-Home manifest loaded: "
+        f"manifest={manifest_path}, root={root}, client_id={client_id}, "
+        f"domain={domain}, "
+        f"train={len(splits.get('train', []))}, "
+        f"val={len(splits.get('val', []))}, "
+        f"test={len(splits.get('test', []))}")
+    return data_dict, config
+
+
 def _load_officehome_ggeur_data(config, client_cfgs=None):
     """Load Office-Home dataset for GGEUR_Clip"""
     from federatedscope.cv.dataset.office_home import OfficeHome, load_office_home_domain_data
@@ -363,12 +504,29 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
                            std=[0.26862954, 0.26130258, 0.27577711])
     ])
 
-    domains = OfficeHome.DOMAINS  # ['Art', 'Clipart', 'Product', 'Real_World']
+    manifest_data = _load_officehome_manifest_data(config, transform)
+    if manifest_data is not None:
+        return manifest_data
+
+    selected_domains = list(getattr(config.ggeur, 'officehome_domains', [])) \
+        if hasattr(config, 'ggeur') else []
+    domains = selected_domains or OfficeHome.DOMAINS
+    invalid_domains = [domain for domain in domains if domain not in OfficeHome.DOMAINS]
+    if invalid_domains:
+        raise ValueError(
+            f"Invalid OfficeHome domains {invalid_domains}; expected "
+            f"subset of {OfficeHome.DOMAINS}")
     num_domains = len(domains)
     num_classes = len(OfficeHome.CLASSES)  # 65 classes
 
     # Check if LDS is enabled
     use_lds = getattr(config.ggeur, 'use_lds', False) if hasattr(config, 'ggeur') else False
+    split_strategy = getattr(config.ggeur, 'officehome_split_strategy',
+                             'standard') if hasattr(config, 'ggeur') else 'standard'
+    split_strategy = str(split_strategy).lower()
+    if split_strategy not in ['standard', 'random_fixed_per_domain']:
+        raise ValueError(
+            f"Unsupported OfficeHome split strategy: {split_strategy}")
 
     # Get configured client number
     configured_client_num = config.federate.client_num
@@ -383,7 +541,37 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
         clients_per_domain = configured_client_num // num_domains
         total_clients = configured_client_num
 
-    if use_lds:
+    if split_strategy == 'random_fixed_per_domain':
+        if use_lds:
+            raise ValueError(
+                "OfficeHome random_fixed_per_domain split cannot be combined "
+                "with ggeur.use_lds=True")
+        configured_clients_per_domain = int(
+            getattr(config.ggeur, 'officehome_random_clients_per_domain', 0))
+        if configured_clients_per_domain > 0:
+            clients_per_domain = configured_clients_per_domain
+            total_clients = clients_per_domain * num_domains
+        if configured_client_num != total_clients:
+            logger.warning(
+                f"client_num ({configured_client_num}) does not match "
+                f"OfficeHome random_fixed_per_domain total ({total_clients}); "
+                f"using {total_clients}.")
+        random_samples_per_client = int(
+            getattr(config.ggeur, 'officehome_random_samples_per_client', 0))
+        if random_samples_per_client <= 0:
+            raise ValueError(
+                "ggeur.officehome_random_samples_per_client must be positive "
+                "for random_fixed_per_domain split")
+        random_sample_with_replacement = bool(
+            getattr(config.ggeur,
+                    'officehome_random_sample_with_replacement', False))
+        logger.info(
+            "GGEUR_Clip Office-Home random_fixed_per_domain: "
+            f"{total_clients} clients ({clients_per_domain} per domain), "
+            f"{random_samples_per_client} train samples/client, "
+            f"within_client_replacement={random_sample_with_replacement}")
+        dirichlet_matrix = None
+    elif use_lds:
         # LDS mode: use Dirichlet distribution for non-IID data split
         lds_alpha = getattr(config.ggeur, 'lds_alpha', 0.1)
         lds_seed = getattr(config.ggeur, 'lds_seed', 42)
@@ -423,7 +611,22 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
 
             total_original_samples += len(train_dataset)
 
-            if use_lds:
+            if split_strategy == 'random_fixed_per_domain':
+                train_subsets, random_summary = _sample_dataset_for_clients(
+                    train_dataset,
+                    clients_per_domain,
+                    random_samples_per_client,
+                    seed=config.seed + domain_idx * 1009,
+                    replace=random_sample_with_replacement)
+                logger.info(
+                    f"  OfficeHome random-fixed domain {domain}: "
+                    f"source_train={random_summary['source_samples']}, "
+                    f"clients={clients_per_domain}, "
+                    f"samples/client={random_summary['samples_per_client']}, "
+                    f"unique_covered={random_summary['unique_covered_samples']}, "
+                    "within_client_replacement="
+                    f"{random_summary['sample_with_replacement']}")
+            elif use_lds:
                 # LDS mode: first apply Dirichlet distribution to get domain's portion
                 lds_subset, class_counts = _split_dataset_with_lds(
                     train_dataset,
@@ -484,7 +687,15 @@ def _load_officehome_ggeur_data(config, client_cfgs=None):
     # Update config with actual client number
     config.federate.client_num = total_clients
 
-    if use_lds:
+    if split_strategy == 'random_fixed_per_domain':
+        logger.info("GGEUR_Clip Office-Home random-fixed Summary:")
+        logger.info(f"  Total clients: {total_clients}")
+        logger.info(f"  Domains: {domains}")
+        logger.info(f"  Clients per domain: {clients_per_domain}")
+        logger.info(f"  Samples per client: {random_samples_per_client}")
+        logger.info(f"  Logical train samples: {total_train_samples}")
+        logger.info(f"  Original train samples: {total_original_samples}")
+    elif use_lds:
         logger.info(f"GGEUR_Clip Office-Home LDS Summary:")
         logger.info(f"  Total clients: {total_clients}")
         logger.info(f"  Original train samples: {total_original_samples}")

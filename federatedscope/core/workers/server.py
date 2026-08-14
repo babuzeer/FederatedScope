@@ -181,7 +181,9 @@ class Server(BaseServer):
         self.join_in_client_num = 0
         self.join_in_info = dict()
         self.first_join_timestamp = None
-        self.join_timeout_seconds = 60
+        self.join_timeout_seconds = int(
+            getattr(self._cfg.distribute, 'join_timeout_seconds', 60))
+        self.training_started = False
         # the unseen clients indicate the ones that do not contribute to FL
         # process by training on their local data and uploading their local
         # model update. The splitting is useful to check participation
@@ -813,7 +815,11 @@ class Server(BaseServer):
         To start the FL course when the expected number of clients have joined
         """
 
+        if self.training_started:
+            return
+
         if self.check_client_join_in():
+            self.training_started = True
             if self._cfg.federate.use_ss or self._cfg.vertical.use:
                 self.broadcast_client_address()
 
@@ -1035,6 +1041,14 @@ class Server(BaseServer):
             if self.first_join_timestamp is None:
                 self.first_join_timestamp = time.time()
             sender, info = message.sender, message.content
+            if self.training_started or sender not in self.comm_manager.neighbors:
+                logger.warning(
+                    f"Server: Reject late or unknown join_in_info from "
+                    f"client #{sender}. training_started="
+                    f"{self.training_started}, joined_clients="
+                    f"{list(self.comm_manager.neighbors.keys())}")
+                self._send_join_rejection(sender, None)
+                return
             for key in self._cfg.federate.join_in_info:
                 assert key in info
             self.join_in_info[sender] = info
@@ -1042,8 +1056,22 @@ class Server(BaseServer):
         else:
             if self.first_join_timestamp is None:
                 self.first_join_timestamp = time.time()
-            self.join_in_client_num += 1
             sender, address = message.sender, message.content
+            if self.training_started or self.join_in_client_num >= self.client_num:
+                logger.warning(
+                    f"Server: Reject late or extra join_in from sender "
+                    f"{sender} at {address}. training_started="
+                    f"{self.training_started}, joined="
+                    f"{self.join_in_client_num}/{self.client_num}")
+                self._send_join_rejection(sender, address)
+                return
+            if int(sender) != -1 and sender in self.comm_manager.neighbors:
+                logger.warning(
+                    f"Server: Ignore duplicate join_in from existing client "
+                    f"#{sender} at {address}")
+                return
+
+            self.join_in_client_num += 1
             if int(sender) == -1:  # assign number to client
                 sender = self.join_in_client_num
                 self.comm_manager.add_neighbors(neighbor_id=sender,
@@ -1074,8 +1102,38 @@ class Server(BaseServer):
 
         self.trigger_for_start()
 
+    def _send_join_rejection(self, sender, address):
+        """Tell a rejected distributed client to exit instead of waiting."""
+        if self.mode != 'distributed' or self.comm_manager is None:
+            return
+
+        receiver = sender
+        temp_receiver = None
+        neighbors = getattr(self.comm_manager, 'neighbors', {})
+        if sender not in neighbors:
+            if address is None:
+                return
+            temp_receiver = f"join_rejected_{address['host']}:{address['port']}"
+            self.comm_manager.add_neighbors(
+                neighbor_id=temp_receiver, address=address)
+            receiver = temp_receiver
+
+        try:
+            self.comm_manager.send(
+                Message(msg_type='finish',
+                        sender=self.ID,
+                        receiver=[receiver],
+                        state=self.state,
+                        timestamp=self.cur_timestamp,
+                        content={'reason': 'join_rejected'}))
+        finally:
+            if temp_receiver is not None:
+                neighbors.pop(temp_receiver, None)
+
     def _check_join_timeout(self):
         if self.first_join_timestamp is None or self.check_client_join_in():
+            return
+        if self.join_timeout_seconds <= 0:
             return
 
         elapsed_time = time.time() - self.first_join_timestamp

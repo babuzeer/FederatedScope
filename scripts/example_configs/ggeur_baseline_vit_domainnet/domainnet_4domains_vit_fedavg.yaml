@@ -31,8 +31,7 @@ train:
 
 ggeur:
   use: True
-  
-  domainnet_shared_classes_only: False
+  domainnet_domains: ['clipart', 'painting', 'real', 'sketch']
   feature_extractor: 'clip'
   clip_model: 'ViT-B-16'
   clip_pretrained: 'openai'
@@ -40,9 +39,9 @@ ggeur:
   embedding_dim: 512
   use_feature_cache: True
   feature_cache_dir: ''
-  num_generated_per_sample: 0
-  num_generated_per_prototype: 0
-  target_size_per_class: 0
+  num_generated_per_sample: 20
+  num_generated_per_prototype: 20
+  target_size_per_class: 20
   mlp_hidden_dim: 0
   mlp_dropout: 0.0
   use_cross_client_prototypes: True
@@ -57,4 +56,3 @@ ggeur:
 
 outdir: 'exp/domainnet_4domains/vit/fedavg'
 expname: 'domainnet_4domains_vit_fedavg'
-

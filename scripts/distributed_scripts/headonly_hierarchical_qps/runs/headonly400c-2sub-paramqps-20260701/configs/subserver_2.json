@@ -1,0 +1,19 @@
+{
+  "role": "subserver",
+  "experiment_summary": "headonly400c-2sub-paramqps",
+  "run_id": "headonly400c-2sub-paramqps-20260701",
+  "subserver_id": 2,
+  "listen_host": "0.0.0.0",
+  "listen_port": 58062,
+  "advertise_host": "10.112.81.135",
+  "root_host": "127.0.0.1",
+  "root_port": 58051,
+  "expected_clients": 200,
+  "client_start": 201,
+  "client_end": 400,
+  "total_rounds": 20,
+  "upload_timeout_sec": 10.0,
+  "qps_window_sec": 1.0,
+  "root_rpc_timeout_sec": 600.0,
+  "log_dir": "/root/autodl-tmp/FederatedScope/exp/headonly_hierarchical_qps/headonly400c-2sub-paramqps-20260701"
+}
