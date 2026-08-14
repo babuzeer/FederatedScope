@@ -398,6 +398,18 @@ class GGEURClient(Client):
         )
 
     def _get_label_flip_target_label(self):
+        # Per-attacker target labels: the i-th attacker in attacker_id uses
+        # target_labels[i]. Falls back to the shared target_label_ind.
+        target_labels = getattr(self.label_flip_cfg, 'target_labels', [])
+        if target_labels:
+            attacker_ids = sorted(self.label_flip_attacker_ids)
+            try:
+                idx = attacker_ids.index(self.ID)
+                if 0 <= idx < len(target_labels):
+                    return int(target_labels[idx])
+            except ValueError:
+                pass  # Not an attacker — fall through to shared target.
+
         target = int(getattr(
             self.label_flip_cfg, 'target_label_ind',
             getattr(self._cfg.attack, 'target_label_ind', -1)))
@@ -533,6 +545,16 @@ class GGEURClient(Client):
                 self.label_flip_cfg, 'poison_training', True)),
         }
         if not bool(getattr(self.label_flip_cfg, 'poison_training', True)):
+            return
+
+        # Update-reversal mode: train on clean data, attack happens at upload
+        # time by reversing the model update. No label flipping needed.
+        if bool(getattr(self.label_flip_cfg, 'update_reversal', False)):
+            self.label_flip_latest_meta['update_reversal'] = True
+            logger.info(
+                f"Client {self.ID}: update-reversal attack active in round "
+                f"{int(round_idx)} — training on clean data, will reverse "
+                f"update at upload")
             return
 
         self._restore_base_augmented_dataset()
@@ -3690,10 +3712,16 @@ class GGEURClient(Client):
         version = str(getattr(self.ggeur_cfg, 'headonly_cache_version',
                               'fcache_v1')).replace('/', '_')
         dataset = str(self._cfg.data.type).replace('/', '_')
+        # 用 feature_extractor + embedding_dim 做子目录隔离，
+        # 避免 CNN(1024) 与 CLIP(512) 等不同模型同名缓存文件互相覆盖
+        ext = str(self.feature_extractor_type).replace('/', '_')
+        dim = int(self.embedding_dim)
+        model_subdir = f'{ext}_d{dim}'
         path = os.path.join(
             cache_dir,
             'headonly_augmented',
             version,
+            model_subdir,
             f'{dataset}_client_{int(self.ID):06d}.pt',
         )
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -4109,6 +4137,10 @@ class GGEURClient(Client):
         combined_para = self._apply_adaptive_dp_to_upload(
             combined_para, round_idx)
 
+        # Update-reversal attack: reverse and scale the MLP update before upload
+        combined_para = self._apply_update_reversal_to_upload(
+            combined_para, round_idx)
+
         # Send model parameters
         self.comm_manager.send(
             Message(
@@ -4189,6 +4221,80 @@ class GGEURClient(Client):
             f"factor={float(stats.get('clip_factor', 0.0)):.6f} "
             f"noise_std={float(stats.get('noise_std', 0.0)):.6f} "
             f"sanitized_norm={float(stats.get('sanitized_norm', 0.0)):.6f}")
+
+        if is_wrapped:
+            combined_para['mlp'] = new_mlp_state
+        else:
+            combined_para = new_mlp_state
+        return combined_para
+
+    def _apply_update_reversal_to_upload(self, combined_para, round_idx):
+        """Update-reversal attack: reverse and scale the MLP update.
+
+        Malicious clients train on clean data, then compute
+        delta = local_mlp - global_mlp, reverse it (-delta), scale by
+        a factor (default: total_clients / num_attackers), and upload
+        global + reversed_delta * scale. This effectively cancels out
+        the updates from benign clients and pushes the global model
+        in the opposite direction.
+
+        Only active when label_flip.update_reversal=True and the client
+        is an active attacker in the current round.
+        """
+        if not self.label_flip_enabled or not self.label_flip_is_attacker:
+            return combined_para
+        if not bool(getattr(self.label_flip_cfg, 'update_reversal', False)):
+            return combined_para
+        if not self._is_label_flip_active_round(round_idx):
+            return combined_para
+        if self._adaptive_dp_global_mlp_state is None or combined_para is None:
+            return combined_para
+
+        # Determine scale factor
+        scale_cfg = float(getattr(
+            self.label_flip_cfg, 'update_reversal_scale', -1.0))
+        if scale_cfg > 0:
+            scale = scale_cfg
+        else:
+            n_total = max(1, int(self._cfg.federate.client_num))
+            n_attackers = max(1, len(self.label_flip_attacker_ids))
+            scale = n_total / n_attackers
+
+        # Locate MLP state_dict in combined_para
+        is_wrapped = (
+            isinstance(combined_para, dict) and 'mlp' in combined_para
+            and not all(torch.is_tensor(v) for v in combined_para.values()))
+        if is_wrapped:
+            mlp_state = combined_para.get('mlp')
+        else:
+            mlp_state = combined_para
+        if not isinstance(mlp_state, dict):
+            return combined_para
+
+        global_state = self._adaptive_dp_global_mlp_state
+
+        # Compute reversed-and-scaled update:
+        #   delta = local - global
+        #   poisoned = global - delta * scale = global*(1+scale) - local*scale
+        new_mlp_state = {}
+        total_delta_norm = 0.0
+        for key, value in mlp_state.items():
+            g = global_state.get(key)
+            if torch.is_tensor(value) and torch.is_tensor(g):
+                local_v = value.detach().cpu().float()
+                global_v = g.detach().cpu().float()
+                delta = local_v - global_v
+                total_delta_norm += float(delta.norm().item()) ** 2
+                poisoned = global_v - delta * scale
+                new_mlp_state[key] = poisoned.to(value.dtype)
+            else:
+                new_mlp_state[key] = value
+
+        total_delta_norm = total_delta_norm ** 0.5
+        logger.info(
+            f"Client {self.ID}: update-reversal attack in round {round_idx} — "
+            f"scale={scale:.4f}, delta_norm={total_delta_norm:.6f}, "
+            f"poisoned_update_norm={total_delta_norm * scale:.6f}")
 
         if is_wrapped:
             combined_para['mlp'] = new_mlp_state

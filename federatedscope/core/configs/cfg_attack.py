@@ -67,6 +67,10 @@ def extend_attack_cfg(cfg):
     cfg.attack.label_flip = CN()
     cfg.attack.label_flip.source_label_ind = -1
     cfg.attack.label_flip.target_label_ind = -1
+    # When non-empty, each attacker uses a different target label. The i-th
+    # entry corresponds to the i-th attacker in cfg.attack.attacker_id.
+    # When empty or not set, all attackers share target_label_ind.
+    cfg.attack.label_flip.target_labels = []
     cfg.attack.label_flip.replacement_pairs = []
     cfg.attack.label_flip.all_to_target = False
     cfg.attack.label_flip.poison_ratio = 1.0
@@ -74,24 +78,14 @@ def extend_attack_cfg(cfg):
     cfg.attack.label_flip.poison_epochs = 0
     cfg.attack.label_flip.poison_statistics = True
     cfg.attack.label_flip.poison_training = True
-
-    # for A Little Is Enough / ALIE model-poisoning attack on GGEUR
-    # Malicious clients keep their local training unchanged; before server-side
-    # aggregation, their submitted model parameters are replaced by
-    # mean +/- z * std estimated per parameter dimension.
-    cfg.attack.little_is_enough = CN()
-    cfg.attack.little_is_enough.start_round = -1
-    cfg.attack.little_is_enough.poison_epochs = 0
-    cfg.attack.little_is_enough.z = 1.0
-    cfg.attack.little_is_enough.auto_z = False
-    cfg.attack.little_is_enough.max_z = 1.5
-    cfg.attack.little_is_enough.direction = 'positive'
-    cfg.attack.little_is_enough.stats_source = 'attacker'
-    cfg.attack.little_is_enough.min_std = 1e-6
-    cfg.attack.little_is_enough.min_attackers = 1
-    cfg.attack.little_is_enough.target_models = ['mlp', 'classifier']
-    cfg.attack.little_is_enough.log_detail = True
-    cfg.attack.little_is_enough.log_norms = True
+    # Update-reversal attack: malicious clients train on clean data, then
+    # reverse the model update (delta = local - global) and scale it by
+    # a factor (default: total_clients / num_attackers) before uploading.
+    # This is a training-phase attack, independent of poison_statistics.
+    # When poison_training=True and update_reversal=True, the client does
+    # NOT flip labels during training; instead it reverses the update.
+    cfg.attack.label_flip.update_reversal = False
+    cfg.attack.label_flip.update_reversal_scale = -1.0  # <0 = auto (n_total/n_attackers)
 
     # for CERBERUS backdoor attack on the GGEUR client
     cfg.attack.cerberus = CN()

@@ -107,6 +107,12 @@ def extend_ggeur_cfg(cfg):
     # Timeout in seconds for GGEUR-specific distributed phases. Set <= 0 to
     # disable the watchdog.
     cfg.ggeur.distributed_stage_timeout = 1800
+    # Attack evaluation frequency: run expensive trigger/ASR evaluation
+    # (A3FL/CERBERUS/SABRE, requires per-sample feature extractor forward)
+    # every N rounds. Set to 1 to evaluate every round (default). The final
+    # round is always evaluated regardless of this setting. MLP test accuracy
+    # (which uses cached features) is unaffected and still runs every round.
+    cfg.ggeur.attack_eval_freq = 1
 
     # ========== Server-side Defense Settings ==========
     # GGEUR-specific robust aggregation for MLP/head updates. Supported values:
@@ -148,6 +154,40 @@ def extend_ggeur_cfg(cfg):
     cfg.ggeur.multi_metrics_cov_eps = 1e-6
     cfg.ggeur.multi_metrics_target_models = ['mlp', 'classifier', 'model']
     cfg.ggeur.multi_metrics_debug = False
+    # Adaptive threshold: when enabled, use score_mean + z_threshold * score_std
+    # as the cutoff instead of fixed keep_ratio. Clients below threshold are
+    # kept; falls back to topk if fewer than min_clients survive.
+    cfg.ggeur.multi_metrics_adaptive_threshold = False
+    cfg.ggeur.multi_metrics_z_threshold = 2.0
+    # Historical smoothing: maintain per-client EMA of anomaly scores across
+    # rounds to reduce single-round fluctuations. ema_alpha controls the
+    # weight of the current round (0 < alpha <= 1, higher = more responsive).
+    cfg.ggeur.multi_metrics_history_smoothing = False
+    cfg.ggeur.multi_metrics_ema_alpha = 0.5
+
+    # Multi-metrics statistics defense (round-0 data-poisoning defense):
+    # Detects clients who uploaded unreasonable covariances or prototypes
+    # (e.g. label-flipping attackers) using z_trace / z_fro / z_cross features
+    # with MAD z-score and whitened Mahalanobis scoring. Executed once in
+    # round 0, independent of the model-update multi_metrics defense above.
+    # Enabled via multi_metrics_stats_defense (explicit) or
+    # multi_metrics_stats_enabled (alias).
+    cfg.ggeur.multi_metrics_stats_defense = False
+    cfg.ggeur.multi_metrics_stats_enabled = False
+    cfg.ggeur.multi_metrics_stats_min_clients = 4
+    cfg.ggeur.multi_metrics_stats_cov_eps = 1e-6
+    cfg.ggeur.multi_metrics_stats_keep_ratio = 0.75
+    cfg.ggeur.multi_metrics_stats_adaptive_threshold = False
+    cfg.ggeur.multi_metrics_stats_z_threshold = 2.0
+    # Feature-selection gap threshold for the statistics defense (方案 B).
+    # A MAD-z feature dim is retained only if its largest "high-tail natural
+    # cluster split" consecutive gap (in sorted values) is >= this value AND
+    # the resulting upper cluster is at most half of the clients.  Typical
+    # range: 0.5 (aggressive, keep more) ~ 2.0 (conservative, drop more).
+    # Lowering to ~0.3 will relax the filter; raising above e.g. 5.0 disables
+    # practical auto-dropping of noisy features (degrades to the 3-feature
+    # baseline).
+    cfg.ggeur.multi_metrics_stats_feat_gap_thresh = 1.0
 
     # ========== FedProto Integration Settings ==========
     # Whether to use FedProto-style prototype regularization during MLP training

@@ -168,7 +168,12 @@ class GGEURServer(Server):
         self.a3fl_shared_trigger = None
         self.a3fl_test_loaders = {}
         self.a3fl_test_loaded = False
+        # Cache of clean test features per domain to avoid recomputing
+        # the feature extractor forward pass on unchanged clean images every
+        # round. Maps domain -> (clean_features_tensor (CPU), labels_tensor (CPU)).
+        self.a3fl_clean_feature_cache = {}
         self.foolsgold_update_history = {}
+        self.multi_metrics_score_history = {}
 
         attack_method = str(getattr(config.attack, 'attack_method', '')).lower()
         self.cerberus_enabled = attack_method == 'cerberus'
@@ -313,49 +318,59 @@ class GGEURServer(Server):
         return kept_params
 
     def _filter_benign_statistics_for_aggregation(self):
-        """Optionally exclude malicious clients from statistics aggregation."""
-        if not self.aggregate_benign_only:
-            return self.local_statistics_buffer
+        """Optionally exclude malicious clients from statistics aggregation.
 
-        attacker_ids = set(self.aggregate_benign_attacker_ids)
-        if not attacker_ids:
-            logger.warning(
-                "Server: aggregate_benign_only is enabled but "
-                "cfg.attack.attacker_id is empty; keeping all statistics")
-            return self.local_statistics_buffer
+        Pipeline (each stage is opt-in and can be used independently):
+          1. aggregate_benign_only  : drop by known cfg.attack.attacker_id list
+          2. multi_metrics_stats_defense : robust MAD + whitened Mahalanobis
+             anomaly detection using z_trace / z_fro / z_cross features.
+             Detects data-poisoning attackers (e.g. label flipping) who
+             uploaded unreasonable covariances or prototypes.
+             This defense is controlled by separate stats-only flags, so the
+             training-phase (model-update) multi_metrics backdoor defense is
+             completely unaffected.
+        """
+        buffer = self.local_statistics_buffer
 
-        kept_stats = {}
-        dropped_ids = []
-        for client_id, client_stats in self.local_statistics_buffer.items():
-            try:
-                normalized_client_id = int(client_id)
-            except (TypeError, ValueError):
-                normalized_client_id = None
+        if self.aggregate_benign_only:
+            attacker_ids = set(self.aggregate_benign_attacker_ids)
+            if attacker_ids:
+                kept_stats = {}
+                dropped_ids = []
+                for client_id, client_stats in buffer.items():
+                    try:
+                        normalized_client_id = int(client_id)
+                    except (TypeError, ValueError):
+                        normalized_client_id = None
 
-            if normalized_client_id is not None and \
-                    normalized_client_id in attacker_ids:
-                dropped_ids.append(normalized_client_id)
-                continue
-            kept_stats[client_id] = client_stats
+                    if normalized_client_id is not None and \
+                            normalized_client_id in attacker_ids:
+                        dropped_ids.append(normalized_client_id)
+                        continue
+                    kept_stats[client_id] = client_stats
 
-        if not dropped_ids:
-            logger.info(
-                "Server: aggregate_benign_only enabled for statistics, "
-                "but no received statistics matched cfg.attack.attacker_id")
-            return self.local_statistics_buffer
+                if not dropped_ids:
+                    logger.info(
+                        "Server: aggregate_benign_only enabled for "
+                        "statistics, but no received statistics matched "
+                        "cfg.attack.attacker_id")
+                elif not kept_stats:
+                    logger.warning(
+                        "Server: aggregate_benign_only would remove all "
+                        "local statistics; falling back to all statistics")
+                else:
+                    logger.info(
+                        "Server: aggregate_benign_only dropped malicious "
+                        f"client statistics/prototypes "
+                        f"{sorted(set(dropped_ids))}; kept "
+                        f"{len(kept_stats)}/{len(buffer)} "
+                        "statistics payloads")
+                    buffer = kept_stats
 
-        if not kept_stats:
-            logger.warning(
-                "Server: aggregate_benign_only would remove all local "
-                "statistics; falling back to all statistics")
-            return self.local_statistics_buffer
+        if self._is_multi_metrics_stats_enabled() and buffer:
+            buffer = self._multi_metrics_filter_statistics(buffer)
 
-        logger.info(
-            "Server: aggregate_benign_only dropped malicious client "
-            f"statistics/prototypes {sorted(set(dropped_ids))}; "
-            f"kept {len(kept_stats)}/{len(self.local_statistics_buffer)} "
-            "statistics payloads")
-        return kept_stats
+        return buffer
 
     def _resolve_lie_z(self, n_workers, m_attackers):
         cfg_z = float(getattr(self.lie_cfg, 'z', 1.0))
@@ -1942,6 +1957,7 @@ class GGEURServer(Server):
             f"Server: Performing {'FedOpt' if self.use_fedopt else 'FedAvg'} aggregation for round {round_idx}"
         )
         self._clear_stage()
+        self._current_aggregation_round = int(round_idx)
 
         # Collect all model parameters
         all_params = self.msg_buffer['train'][round_idx]
@@ -2143,86 +2159,101 @@ class GGEURServer(Server):
                 acc_str = ', '.join([f"{k}: {v:.4f}" for k, v in test_results.items()])
                 logger.info(f"Server: Round {round_idx} MLP Test Accuracy - {acc_str}")
             if self.a3fl_enabled and self.latest_a3fl_meta is not None:
-                poison_results = self._evaluate_a3fl_on_test_sets()
-                if poison_results:
-                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
-                    logger.info(f"Server: Round {round_idx} A3FL Poison Accuracy - {poison_str}")
+                if self._should_run_attack_eval(round_idx):
+                    poison_results = self._evaluate_a3fl_on_test_sets()
+                    if poison_results:
+                        poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
+                        logger.info(f"Server: Round {round_idx} A3FL Poison Accuracy - {poison_str}")
+                    else:
+                        logger.info(
+                            f"Server: Round {round_idx} skipped A3FL Poison Accuracy logging "
+                            f"because evaluation returned no results")
                 else:
-                    logger.info(
-                        f"Server: Round {round_idx} skipped A3FL Poison Accuracy logging "
-                        f"because evaluation returned no results")
+                    logger.debug(
+                        f"Server: Round {round_idx} skipped A3FL Poison "
+                        f"Accuracy evaluation (attack_eval_freq)")
             if self.cerberus_enabled and self.latest_cerberus_meta is not None:
-                cerberus_eval = self._evaluate_cerberus_on_test_sets()
-                poison_results = cerberus_eval.get('asr', {})
-                non_target_results = cerberus_eval.get('non_target_asr', {})
-                clean_target_results = cerberus_eval.get(
-                    'clean_target_rate', {})
-                attacker_id = int(
-                    self.latest_cerberus_meta.get('client_id', -1))
-                if poison_results:
-                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
-                    logger.info(
-                        f"Server: Round {round_idx} CERBERUS ASR "
-                        f"(attacker {attacker_id}) "
-                        f"- {poison_str}")
-                    if non_target_results:
-                        non_target_str = ', '.join([
-                            f"{k}: {v:.4f}"
-                            for k, v in non_target_results.items()
-                        ])
+                if self._should_run_attack_eval(round_idx):
+                    cerberus_eval = self._evaluate_cerberus_on_test_sets()
+                    poison_results = cerberus_eval.get('asr', {})
+                    non_target_results = cerberus_eval.get('non_target_asr', {})
+                    clean_target_results = cerberus_eval.get(
+                        'clean_target_rate', {})
+                    attacker_id = int(
+                        self.latest_cerberus_meta.get('client_id', -1))
+                    if poison_results:
+                        poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
                         logger.info(
-                            f"Server: Round {round_idx} CERBERUS non-target ASR "
+                            f"Server: Round {round_idx} CERBERUS ASR "
                             f"(attacker {attacker_id}) "
-                            f"- {non_target_str}")
-                    if clean_target_results:
-                        clean_target_str = ', '.join([
-                            f"{k}: {v:.4f}"
-                            for k, v in clean_target_results.items()
-                        ])
+                            f"- {poison_str}")
+                        if non_target_results:
+                            non_target_str = ', '.join([
+                                f"{k}: {v:.4f}"
+                                for k, v in non_target_results.items()
+                            ])
+                            logger.info(
+                                f"Server: Round {round_idx} CERBERUS non-target ASR "
+                                f"(attacker {attacker_id}) "
+                                f"- {non_target_str}")
+                        if clean_target_results:
+                            clean_target_str = ', '.join([
+                                f"{k}: {v:.4f}"
+                                for k, v in clean_target_results.items()
+                            ])
+                            logger.info(
+                                f"Server: Round {round_idx} CERBERUS clean target rate "
+                                f"(target {int(self.latest_cerberus_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
+                                f"- {clean_target_str}")
+                    else:
                         logger.info(
-                            f"Server: Round {round_idx} CERBERUS clean target rate "
-                            f"(target {int(self.latest_cerberus_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
-                            f"- {clean_target_str}")
+                            f"Server: Round {round_idx} skipped CERBERUS ASR logging "
+                            f"because evaluation returned no results")
                 else:
-                    logger.info(
-                        f"Server: Round {round_idx} skipped CERBERUS ASR logging "
-                        f"because evaluation returned no results")
+                    logger.debug(
+                        f"Server: Round {round_idx} skipped CERBERUS ASR "
+                        f"evaluation (attack_eval_freq)")
             if self.sabre_enabled and self.latest_sabre_meta is not None:
-                sabre_eval = self._evaluate_sabre_on_test_sets()
-                poison_results = sabre_eval.get('asr', {})
-                non_target_results = sabre_eval.get('non_target_asr', {})
-                clean_target_results = sabre_eval.get(
-                    'clean_target_rate', {})
-                attacker_id = int(
-                    self.latest_sabre_meta.get('client_id', -1))
-                if poison_results:
-                    poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
-                    logger.info(
-                        f"Server: Round {round_idx} SABRE ASR "
-                        f"(attacker {attacker_id}) "
-                        f"- {poison_str}")
-                    if non_target_results:
-                        non_target_str = ', '.join([
-                            f"{k}: {v:.4f}"
-                            for k, v in non_target_results.items()
-                        ])
+                if self._should_run_attack_eval(round_idx):
+                    sabre_eval = self._evaluate_sabre_on_test_sets()
+                    poison_results = sabre_eval.get('asr', {})
+                    non_target_results = sabre_eval.get('non_target_asr', {})
+                    clean_target_results = sabre_eval.get(
+                        'clean_target_rate', {})
+                    attacker_id = int(
+                        self.latest_sabre_meta.get('client_id', -1))
+                    if poison_results:
+                        poison_str = ', '.join([f"{k}: {v:.4f}" for k, v in poison_results.items()])
                         logger.info(
-                            f"Server: Round {round_idx} SABRE non-target ASR "
+                            f"Server: Round {round_idx} SABRE ASR "
                             f"(attacker {attacker_id}) "
-                            f"- {non_target_str}")
-                    if clean_target_results:
-                        clean_target_str = ', '.join([
-                            f"{k}: {v:.4f}"
-                            for k, v in clean_target_results.items()
-                        ])
+                            f"- {poison_str}")
+                        if non_target_results:
+                            non_target_str = ', '.join([
+                                f"{k}: {v:.4f}"
+                                for k, v in non_target_results.items()
+                            ])
+                            logger.info(
+                                f"Server: Round {round_idx} SABRE non-target ASR "
+                                f"(attacker {attacker_id}) "
+                                f"- {non_target_str}")
+                        if clean_target_results:
+                            clean_target_str = ', '.join([
+                                f"{k}: {v:.4f}"
+                                for k, v in clean_target_results.items()
+                            ])
+                            logger.info(
+                                f"Server: Round {round_idx} SABRE clean target rate "
+                                f"(target {int(self.latest_sabre_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
+                                f"- {clean_target_str}")
+                    else:
                         logger.info(
-                            f"Server: Round {round_idx} SABRE clean target rate "
-                            f"(target {int(self.latest_sabre_meta.get('target_label', self._cfg.attack.target_label_ind))}) "
-                            f"- {clean_target_str}")
+                            f"Server: Round {round_idx} skipped SABRE ASR logging "
+                            f"because evaluation returned no results")
                 else:
-                    logger.info(
-                        f"Server: Round {round_idx} skipped SABRE ASR logging "
-                        f"because evaluation returned no results")
+                    logger.debug(
+                        f"Server: Round {round_idx} skipped SABRE ASR "
+                        f"evaluation (attack_eval_freq)")
         # Aggregate and evaluate PromptFL if enabled
         if self.use_promptfl:
             self._aggregate_prompt(valid_params, total_samples)
@@ -2281,6 +2312,49 @@ class GGEURServer(Server):
         except Exception:
             return True
 
+    def _get_last_attack_rounds(self):
+        """Return the list of last attack rounds (inclusive) for every
+        enabled attack.  Used to detect the boundary round at which the
+        per-client multi-metrics feature table should be printed.
+        """
+        lasts = []
+        for enabled, cfg in (
+            (self.a3fl_enabled, getattr(self._cfg.attack, 'a3fl', None)),
+            (self.cerberus_enabled, self.cerberus_cfg),
+            (self.sabre_enabled, self.sabre_cfg),
+            (self.label_flip_enabled, self.label_flip_cfg),
+            (self.lie_enabled, self.lie_cfg),
+        ):
+            if not enabled or cfg is None:
+                continue
+            start_round = int(getattr(
+                cfg, 'start_round',
+                getattr(self._cfg.attack, 'inject_round', 0)))
+            if start_round < 0:
+                start_round = int(getattr(self._cfg.attack, 'inject_round', 0))
+            poison_epochs = int(getattr(cfg, 'poison_epochs', 0))
+            if poison_epochs <= 0:
+                continue
+            lasts.append(int(start_round + poison_epochs - 1))
+        return sorted(set(lasts))
+
+    def _should_run_attack_eval(self, round_idx):
+        """Whether to run the expensive attack (A3FL/CERBERUS/SABRE)
+        trigger/ASR evaluation this round.
+
+        Controlled by ``cfg.ggeur.attack_eval_freq`` (default 1 = every
+        round). The final round is always evaluated so the end-of-run
+        ASR is recorded. MLP test accuracy evaluation is unaffected and
+        still runs every round (it uses pre-cached features).
+        """
+        freq = int(getattr(self.ggeur_cfg, 'attack_eval_freq', 1))
+        if freq <= 1:
+            return True
+        # Always evaluate the final round
+        if int(round_idx) >= int(self._total_round_num) - 1:
+            return True
+        return int(round_idx) % freq == 0
+
     def _apply_fedopt_update(self, averaged_state_dict):
         """
         Apply FedOpt server-side update based on the averaged client model.
@@ -2321,6 +2395,7 @@ class GGEURServer(Server):
 
     def _perform_separated_fedavg(self, valid_params, total_samples, round_idx):
         """Perform FedAvg for separated training mode"""
+        self._current_aggregation_round = int(round_idx)
         first_params = valid_params[0][1]
 
         if self.training_phase == 'classifier':
@@ -2426,7 +2501,7 @@ class GGEURServer(Server):
         return 'all' in targets or str(aggregation_name).lower() in targets
 
     def _is_multi_metrics_enabled(self):
-        """Whether GGEUR should use multi-metrics adaptive defense."""
+        """Whether GGEUR should use multi-metrics adaptive defense for model updates."""
         ggeur_method = str(getattr(self.ggeur_cfg, 'defense_method', '')).lower()
         agg_method = str(getattr(self._cfg.aggregator, 'robust_rule',
                                  '')).lower() if hasattr(self._cfg, 'aggregator') else ''
@@ -2434,6 +2509,23 @@ class GGEURServer(Server):
                    'multi_metric',
                    'multi_metrics_adaptive')
         return ggeur_method in aliases or agg_method in aliases
+
+    def _is_multi_metrics_stats_enabled(self):
+        """Whether to use multi-metrics anomaly detection for statistics
+        (round-0 covariance / prototype) aggregation against data poisoning
+        attacks in the statistical phase.
+
+        Controlled by ggeur.multi_metrics_stats_defense (explicit bool) or
+        implicitly by ggeur.multi_metrics_stats_enabled. If neither is set,
+        does NOT fire just because model-phase multi_metrics is on, so the
+        training-phase backdoor defense remains unaffected.
+        """
+        explicit = bool(getattr(self.ggeur_cfg,
+                                'multi_metrics_stats_defense', False))
+        if explicit:
+            return True
+        return bool(getattr(self.ggeur_cfg,
+                            'multi_metrics_stats_enabled', False))
 
     def _multi_metrics_should_target_model(self, aggregation_name):
         targets = getattr(self.ggeur_cfg, 'multi_metrics_target_models',
@@ -2587,7 +2679,7 @@ class GGEURServer(Server):
             if param_tensor is None:
                 logger.debug(f"Server: Cannot convert key '{key}' to tensor, skipping")
                 continue
-            aggregated_params[key] = torch.zeros_like(param_tensor).float()
+            aggregated_params[key] = torch.zeros_like(param_tensor).float().to(self.device)
 
         if not aggregated_params:
             return None
@@ -2604,7 +2696,7 @@ class GGEURServer(Server):
                 param_tensor = self._to_param_tensor(param_tensor)
                 if param_tensor is None:
                     continue
-                aggregated_params[key] += weight * param_tensor.float()
+                aggregated_params[key] += weight * param_tensor.float().to(self.device)
 
         return aggregated_params
 
@@ -2758,15 +2850,69 @@ class GGEURServer(Server):
         scores = torch.where(torch.isfinite(scores), scores,
                              torch.full_like(scores, float('inf')))
 
+        client_ids = [
+            int(sender) if sender is not None else None
+            for _, _, sender in retained_valid_params
+        ]
+
+        # --- Historical EMA smoothing (Solution C) ---
+        history_smoothing = bool(getattr(self.ggeur_cfg,
+                                        'multi_metrics_history_smoothing',
+                                        False))
+        ema_alpha = float(getattr(self.ggeur_cfg,
+                                  'multi_metrics_ema_alpha', 0.5))
+        ema_alpha = max(0.01, min(1.0, ema_alpha))
+
+        if history_smoothing:
+            smoothed = scores.clone()
+            for idx, cid in enumerate(client_ids):
+                if cid is None:
+                    continue
+                cur = float(scores[idx].item())
+                prev = self.multi_metrics_score_history.get(cid)
+                if prev is not None:
+                    ema = ema_alpha * cur + (1.0 - ema_alpha) * prev
+                else:
+                    ema = cur
+                self.multi_metrics_score_history[cid] = ema
+                smoothed[idx] = ema
+            sel_scores = smoothed
+        else:
+            sel_scores = scores
+
+        # --- Adaptive threshold or fixed keep_ratio (Solution B) ---
+        adaptive_threshold = bool(getattr(self.ggeur_cfg,
+                                          'multi_metrics_adaptive_threshold',
+                                          False))
+        z_threshold = float(getattr(self.ggeur_cfg,
+                                    'multi_metrics_z_threshold', 2.0))
         keep_ratio = float(getattr(self.ggeur_cfg,
-                                   'multi_metrics_keep_ratio', 0.5))
+                                  'multi_metrics_keep_ratio', 0.5))
         keep_ratio = max(0.0, min(1.0, keep_ratio))
         keep_num = int(math.ceil(n_users * keep_ratio))
         keep_num = max(1, min(keep_num, n_users))
-        keep_indices = torch.topk(scores,
-                                  keep_num,
-                                  largest=False).indices
-        keep_indices_list = keep_indices.detach().cpu().tolist()
+
+        if adaptive_threshold:
+            sel_np = sel_scores.detach().cpu().float().numpy()
+            thr = float(sel_np.mean() + z_threshold * sel_np.std())
+            keep_mask = sel_scores <= thr
+            keep_indices_list = torch.where(keep_mask)[0]. \
+                detach().cpu().tolist()
+            if len(keep_indices_list) < keep_num:
+                keep_indices = torch.topk(sel_scores,
+                                          keep_num,
+                                          largest=False).indices
+                keep_indices_list = keep_indices.detach().cpu().tolist()
+            cutoff_score = thr
+        else:
+            keep_indices = torch.topk(sel_scores,
+                                      keep_num,
+                                      largest=False).indices
+            keep_indices_list = keep_indices.detach().cpu().tolist()
+            sel_np = sel_scores.detach().cpu().float().numpy()
+            cutoff_score = float(sel_np[keep_indices_list[-1]]) \
+                if keep_indices_list else float('inf')
+
         selected_params = [
             retained_valid_params[idx] for idx in keep_indices_list
         ]
@@ -2774,10 +2920,6 @@ class GGEURServer(Server):
         if selected_total_samples <= 0:
             return None
 
-        client_ids = [
-            int(sender) if sender is not None else None
-            for _, _, sender in retained_valid_params
-        ]
         kept_client_ids = [client_ids[idx] for idx in keep_indices_list]
         kept_set = set(keep_indices_list)
         dropped_indices_list = [
@@ -2791,10 +2933,6 @@ class GGEURServer(Server):
         score_max = float(scores_np.max())
         score_mean = float(scores_np.mean())
         score_median = float(np.median(scores_np))
-        if keep_indices_list:
-            cutoff_score = float(scores_np[keep_indices_list[-1]])
-        else:
-            cutoff_score = float('inf')
 
         feat_manhattan = features_np[:, 0]
         feat_euclidean = features_np[:, 1]
@@ -2803,11 +2941,15 @@ class GGEURServer(Server):
         def _r4(x):
             return [round(float(v), 4) for v in x]
 
+        mode_str = "adaptive" if adaptive_threshold else "ratio"
+        if history_smoothing:
+            mode_str += "+ema"
+
         logger.info(
             f"Server: Multi-metrics {aggregation_name} "
             f"client_ids={client_ids}, kept={kept_client_ids}, "
             f"dropped={dropped_client_ids}, "
-            f"keep_ratio={keep_ratio:.4f}, keep_num={keep_num}/{n_users}, "
+            f"mode={mode_str}, keep_num={len(keep_indices_list)}/{n_users}, "
             f"eps={eps:.2e}, cutoff_score={cutoff_score:.4f}, "
             f"score_min={score_min:.4f}, score_max={score_max:.4f}, "
             f"score_mean={score_mean:.4f}, score_median={score_median:.4f}, "
@@ -2830,6 +2972,14 @@ class GGEURServer(Server):
                 indicators=indicators,
                 scores=scores,
                 kept_client_ids=kept_client_ids)
+
+        self._maybe_log_last_attack_round_feature_table(
+            aggregation_name=aggregation_name,
+            client_ids=client_ids,
+            features_np=features_np,
+            scores_np=scores_np,
+            kept_client_ids=kept_client_ids,
+            dropped_client_ids=dropped_client_ids)
 
         return self._fedavg_model_params_no_defense(
             selected_params,
@@ -2860,6 +3010,443 @@ class GGEURServer(Server):
             f"indicators={_round_list(indicators)}, "
             f"scores={_round_list(scores)}, "
             f"kept_client_ids={kept_client_ids}")
+
+    def _maybe_log_last_attack_round_feature_table(self,
+                                                   aggregation_name,
+                                                   client_ids,
+                                                   features_np,
+                                                   scores_np,
+                                                   kept_client_ids,
+                                                   dropped_client_ids):
+        """If we are at the last attack round (or the round right after),
+        print a nicely formatted table of per-client feature values so the
+        user can inspect why attackers / benign clients were kept or
+        dropped.
+        """
+        cur_r = getattr(self, '_current_aggregation_round', None)
+        if cur_r is None:
+            return
+        cur_r = int(cur_r)
+        last_rounds = self._get_last_attack_rounds()
+        if not last_rounds:
+            return
+        is_boundary = any(
+            cur_r == lr or cur_r == lr + 1 for lr in last_rounds
+        )
+        if not is_boundary:
+            return
+        attacker_ids = None
+        if self.a3fl_enabled:
+            from federatedscope.attack.auxiliary.a3fl_utils import \
+                parse_attacker_ids as _pa
+            attacker_ids = set(_pa(self._cfg.attack.attacker_id))
+        elif self.cerberus_enabled or self.sabre_enabled or \
+                self.label_flip_enabled or self.lie_enabled:
+            from federatedscope.attack.auxiliary.a3fl_utils import \
+                parse_attacker_ids as _pa
+            attacker_ids = set(_pa(self._cfg.attack.attacker_id))
+
+        kept_set = set(kept_client_ids or [])
+        dropped_set = set(dropped_client_ids or [])
+        # features_np columns: manhattan, euclidean, cosine (3 cols)
+        # When DCT feature is enabled there may be a 4th column (dct_cos_dist).
+        # We always print the first three core features the user asked for.
+        use_cols = min(3, features_np.shape[1])
+        labels = ["Manhattan", "Euclidean", "Cosine"]
+        col_labels = labels[:use_cols]
+        if features_np.shape[1] >= 4:
+            col_labels_dct = labels + ["DCT_cos"]
+            use_cols = 4
+        else:
+            col_labels_dct = None
+
+        rows = []
+        for i, cid in enumerate(client_ids):
+            status = "KEPT" if cid in kept_set else (
+                "DROP" if cid in dropped_set else "-"
+            )
+            is_att = "ATT" if (attacker_ids is not None and
+                               cid in attacker_ids) else ""
+            row = [
+                str(cid),
+                status,
+                is_att,
+                f"{float(scores_np[i]):8.4f}",
+            ]
+            for j in range(use_cols):
+                row.append(f"{float(features_np[i, j]):10.4f}")
+            rows.append(row)
+        # Sort by Mahalanobis score desc so the most suspicious clients
+        # sit at the top.
+        rows.sort(key=lambda r: float(r[3]), reverse=True)
+
+        n_cols = 4 + use_cols
+        headers = ["Client", "Fate", "Role", "MahaDist"] + (
+            col_labels_dct if col_labels_dct else col_labels
+        )
+        # Build header + separator
+        widths = [max(len(headers[j]),
+                      max((len(r[j]) for r in rows), default=4))
+                  for j in range(n_cols)]
+
+        def _fmt(vals):
+            return " | ".join(
+                str(v).rjust(widths[j]) for j, v in enumerate(vals)
+            )
+
+        sep = "-+-".join("-" * w for w in widths)
+        which_last = ", ".join(str(x) for x in last_rounds)
+        logger.info(
+            f"Server: Multi-metrics {aggregation_name} final-attack-round "
+            f"feature table (round {cur_r}, last_attack_round(s)="
+            f"{which_last}):\n"
+            f"  | {_fmt(headers)}\n"
+            f"  |-{sep}-\n"
+            + "\n".join(f"  | {_fmt(r)}" for r in rows)
+            + "\n  '---")
+
+    def _multi_metrics_filter_statistics(self, statistics_buffer):
+        """Multi-metrics anomaly detection for round-0 statistics payloads.
+
+        Defends against data-poisoning attacks (e.g. label flipping) in the
+        statistical phase by detecting clients who uploaded unreasonable
+        covariances or prototypes.  Executed exactly once (round 0), so no
+        cross-round EMA smoothing is applied.
+
+        For each client we build three robust, count-free features:
+          - z_trace : per-class mean covariance-trace, then robust MAD z-score
+          - z_fro   : per-class mean covariance-Frobenius-norm, then MAD z-score
+          - z_cross : cross-class consistency fingerprint (cosine-similarity
+                      derived from local prototypes across all classes), then
+                      MAD z-score
+        The three MAD-z features are whitened via sample covariance, and each
+        client receives a Mahalanobis-style divergence score vs. the
+        population.  High-divergence clients are excluded from statistics
+        aggregation.
+
+        Two threshold strategies (mutually exclusive via cfg):
+          - Fixed keep_ratio (default): always retain top keep_ratio clients.
+          - Adaptive threshold (Solution B): retain clients whose score <=
+            mean + z_threshold*std; keep_ratio acts as a minimum retention
+            floor (fallback to topk when below).  Useful when the number of
+            attackers is unknown — no client is dropped if none look anomalous.
+
+        This logic is *independent* of the model-update multi_metrics defense:
+        it reads separate cfg flags (multi_metrics_stats_* prefix).
+        """
+        min_clients = int(getattr(self.ggeur_cfg,
+                                  'multi_metrics_stats_min_clients', 4))
+        min_clients = max(4, min_clients)
+        if len(statistics_buffer) < min_clients:
+            logger.info(
+                "Server: Multi-metrics statistics defense needs at least "
+                f"{min_clients} clients; skipping")
+            return statistics_buffer
+
+        client_ids = []
+        trace_list = []
+        fro_list = []
+        cross_list = []
+        for client_id, client_stats in statistics_buffer.items():
+            covs = client_stats.get('covs', {}) or {}
+            prototypes = client_stats.get('prototypes', {}) or {}
+
+            traces = []
+            fros = []
+            for cov in covs.values():
+                try:
+                    cov_arr = np.asarray(cov, dtype=np.float64)
+                except Exception:
+                    continue
+                if cov_arr.ndim != 2 or cov_arr.shape[0] != cov_arr.shape[1]:
+                    continue
+                traces.append(float(np.trace(cov_arr)))
+                fros.append(float(np.linalg.norm(cov_arr, 'fro')))
+            trace_val = float(np.mean(traces)) if traces else 0.0
+            fro_val = float(np.mean(fros)) if fros else 0.0
+
+            proto_keys = sorted(prototypes.keys())
+            cross_val = 0.0
+            if len(proto_keys) >= 2:
+                vectors = []
+                for k in proto_keys:
+                    v = np.asarray(prototypes[k], dtype=np.float64).reshape(-1)
+                    norm = np.linalg.norm(v)
+                    if norm <= 0:
+                        continue
+                    vectors.append(v / norm)
+                if len(vectors) >= 2:
+                    vectors_mat = np.stack(vectors, axis=0)
+                    gram = vectors_mat @ vectors_mat.T
+                    iu = np.triu_indices(len(vectors), k=1)
+                    sims = gram[iu].tolist()
+                    if sims:
+                        cross_val = float(np.mean(sims))
+
+            client_ids.append(client_id)
+            trace_list.append(trace_val)
+            fro_list.append(fro_val)
+            cross_list.append(cross_val)
+
+        def _mad_z(arr):
+            arr = np.asarray(arr, dtype=np.float64)
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            eps = 1e-12
+            if mad < eps:
+                mad = float(np.std(arr))
+                if mad < eps:
+                    mad = 1.0
+            scale = 1.4826 * mad
+            return np.abs(arr - med) / (scale + eps)
+
+        z_trace = _mad_z(trace_list)
+        z_fro = _mad_z(fro_list)
+        z_cross = _mad_z(cross_list)
+
+        feat_names = ['z_trace', 'z_fro', 'z_cross']
+        feat_arrs = [z_trace, z_fro, z_cross]
+        features_np = np.stack(feat_arrs, axis=1)  # shape: [N, D]
+
+        # --- 方案 B：无监督特征选择（按分离间隙 Gap 自动过滤重叠维度）---
+        # 对每个 1D MAD-z 特征，在排序后的值中寻找"高尾自然簇分隔"：
+        # 考虑所有合法切分（上部簇大小 ∈ [2, floor(N/2)]），取最大连续间隙。
+        # Gap 大于阈值 min_gap 且上部簇占比 ≤ 50% 的维度被保留，
+        # 其余被视为与攻击者不相关（甚至重叠）的噪声维度，直接剔除。
+        n_users_local = features_np.shape[0]
+        D_local = features_np.shape[1]
+        min_gap = float(getattr(self.ggeur_cfg,
+                                'multi_metrics_stats_feat_gap_thresh', 1.0))
+        max_upper_frac = 0.5
+
+        feat_gaps = np.zeros(D_local, dtype=np.float64)
+        feat_upper_sizes = np.zeros(D_local, dtype=np.int64)
+        feat_best_splits = np.zeros(D_local, dtype=np.int64)
+
+        min_upper = 2
+        max_upper = max(min_upper, int(np.floor(n_users_local * max_upper_frac)))
+        min_upper = min(min_upper, max_upper)
+
+        for d in range(D_local):
+            feat_vec = feat_arrs[d]
+            order = np.argsort(feat_vec, kind='mergesort')
+            z_sorted = feat_vec[order]
+            gaps = np.diff(z_sorted)  # len = N-1
+
+            # 切分索引 s: 下部 = indices 0..s (inclusive, size s+1)
+            #             上部簇 = indices s+1..N-1,  size = N-1-s
+            # 合法 s: 2 ≤ N-1-s ≤ max_upper
+            #   => s ≤ N-1-2  且  s ≥ N-1-max_upper
+            s_lo = max(0, n_users_local - 1 - max_upper)
+            s_hi = max(s_lo, n_users_local - 1 - min_upper)
+            if s_lo >= n_users_local - 1:
+                feat_gaps[d] = 0.0
+                feat_upper_sizes[d] = 0
+                feat_best_splits[d] = -1
+                continue
+
+            sub_gaps = gaps[s_lo:s_hi + 1]
+            if sub_gaps.size == 0:
+                feat_gaps[d] = 0.0
+                feat_upper_sizes[d] = 0
+                feat_best_splits[d] = -1
+                continue
+            local_idx = int(np.argmax(sub_gaps))
+            best_s = s_lo + local_idx
+            feat_gaps[d] = float(gaps[best_s])
+            feat_upper_sizes[d] = n_users_local - 1 - best_s
+            feat_best_splits[d] = int(best_s)
+
+        # 第一阶段筛选：gap >= min_gap 且 upper_ratio <= 0.5
+        keep_mask = (feat_gaps >= min_gap) & (feat_upper_sizes <= max_upper)
+        keep_dims = [d for d in range(D_local) if keep_mask[d]]
+
+        # 安全兜底：至少保留 1 个特征（按 Gap 排名取最优）
+        if len(keep_dims) == 0:
+            order_by_gap = sorted(range(D_local),
+                                  key=lambda d: feat_gaps[d], reverse=True)
+            keep_dims = [order_by_gap[0]]
+            logger.info(
+                "Server: Multi-metrics statistics feature selection: no feat "
+                f"passed gap>= {min_gap:.3f}; fallback to best feat="
+                f"{feat_names[keep_dims[0]]} (gap={feat_gaps[keep_dims[0]]:.4f})")
+
+        # 第二阶段：若只保留了 1 个特征，尝试再补一个次优特征
+        # （降低 Gap 门槛到 0.3 * min_gap），方便后续白化/多指标投票。
+        if len(keep_dims) == 1 and D_local >= 2:
+            first = keep_dims[0]
+            rest_by_gap = sorted([d for d in range(D_local) if d != first],
+                                 key=lambda d: feat_gaps[d], reverse=True)
+            for d in rest_by_gap:
+                if feat_gaps[d] >= 0.3 * min_gap and \
+                        feat_upper_sizes[d] <= max_upper:
+                    keep_dims.append(d)
+                    break
+
+        # 上三角簇 Jaccard 一致性校验：保留的特征之间其"高簇"客户端集合
+        # 应有合理重叠（Jaccard >= 0.25），否则说明两特征的异常判定互相矛盾，
+        # 宁可不保留次优特征，退回到单特征。
+        def _upper_set(d, best_s, order_arr):
+            if best_s < 0 or best_s + 1 >= len(order_arr):
+                return set()
+            return set(int(order_arr[i])
+                       for i in range(best_s + 1, len(order_arr)))
+
+        if len(keep_dims) >= 2:
+            kept_orders = [np.argsort(feat_arrs[d], kind='mergesort')
+                           for d in keep_dims]
+            kept_splits = [feat_best_splits[d] for d in keep_dims]
+            sets = [_upper_set(d_idx, kept_splits[j], kept_orders[j])
+                    for j, d_idx in enumerate(keep_dims)]
+            final_keep = [keep_dims[0]]
+            for j in range(1, len(keep_dims)):
+                base = sets[0]
+                cand = sets[j]
+                if len(base) == 0 or len(cand) == 0:
+                    continue
+                inter = len(base & cand)
+                union = len(base | cand)
+                jacc = inter / union if union > 0 else 0.0
+                if jacc >= 0.25:
+                    final_keep.append(keep_dims[j])
+            # 但至少留 1 个，不会全丢
+            keep_dims = final_keep
+
+        # 应用特征筛选
+        features_np = features_np[:, keep_dims]
+        kept_names = [feat_names[d] for d in keep_dims]
+        dropped_names = [(feat_names[d], float(feat_gaps[d]),
+                          int(feat_upper_sizes[d]))
+                         for d in range(D_local) if d not in keep_dims]
+
+        feat_sel_msg = (
+            f"kept_feats={kept_names} "
+            f"(gaps={[round(float(feat_gaps[d]), 4) for d in keep_dims]}, "
+            f"upper_sizes={[int(feat_upper_sizes[d]) for d in keep_dims]})"
+        )
+        if dropped_names:
+            feat_sel_msg += (
+                f"; dropped_feats=[ "
+                + ", ".join(
+                    f"({n}, gap={g:.4f}, upper={s})"
+                    for n, g, s in dropped_names)
+                + " ]"
+            )
+        logger.info("Server: Multi-metrics statistics feature selection: "
+                    + feat_sel_msg
+                    + f"; gap_threshold={min_gap:.3f}, D={D_local}->{len(keep_dims)}")
+
+        features_t = torch.from_numpy(features_np).float().to(self.device)
+
+        indicators = torch.sum(
+            torch.abs(features_t.unsqueeze(1) - features_t.unsqueeze(0)),
+            dim=1)
+
+        eps = float(getattr(self.ggeur_cfg,
+                            'multi_metrics_stats_cov_eps', 1e-6))
+        eps = max(eps, 1e-12)
+        cov = self._multi_metrics_covariance(indicators, eps)
+        inv_cov = torch.pinverse(cov)
+        raw_scores = torch.sum((indicators @ inv_cov) * indicators, dim=1)
+        scores = torch.sqrt(torch.clamp(raw_scores, min=0.0))
+        scores = torch.where(torch.isfinite(scores), scores,
+                             torch.full_like(scores, float('inf')))
+
+        adaptive_threshold = bool(getattr(self.ggeur_cfg,
+                                          'multi_metrics_stats_adaptive_threshold',
+                                          False))
+        z_threshold = float(getattr(self.ggeur_cfg,
+                                    'multi_metrics_stats_z_threshold', 2.0))
+        keep_ratio = float(getattr(self.ggeur_cfg,
+                                   'multi_metrics_stats_keep_ratio', 0.75))
+        keep_ratio = max(0.0, min(1.0, keep_ratio))
+        n_users = len(client_ids)
+        keep_num = int(math.ceil(n_users * keep_ratio))
+        keep_num = max(1, min(keep_num, n_users))
+
+        if adaptive_threshold:
+            scores_np = scores.detach().cpu().float().numpy()
+            thr = float(scores_np.mean() + z_threshold * scores_np.std())
+            keep_mask = scores <= thr
+            keep_indices_list = torch.where(keep_mask)[0]. \
+                detach().cpu().tolist()
+            if len(keep_indices_list) < keep_num:
+                keep_indices = torch.topk(scores, keep_num,
+                                          largest=False).indices
+                keep_indices_list = keep_indices.detach().cpu().tolist()
+            cutoff_score = thr
+        else:
+            keep_indices = torch.topk(scores, keep_num,
+                                      largest=False).indices
+            keep_indices_list = keep_indices.detach().cpu().tolist()
+            scores_np = scores.detach().cpu().float().numpy()
+            cutoff_score = float(scores_np[keep_indices_list[-1]]) \
+                if keep_indices_list else float('inf')
+
+        kept_indices = set(keep_indices_list)
+        kept_stats = {}
+        dropped_ids = []
+        for i, raw_cid in enumerate(client_ids):
+            if i in kept_indices:
+                kept_stats[raw_cid] = statistics_buffer[raw_cid]
+            else:
+                try:
+                    dropped_ids.append(int(raw_cid))
+                except (TypeError, ValueError):
+                    dropped_ids.append(raw_cid)
+
+        if not kept_stats:
+            logger.warning(
+                "Server: Multi-metrics statistics defense would drop all "
+                "clients; falling back to original statistics")
+            return statistics_buffer
+
+        mode_str = "adaptive" if adaptive_threshold else "ratio"
+
+        def _r4(x):
+            return [round(float(v), 4) for v in x]
+
+        kept_id_log = []
+        for i in keep_indices_list:
+            try:
+                kept_id_log.append(int(client_ids[i]))
+            except (TypeError, ValueError):
+                kept_id_log.append(client_ids[i])
+        all_id_log = []
+        for raw_cid in client_ids:
+            try:
+                all_id_log.append(int(raw_cid))
+            except (TypeError, ValueError):
+                all_id_log.append(raw_cid)
+
+        logger.info(
+            "Server: Multi-metrics statistics defense "
+            f"client_ids={all_id_log}, kept={kept_id_log}, "
+            f"dropped={sorted(dropped_ids)}, mode={mode_str}, "
+            f"used_feats={kept_names}, "
+            f"keep_num={len(keep_indices_list)}/{n_users}, "
+            f"eps={eps:.2e}, cutoff_score={cutoff_score:.4f}, "
+            f"score_min={float(scores_np.min()):.4f}, "
+            f"score_max={float(scores_np.max()):.4f}, "
+            f"score_mean={float(scores_np.mean()):.4f}, "
+            f"score_median={float(np.median(scores_np)):.4f}, "
+            f"scores={_r4(scores_np.tolist())}, "
+            f"z_trace={_r4(z_trace.tolist())}, "
+            f"z_fro={_r4(z_fro.tolist())}, "
+            f"z_cross={_r4(z_cross.tolist())}")
+
+        if bool(getattr(self.ggeur_cfg, 'multi_metrics_debug', False)):
+            indicators_cpu = indicators.detach().cpu()
+            scores_cpu = scores.detach().cpu()
+            self._log_multi_metrics_debug(
+                aggregation_name='statistics',
+                client_ids=client_ids,
+                features=features_t.detach().cpu(),
+                indicators=indicators_cpu,
+                scores=scores_cpu,
+                kept_client_ids=[client_ids[i] for i in keep_indices_list])
+
+        return kept_stats
 
     def _foolsgold_aggregate_model_params(self,
                                           valid_params,
@@ -4163,45 +4750,91 @@ class GGEURServer(Server):
                 non_target_total = 0
                 clean_target_correct = 0
                 clean_total = 0
-                for images, labels in dataloader:
-                    images = images.to(self.device)
-                    labels = labels.to(self.device).long()
-                    if additive:
-                        poisoned_images = torch.clamp(
-                            images + trigger * mask,
-                            float(image_clip_min),
-                            float(image_clip_max))
-                    else:
-                        poisoned_images = trigger * mask + images * (1.0 - mask)
-                    if self.feature_extractor_type == 'cnn':
-                        clean_features = self.cnn_extractor(images)
-                        poison_features = self.cnn_extractor(poisoned_images)
-                    elif self.feature_extractor_type == 'timm':
-                        clean_features = self.timm_extractor(images)
-                        poison_features = self.timm_extractor(poisoned_images)
-                    else:
-                        clean_features = self.clip_model.encode_image(images)
-                        poison_features = self.clip_model.encode_image(
-                            poisoned_images)
 
-                    clean_logits = self.global_mlp(clean_features.float())
-                    poison_logits = self.global_mlp(poison_features.float())
-                    clean_preds = torch.argmax(clean_logits, dim=1)
-                    poison_preds = torch.argmax(poison_logits, dim=1)
+                # Reuse cached clean features/labels when available to skip
+                # the feature-extractor forward pass on unchanged clean
+                # images (saves ~50% of per-round eval time for CLIP/CNN).
+                cached = self.a3fl_clean_feature_cache.get(domain)
+                if cached is not None:
+                    clean_features = cached[0].to(self.device)
+                    labels_tensor = cached[1].to(self.device)
+                    # Only need poisoned forward this round
+                    poison_features_list = []
+                    for images, _ in dataloader:
+                        images = images.to(self.device)
+                        if additive:
+                            poisoned_images = torch.clamp(
+                                images + trigger * mask,
+                                float(image_clip_min),
+                                float(image_clip_max))
+                        else:
+                            poisoned_images = trigger * mask + images * (
+                                1.0 - mask)
+                        if self.feature_extractor_type == 'cnn':
+                            pf = self.cnn_extractor(poisoned_images)
+                        elif self.feature_extractor_type == 'timm':
+                            pf = self.timm_extractor(poisoned_images)
+                        else:
+                            pf = self.clip_model.encode_image(poisoned_images)
+                        poison_features_list.append(pf)
+                    poison_features = torch.cat(poison_features_list, dim=0)
+                else:
+                    # First time: compute both clean and poisoned features,
+                    # and cache clean features for future rounds.
+                    clean_features_list = []
+                    labels_list = []
+                    poison_features_list = []
+                    for images, labels in dataloader:
+                        images = images.to(self.device)
+                        labels = labels.to(self.device).long()
+                        if additive:
+                            poisoned_images = torch.clamp(
+                                images + trigger * mask,
+                                float(image_clip_min),
+                                float(image_clip_max))
+                        else:
+                            poisoned_images = trigger * mask + images * (
+                                1.0 - mask)
+                        if self.feature_extractor_type == 'cnn':
+                            cf = self.cnn_extractor(images)
+                            pf = self.cnn_extractor(poisoned_images)
+                        elif self.feature_extractor_type == 'timm':
+                            cf = self.timm_extractor(images)
+                            pf = self.timm_extractor(poisoned_images)
+                        else:
+                            cf = self.clip_model.encode_image(images)
+                            pf = self.clip_model.encode_image(poisoned_images)
+                        clean_features_list.append(cf)
+                        labels_list.append(labels)
+                        poison_features_list.append(pf)
+                    clean_features = torch.cat(clean_features_list, dim=0)
+                    labels_tensor = torch.cat(labels_list, dim=0)
+                    poison_features = torch.cat(poison_features_list, dim=0)
+                    # Cache on CPU to free GPU memory between rounds
+                    self.a3fl_clean_feature_cache[domain] = (
+                        clean_features.cpu(), labels_tensor.cpu())
+                    logger.info(
+                        f"Server: Cached clean test features for domain "
+                        f"'{domain}' ({clean_features.shape[0]} samples)")
 
-                    non_target_mask = labels != target_label
-                    if non_target_mask.any():
-                        target_hits = poison_preds[
-                            non_target_mask].eq(target_label).sum().item()
-                        non_target_count = non_target_mask.sum().item()
-                        asr_correct += target_hits
-                        asr_total += non_target_count
-                        non_target_correct += target_hits
-                        non_target_total += non_target_count
+                clean_logits = self.global_mlp(clean_features.float())
+                poison_logits = self.global_mlp(poison_features.float())
+                clean_preds = torch.argmax(clean_logits, dim=1)
+                poison_preds = torch.argmax(poison_logits, dim=1)
 
-                    clean_target_correct += clean_preds.eq(
-                        target_label).sum().item()
-                    clean_total += clean_preds.shape[0]
+                non_target_mask = labels_tensor != target_label
+                if non_target_mask.any():
+                    target_hits = poison_preds[
+                        non_target_mask].eq(target_label).sum().item()
+                    non_target_count = non_target_mask.sum().item()
+                    asr_correct += target_hits
+                    asr_total += non_target_count
+                    non_target_correct += target_hits
+                    non_target_total += non_target_count
+
+                clean_target_correct += clean_preds.eq(
+                    target_label).sum().item()
+                clean_total += clean_preds.shape[0]
 
                 asr_results[domain] = (
                     asr_correct / asr_total if asr_total > 0 else 0.0)
